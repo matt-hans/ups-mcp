@@ -14,6 +14,8 @@ Users can integrate with the MCP server to allow AI agents to facilitate trackin
 - ```CLIENT_SECRET``` - UPS Client Secret
 - ```ENVIRONMENT``` - Whether to point to Test (CIE) or Production (Accepted values: test, production)
 
+**Note**: Your API credentials are sensitive. Do not commit them to version control. We recommend managing secrets securely using GitHub Secrets, a vault, or a password manager.
+
 **Execution**
 
 You can run the package using uvx:
@@ -24,13 +26,31 @@ To use an older version, you can specify the version number like so:
 
 ```uvx --from git+https://github.com/UPS-API/ups-mcp@v1.0.0 ups-mcp```
 
-**Note**: Your API credentials are sensitive. Do not commit them to version control. We recommend managing secrets securely using GitHub Secrets, a vault, or a password manager.
-
 ## Popular Integrations
-Here is the sample config file, different MCP Clients may require modification.
+Here are sample config files for popular integrations. Different MCP Clients may require modification.
+
+### Claude Desktop
 ```json
 {
   "mcpServers": {
+    "ups-mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/UPS-API/ups-mcp", "ups-mcp"],
+      "env": {
+        "CLIENT_ID": "**********",
+        "CLIENT_SECRET": "**********",
+        "ENVIRONMENT": "test"
+      }
+    }
+  }
+}
+```
+
+### GitHub Copilot in VS Code
+```json
+{
+  "servers": {
     "ups-mcp": {
       "type": "stdio",
       "command": "uvx",
