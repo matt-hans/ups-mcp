@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from mcp.server.fastmcp.exceptions import ToolError
+
 from .authorization import OAuthManager
-from .http_client import UPSHTTPClient, validation_error_envelope
+from .http_client import UPSHTTPClient
 from .openapi_registry import OpenAPIRegistry, OperationSpec, load_default_registry
 
 RATE_OPERATION_ID = "Rate"
@@ -147,17 +149,9 @@ class ToolManager:
         normalized_option = RATE_REQUEST_OPTIONS.get(str(requestoption).lower())
         if not normalized_option:
             allowed = ", ".join(sorted(RATE_REQUEST_OPTIONS.values()))
-            return validation_error_envelope(
-                operation_name="rate_shipment",
-                message=f"Invalid requestoption '{requestoption}'. Allowed values: {allowed}",
-                trans_id=trans_id,
-            )
+            raise ToolError(f"Invalid requestoption '{requestoption}'. Allowed values: {allowed}")
         if not isinstance(request_body, dict):
-            return validation_error_envelope(
-                operation_name="rate_shipment",
-                message="request_body must be a JSON object",
-                trans_id=trans_id,
-            )
+            raise ToolError("request_body must be a JSON object")
 
         return self._execute_operation(
             operation_id=RATE_OPERATION_ID,
@@ -178,11 +172,7 @@ class ToolManager:
         transaction_src: str = "ups-mcp",
     ) -> dict[str, Any]:
         if not isinstance(request_body, dict):
-            return validation_error_envelope(
-                operation_name="create_shipment",
-                message="request_body must be a JSON object",
-                trans_id=trans_id,
-            )
+            raise ToolError("request_body must be a JSON object")
         return self._execute_operation(
             operation_id=SHIPMENT_OPERATION_ID,
             operation_name="create_shipment",
@@ -208,11 +198,7 @@ class ToolManager:
             elif isinstance(trackingnumber, list) and all(isinstance(item, str) for item in trackingnumber):
                 query_tracking_number = trackingnumber
             else:
-                return validation_error_envelope(
-                    operation_name="void_shipment",
-                    message="trackingnumber must be a string or a list of strings",
-                    trans_id=trans_id,
-                )
+                raise ToolError("trackingnumber must be a string or a list of strings")
 
         return self._execute_operation(
             operation_id=VOID_SHIPMENT_OPERATION_ID,
@@ -235,11 +221,7 @@ class ToolManager:
         transaction_src: str = "ups-mcp",
     ) -> dict[str, Any]:
         if not isinstance(request_body, dict):
-            return validation_error_envelope(
-                operation_name="recover_label",
-                message="request_body must be a JSON object",
-                trans_id=trans_id,
-            )
+            raise ToolError("request_body must be a JSON object")
         return self._execute_operation(
             operation_id=LABEL_RECOVERY_OPERATION_ID,
             operation_name="recover_label",
@@ -258,11 +240,7 @@ class ToolManager:
         transaction_src: str = "ups-mcp",
     ) -> dict[str, Any]:
         if not isinstance(request_body, dict):
-            return validation_error_envelope(
-                operation_name="get_time_in_transit",
-                message="request_body must be a JSON object",
-                trans_id=trans_id,
-            )
+            raise ToolError("request_body must be a JSON object")
         return self._execute_operation(
             operation_id=TIME_IN_TRANSIT_OPERATION_ID,
             operation_name="get_time_in_transit",
@@ -287,36 +265,22 @@ class ToolManager:
         try:
             operation = self.registry.get_operation(operation_id)
         except KeyError as exc:
-            return validation_error_envelope(
-                operation_name=operation_name,
-                message=str(exc),
-                trans_id=trans_id,
-            )
+            raise ToolError(str(exc))
 
         if operation.deprecated:
-            return validation_error_envelope(
-                operation_name=operation_name,
-                message=f"Operation is deprecated and not exposed: {operation.operation_id}",
-                trans_id=trans_id,
-            )
+            raise ToolError(f"Operation is deprecated and not exposed: {operation.operation_id}")
 
         resolved_path_params = dict(operation.default_path_values())
         resolved_path_params.update(path_params)
         if operation.request_body_required and request_body is None:
-            return validation_error_envelope(
-                operation_name=operation_name,
-                message=f"request_body is required for operation {operation.operation_id}",
-                trans_id=trans_id,
-            )
+            raise ToolError(f"request_body is required for operation {operation.operation_id}")
 
         if request_body is not None and operation.request_body_schema:
             validation_errors = self.registry.validate_request_body(operation_id, request_body)
             if validation_errors:
-                return validation_error_envelope(
-                    operation_name=operation_name,
-                    message=f"request_body validation failed for {operation.operation_id}",
-                    trans_id=trans_id,
-                    details=validation_errors[:25],
+                raise ToolError(
+                    f"request_body validation failed for {operation.operation_id}: "
+                    + "; ".join(validation_errors[:25])
                 )
 
         return self.http_client.call_operation(

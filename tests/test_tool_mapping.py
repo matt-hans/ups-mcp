@@ -1,5 +1,7 @@
 import unittest
 
+from mcp.server.fastmcp.exceptions import ToolError
+
 from ups_mcp.tools import ToolManager
 
 
@@ -9,19 +11,7 @@ class FakeHTTPClient:
 
     def call_operation(self, operation, **kwargs):  # noqa: ANN001
         self.calls.append({"operation": operation, "kwargs": kwargs})
-        return {
-            "ok": True,
-            "operation": kwargs["operation_name"],
-            "status_code": 200,
-            "trans_id": kwargs.get("trans_id"),
-            "request": {
-                "method": operation.method,
-                "path": operation.path.format(**kwargs["path_params"]),
-                "query": kwargs.get("query_params", {}),
-            },
-            "data": {"mock": True},
-            "error": None,
-        }
+        return {"mock": True}
 
 
 class ToolMappingTests(unittest.TestCase):
@@ -43,7 +33,7 @@ class ToolMappingTests(unittest.TestCase):
             trans_id="trans-123",
         )
 
-        self.assertTrue(response["ok"])
+        self.assertEqual(response, {"mock": True})
         self.assertEqual(len(self.fake_http_client.calls), 1)
         call = self.fake_http_client.calls[0]
         self.assertEqual(call["operation"].operation_id, "Rate")
@@ -67,25 +57,26 @@ class ToolMappingTests(unittest.TestCase):
         self.assertEqual(first_query, "1Z999AA10123456784")
         self.assertEqual(second_query, ["1Z999AA10123456784", "1Z999AA10123456785"])
 
-    def test_invalid_rate_requestoption_returns_validation_error_envelope(self) -> None:
-        response = self.manager.rate_shipment(
-            requestoption="invalid-option",
-            request_body={"RateRequest": {}},
-        )
+    def test_invalid_rate_requestoption_raises_tool_error(self) -> None:
+        with self.assertRaises(ToolError) as ctx:
+            self.manager.rate_shipment(
+                requestoption="invalid-option",
+                request_body={"RateRequest": {}},
+            )
 
-        self.assertFalse(response["ok"])
-        self.assertEqual(response["error"]["code"], "VALIDATION_ERROR")
+        self.assertIn("Invalid requestoption", str(ctx.exception))
         self.assertEqual(len(self.fake_http_client.calls), 0)
 
-    def test_schema_validation_error_blocks_call(self) -> None:
+    def test_schema_validation_error_raises_tool_error(self) -> None:
         self.manager.registry.validate_request_body = lambda operation_id, request_body: ["RateRequest is required"]  # type: ignore[method-assign]
-        response = self.manager.rate_shipment(
-            requestoption="rate",
-            request_body={},
-        )
 
-        self.assertFalse(response["ok"])
-        self.assertEqual(response["error"]["code"], "VALIDATION_ERROR")
+        with self.assertRaises(ToolError) as ctx:
+            self.manager.rate_shipment(
+                requestoption="rate",
+                request_body={},
+            )
+
+        self.assertIn("validation failed", str(ctx.exception))
         self.assertEqual(len(self.fake_http_client.calls), 0)
 
 

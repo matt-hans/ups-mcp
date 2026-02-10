@@ -1,23 +1,20 @@
 import unittest
 
+from mcp.server.fastmcp.exceptions import ToolError
+
 from ups_mcp.tools import ToolManager
 
 
 class CapturingHTTPClient:
-    def __init__(self, response: dict | None = None) -> None:
+    def __init__(self, response: dict | None = None, raise_error: ToolError | None = None) -> None:
         self.calls: list[dict] = []
-        self.response = response or {
-            "ok": True,
-            "operation": "x",
-            "status_code": 200,
-            "trans_id": "t",
-            "request": {},
-            "data": {},
-            "error": None,
-        }
+        self.response = response or {"trackResponse": {"shipment": []}}
+        self.raise_error = raise_error
 
     def call_operation(self, operation, **kwargs):  # noqa: ANN001
         self.calls.append({"operation": operation, "kwargs": kwargs})
+        if self.raise_error:
+            raise self.raise_error
         return self.response
 
 
@@ -41,7 +38,7 @@ class LegacyToolTests(unittest.TestCase):
             returnPOD=False,
         )
 
-        self.assertTrue(response["ok"])
+        self.assertIn("trackResponse", response)
         self.assertEqual(len(fake_client.calls), 1)
         call = fake_client.calls[0]
         self.assertEqual(call["kwargs"]["operation_name"], "track_package")
@@ -49,7 +46,7 @@ class LegacyToolTests(unittest.TestCase):
         self.assertTrue(call["kwargs"]["query_params"]["returnMilestones"])
 
     def test_validate_address_uses_shared_http_client(self) -> None:
-        fake_client = CapturingHTTPClient()
+        fake_client = CapturingHTTPClient(response={"XAVResponse": {"ValidAddressIndicator": ""}})
         self.manager.http_client = fake_client
 
         response = self.manager.validate_address(
@@ -63,7 +60,7 @@ class LegacyToolTests(unittest.TestCase):
             countryCode="US",
         )
 
-        self.assertTrue(response["ok"])
+        self.assertIn("XAVResponse", response)
         self.assertEqual(len(fake_client.calls), 1)
         call = fake_client.calls[0]
         payload = call["kwargs"]["json_body"]
@@ -71,28 +68,21 @@ class LegacyToolTests(unittest.TestCase):
         self.assertEqual(payload["XAVRequest"]["AddressKeyFormat"]["AddressLine"], ["123 Main St", "Apt 1"])
         self.assertEqual(payload["XAVRequest"]["AddressKeyFormat"]["PostcodeExtendedLow"], "1234")
 
-    def test_legacy_tools_propagate_error_envelope(self) -> None:
-        fake_error = {
-            "ok": False,
-            "operation": "track_package",
-            "status_code": 429,
-            "trans_id": "t",
-            "request": {},
-            "data": None,
-            "error": {"code": "429", "message": "Rate limit exceeded", "details": {"x": 1}},
-        }
-        fake_client = CapturingHTTPClient(response=fake_error)
+    def test_legacy_tools_propagate_tool_error(self) -> None:
+        fake_client = CapturingHTTPClient(
+            raise_error=ToolError('{"status_code": 429, "code": "429", "message": "Rate limit exceeded"}'),
+        )
         self.manager.http_client = fake_client
 
-        response = self.manager.track_package(
-            inquiryNum="1Z999AA10123456784",
-            locale="en_US",
-            returnSignature=False,
-            returnMilestones=False,
-            returnPOD=False,
-        )
-        self.assertFalse(response["ok"])
-        self.assertEqual(response["error"]["code"], "429")
+        with self.assertRaises(ToolError) as ctx:
+            self.manager.track_package(
+                inquiryNum="1Z999AA10123456784",
+                locale="en_US",
+                returnSignature=False,
+                returnMilestones=False,
+                returnPOD=False,
+            )
+        self.assertIn("Rate limit exceeded", str(ctx.exception))
 
 
 if __name__ == "__main__":

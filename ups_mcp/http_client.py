@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 import re
 import uuid
 from urllib.parse import quote
 
 import requests
+from mcp.server.fastmcp.exceptions import ToolError
 
 from .authorization import OAuthManager
 from .openapi_registry import OperationSpec
@@ -36,11 +38,10 @@ class UPSHTTPClient:
             rendered_path = _render_openapi_path(operation.path, path_params)
         except KeyError as exc:
             missing = exc.args[0]
-            return validation_error_envelope(
-                operation_name=operation_name,
-                message=f"Missing required path parameter: {missing}",
-                trans_id=request_trans_id,
-            )
+            raise ToolError(json.dumps({
+                "code": "VALIDATION_ERROR",
+                "message": f"Missing required path parameter: {missing}",
+            }))
 
         url = f"{self.base_url}/api{rendered_path}"
 
@@ -60,83 +61,23 @@ class UPSHTTPClient:
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
-            return {
-                "ok": False,
-                "operation": operation_name,
-                "status_code": 0,
-                "trans_id": request_trans_id,
-                "request": {
-                    "method": operation.method,
-                    "path": rendered_path,
-                    "query": safe_query,
-                },
-                "data": None,
-                "error": {
-                    "code": "REQUEST_ERROR",
-                    "message": str(exc),
-                    "details": None,
-                },
-            }
+            raise ToolError(json.dumps({
+                "code": "REQUEST_ERROR",
+                "message": str(exc),
+            }))
 
         payload = _parse_payload(response)
         if 200 <= response.status_code < 300:
-            return {
-                "ok": True,
-                "operation": operation_name,
-                "status_code": response.status_code,
-                "trans_id": request_trans_id,
-                "request": {
-                    "method": operation.method,
-                    "path": rendered_path,
-                    "query": safe_query,
-                },
-                "data": payload,
-                "error": None,
-            }
+            return payload if isinstance(payload, dict) else {"raw": payload}
 
-        return {
-            "ok": False,
-            "operation": operation_name,
+        error_code = _extract_error_code(payload, response.status_code)
+        error_message = _extract_error_message(payload, response.status_code)
+        raise ToolError(json.dumps({
             "status_code": response.status_code,
-            "trans_id": request_trans_id,
-            "request": {
-                "method": operation.method,
-                "path": rendered_path,
-                "query": safe_query,
-            },
-            "data": None,
-            "error": {
-                "code": _extract_error_code(payload, response.status_code),
-                "message": _extract_error_message(payload, response.status_code),
-                "details": payload,
-            },
-        }
-
-
-def validation_error_envelope(
-    *,
-    operation_name: str,
-    message: str,
-    trans_id: str | None = None,
-    details: Any = None,
-) -> dict[str, Any]:
-    return {
-        "ok": False,
-        "operation": operation_name,
-        "status_code": 0,
-        "trans_id": trans_id,
-        "request": {
-            "method": None,
-            "path": None,
-            "query": {},
-        },
-        "data": None,
-        "error": {
-            "code": "VALIDATION_ERROR",
-            "message": message,
-            "details": details,
-        },
-    }
+            "code": error_code,
+            "message": error_message,
+            "details": payload,
+        }))
 
 
 def _parse_payload(response: requests.Response) -> dict[str, Any] | list[Any] | None:

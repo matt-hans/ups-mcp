@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import requests
+from mcp.server.fastmcp.exceptions import ToolError
 
 from ups_mcp.http_client import UPSHTTPClient
 from ups_mcp.openapi_registry import OperationSpec
@@ -61,7 +62,7 @@ class UPSHTTPClientTests(unittest.TestCase):
         self.operation = build_operation_spec()
 
     @patch("ups_mcp.http_client.requests.request")
-    def test_success_response_uses_structured_envelope(self, mock_request: Mock) -> None:
+    def test_success_response_returns_raw_payload(self, mock_request: Mock) -> None:
         mock_request.return_value = make_response(200, {"ShipmentResponse": {"status": "ok"}})
 
         result = self.client.call_operation(
@@ -74,60 +75,57 @@ class UPSHTTPClientTests(unittest.TestCase):
             transaction_src="ups-mcp",
         )
 
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["status_code"], 200)
-        self.assertEqual(result["trans_id"], "trans-xyz")
-        self.assertEqual(result["request"]["path"], "/shipments/v2409/ship")
-        self.assertEqual(result["data"]["ShipmentResponse"]["status"], "ok")
-        self.assertIsNone(result["error"])
+        self.assertEqual(result, {"ShipmentResponse": {"status": "ok"}})
         called_kwargs = mock_request.call_args.kwargs
         self.assertEqual(called_kwargs["params"]["additionaladdressvalidation"], "city")
 
     @patch("ups_mcp.http_client.requests.request")
-    def test_error_response_maps_to_envelope(self, mock_request: Mock) -> None:
+    def test_error_response_raises_tool_error(self, mock_request: Mock) -> None:
         mock_request.return_value = make_response(
             429,
             {"response": {"errors": [{"message": "Rate limit exceeded"}]}},
         )
 
-        result = self.client.call_operation(
-            self.operation,
-            operation_name="create_shipment",
-            path_params={"version": "v2409"},
-            json_body={"ShipmentRequest": {}},
-        )
+        with self.assertRaises(ToolError) as ctx:
+            self.client.call_operation(
+                self.operation,
+                operation_name="create_shipment",
+                path_params={"version": "v2409"},
+                json_body={"ShipmentRequest": {}},
+            )
 
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["status_code"], 429)
-        self.assertEqual(result["error"]["code"], "429")
-        self.assertEqual(result["error"]["message"], "Rate limit exceeded")
-        self.assertIsNotNone(result["error"]["details"])
+        error_data = json.loads(str(ctx.exception))
+        self.assertEqual(error_data["status_code"], 429)
+        self.assertEqual(error_data["code"], "429")
+        self.assertEqual(error_data["message"], "Rate limit exceeded")
 
     @patch("ups_mcp.http_client.requests.request")
-    def test_request_exception_maps_to_request_error(self, mock_request: Mock) -> None:
+    def test_request_exception_raises_tool_error(self, mock_request: Mock) -> None:
         mock_request.side_effect = requests.RequestException("network down")
 
-        result = self.client.call_operation(
-            self.operation,
-            operation_name="create_shipment",
-            path_params={"version": "v2409"},
-            json_body={"ShipmentRequest": {}},
-        )
+        with self.assertRaises(ToolError) as ctx:
+            self.client.call_operation(
+                self.operation,
+                operation_name="create_shipment",
+                path_params={"version": "v2409"},
+                json_body={"ShipmentRequest": {}},
+            )
 
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["status_code"], 0)
-        self.assertEqual(result["error"]["code"], "REQUEST_ERROR")
+        error_data = json.loads(str(ctx.exception))
+        self.assertEqual(error_data["code"], "REQUEST_ERROR")
+        self.assertIn("network down", error_data["message"])
 
-    def test_missing_path_parameter_is_validation_error(self) -> None:
-        result = self.client.call_operation(
-            self.operation,
-            operation_name="create_shipment",
-            path_params={},
-            json_body={"ShipmentRequest": {}},
-        )
+    def test_missing_path_parameter_raises_tool_error(self) -> None:
+        with self.assertRaises(ToolError) as ctx:
+            self.client.call_operation(
+                self.operation,
+                operation_name="create_shipment",
+                path_params={},
+                json_body={"ShipmentRequest": {}},
+            )
 
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["error"]["code"], "VALIDATION_ERROR")
+        error_data = json.loads(str(ctx.exception))
+        self.assertEqual(error_data["code"], "VALIDATION_ERROR")
 
     @patch("ups_mcp.http_client.requests.request")
     def test_path_params_are_url_encoded(self, mock_request: Mock) -> None:

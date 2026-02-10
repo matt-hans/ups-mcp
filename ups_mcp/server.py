@@ -46,14 +46,8 @@ async def track_package(
         transaction_src (str): Optional caller source name. Default 'ups-mcp'.
 
     Returns:
-        dict[str, Any]: Structured envelope:
-        - ok (bool)
-        - operation (str)
-        - status_code (int)
-        - trans_id (str)
-        - request ({method, path, query})
-        - data (UPS API response payload on success)
-        - error ({code, message, details} on failure)
+        dict[str, Any]: Raw UPS Track API response (e.g. {"trackResponse": {...}}).
+        On error, raises ToolError with JSON containing status_code, code, message, details.
     """
     tracking_data = tool_manager.track_package(
         inquiryNum=inquiryNumber,
@@ -96,11 +90,11 @@ async def validate_address(
         transaction_src (str): Optional caller source name. Default 'ups-mcp'.
 
     Returns:
-        dict[str, Any]: Structured envelope containing address validation response payload.
-        The payload typically includes one of three indicators:
-        - ValidAddressIndicator: Address is valid. Contains a 'Candidate' object with the corrected/standardized address including normalized formatting, corrected ZIP codes, and ZIP+4 extensions.
-        - AmbiguousAddressIndicator: Multiple possible address matches found. Review candidates to select the correct address.
+        dict[str, Any]: Raw UPS Address Validation response containing one of three indicators:
+        - ValidAddressIndicator: Address is valid. Contains a 'Candidate' object with the corrected/standardized address.
+        - AmbiguousAddressIndicator: Multiple possible address matches found. Review candidates.
         - NoCandidatesIndicator: Address could not be validated or does not exist in the USPS database.
+        On error, raises ToolError with JSON containing status_code, code, message, details.
     """
     validation_data = tool_manager.validate_address(
         addressLine1=addressLine1,
@@ -143,7 +137,7 @@ async def rate_shipment(
         transaction_src (str): Optional caller source name. Default `ups-mcp`.
 
     Returns:
-        dict[str, Any]: Structured envelope with UPS response payload in `data`.
+        dict[str, Any]: Raw UPS API response payload. On error, raises ToolError.
     """
     return tool_manager.rate_shipment(
         requestoption=requestoption,
@@ -180,7 +174,7 @@ async def create_shipment(
         transaction_src (str): Optional caller source name. Default `ups-mcp`.
 
     Returns:
-        dict[str, Any]: Structured envelope with UPS response payload in `data`.
+        dict[str, Any]: Raw UPS API response payload. On error, raises ToolError.
     """
     return tool_manager.create_shipment(
         request_body=request_body,
@@ -209,7 +203,7 @@ async def void_shipment(
         transaction_src (str): Optional caller source name. Default `ups-mcp`.
 
     Returns:
-        dict[str, Any]: Structured envelope with UPS response payload in `data`.
+        dict[str, Any]: Raw UPS API response payload. On error, raises ToolError.
     """
     return tool_manager.void_shipment(
         shipmentidentificationnumber=shipmentidentificationnumber,
@@ -240,7 +234,7 @@ async def recover_label(
         transaction_src (str): Optional caller source name. Default `ups-mcp`.
 
     Returns:
-        dict[str, Any]: Structured envelope with UPS response payload in `data`.
+        dict[str, Any]: Raw UPS API response payload. On error, raises ToolError.
     """
     return tool_manager.recover_label(
         request_body=request_body,
@@ -271,7 +265,7 @@ async def get_time_in_transit(
         transaction_src (str): Optional caller source name. Default `ups-mcp`.
 
     Returns:
-        dict[str, Any]: Structured envelope with UPS response payload in `data`.
+        dict[str, Any]: Raw UPS API response payload. On error, raises ToolError.
     """
     return tool_manager.get_time_in_transit(
         request_body=request_body,

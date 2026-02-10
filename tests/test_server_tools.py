@@ -9,31 +9,31 @@ class FakeToolManager:
 
     def track_package(self, **kwargs):  # noqa: ANN003
         self.calls.append(("track_package", kwargs))
-        return {"ok": True, "operation": "track_package", "status_code": 200, "trans_id": "x", "request": {}, "data": {"tracking": "ok"}, "error": None}
+        return {"trackResponse": {"shipment": [{"package": [{"status": "delivered"}]}]}}
 
     def validate_address(self, **kwargs):  # noqa: ANN003
         self.calls.append(("validate_address", kwargs))
-        return {"ok": True, "operation": "validate_address", "status_code": 200, "trans_id": "x", "request": {}, "data": {"validation": "ok"}, "error": None}
+        return {"XAVResponse": {"ValidAddressIndicator": ""}}
 
     def rate_shipment(self, **kwargs):  # noqa: ANN003
         self.calls.append(("rate_shipment", kwargs))
-        return {"ok": True, "operation": "rate_shipment", "status_code": 200, "trans_id": "x", "request": {}, "data": {}, "error": None}
+        return {"RateResponse": {"RatedShipment": []}}
 
     def create_shipment(self, **kwargs):  # noqa: ANN003
         self.calls.append(("create_shipment", kwargs))
-        return {"ok": True, "operation": "create_shipment", "status_code": 200, "trans_id": "x", "request": {}, "data": {}, "error": None}
+        return {"ShipmentResponse": {"ShipmentResults": {}}}
 
     def void_shipment(self, **kwargs):  # noqa: ANN003
         self.calls.append(("void_shipment", kwargs))
-        return {"ok": True, "operation": "void_shipment", "status_code": 200, "trans_id": "x", "request": {}, "data": {}, "error": None}
+        return {"VoidShipmentResponse": {"SummaryResult": {}}}
 
     def recover_label(self, **kwargs):  # noqa: ANN003
         self.calls.append(("recover_label", kwargs))
-        return {"ok": True, "operation": "recover_label", "status_code": 200, "trans_id": "x", "request": {}, "data": {}, "error": None}
+        return {"LabelRecoveryResponse": {"LabelResults": {}}}
 
     def get_time_in_transit(self, **kwargs):  # noqa: ANN003
         self.calls.append(("get_time_in_transit", kwargs))
-        return {"ok": True, "operation": "get_time_in_transit", "status_code": 200, "trans_id": "x", "request": {}, "data": {}, "error": None}
+        return {"emsResponse": {"services": []}}
 
 
 class ServerToolsTests(unittest.IsolatedAsyncioTestCase):
@@ -45,7 +45,7 @@ class ServerToolsTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         server.tool_manager = self.original_tool_manager
 
-    async def test_legacy_tools_return_structured_envelope(self) -> None:
+    async def test_legacy_tools_return_raw_ups_response(self) -> None:
         track_response = await server.track_package(inquiryNumber="1Z999")
         validation_response = await server.validate_address(
             addressLine1="123 Main St",
@@ -57,12 +57,10 @@ class ServerToolsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(track_response, dict)
         self.assertIsInstance(validation_response, dict)
-        self.assertTrue(track_response["ok"])
-        self.assertTrue(validation_response["ok"])
-        self.assertEqual(track_response["operation"], "track_package")
-        self.assertEqual(validation_response["operation"], "validate_address")
+        self.assertIn("trackResponse", track_response)
+        self.assertIn("XAVResponse", validation_response)
 
-    async def test_new_tools_return_structured_envelope(self) -> None:
+    async def test_new_tools_return_raw_ups_response(self) -> None:
         rate_response = await server.rate_shipment(
             requestoption="Rate",
             request_body={"RateRequest": {}},
@@ -72,11 +70,18 @@ class ServerToolsTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsInstance(rate_response, dict)
-        self.assertTrue(rate_response["ok"])
-        self.assertEqual(rate_response["operation"], "rate_shipment")
+        self.assertIn("RateResponse", rate_response)
         self.assertIsInstance(time_response, dict)
-        self.assertTrue(time_response["ok"])
-        self.assertEqual(time_response["operation"], "get_time_in_transit")
+        self.assertIn("emsResponse", time_response)
+
+    async def test_no_envelope_keys_in_responses(self) -> None:
+        track_response = await server.track_package(inquiryNumber="1Z999")
+
+        self.assertNotIn("ok", track_response)
+        self.assertNotIn("operation", track_response)
+        self.assertNotIn("status_code", track_response)
+        self.assertNotIn("data", track_response)
+        self.assertNotIn("error", track_response)
 
 
 if __name__ == "__main__":
