@@ -67,7 +67,6 @@ Here are sample config files for popular integrations. Different MCP Clients may
 
 ## Available Tools
 
-
 - ```track_package```: Track a package using the UPS Tracking API
     
     Args:
@@ -78,7 +77,7 @@ Here are sample config files for popular integrations. Different MCP Clients may
     - returnPOD (bool): a boolean to indicate whether a proof of delivery is required, default is false. Not required
 
     Returns:
-    - str: The response from the tracking capability, this is a string of json tracking data.
+    - dict: Structured response envelope with keys `ok`, `status_code`, `data`, `error`, etc.
 - ```validate_address```: Validate an address using the UPS Address Validation API for the U.S. or Puerto Rico
     
     Args:
@@ -92,6 +91,75 @@ Here are sample config files for popular integrations. Different MCP Clients may
     - countryCode (str): The country code, e.g. US. Required.
 
     Returns:
-    - str: The json response body from the address validation API
+    - dict: Structured response envelope with keys `ok`, `status_code`, `data`, `error`, etc.
 
-UPS MCP server is still in active development. More tools coming soon!
+- `rate_shipment`: Rate or shop a shipment via `POST /rating/{version}/{requestoption}`
+  - Args:
+    - `requestoption` (str, required): `Rate`, `Shop`, `Ratetimeintransit`, `Shoptimeintransit`
+    - `request_body` (object, required): JSON body matching `RATERequestWrapper`
+    - `version` (str, optional, default `v2409`)
+    - `additionalinfo` (str, optional)
+    - `trans_id` (str, optional)
+    - `transaction_src` (str, optional, default `ups-mcp`)
+
+- `create_shipment`: Create a shipment via `POST /shipments/{version}/ship`
+  - Args:
+    - `request_body` (object, required): JSON body matching `SHIPRequestWrapper`
+    - `version` (str, optional, default `v2409`)
+    - `additionaladdressvalidation` (str, optional)
+    - `trans_id` (str, optional)
+    - `transaction_src` (str, optional, default `ups-mcp`)
+
+- `void_shipment`: Void a shipment via `DELETE /shipments/{version}/void/cancel/{shipmentidentificationnumber}`
+  - Args:
+    - `shipmentidentificationnumber` (str, required)
+    - `version` (str, optional, default `v2409`)
+    - `trackingnumber` (str | list[str], optional)
+    - `trans_id` (str, optional)
+    - `transaction_src` (str, optional, default `ups-mcp`)
+
+- `recover_label`: Recover a label via `POST /labels/{version}/recovery`
+  - Args:
+    - `request_body` (object, required): JSON body matching `LABELRECOVERYRequestWrapper`
+    - `version` (str, optional, default `v1`)
+    - `trans_id` (str, optional)
+    - `transaction_src` (str, optional, default `ups-mcp`)
+
+- `get_time_in_transit`: Get transit-time estimates via `POST /shipments/{version}/transittimes`
+  - Args:
+    - `request_body` (object, required): JSON body matching `TimeInTransitRequest`
+    - `version` (str, optional, default `v1`)
+    - `trans_id` (str, optional)
+    - `transaction_src` (str, optional, default `ups-mcp`)
+
+### Structured Response Envelope
+
+All tools return this shape:
+
+```json
+{
+  "ok": true,
+  "operation": "create_shipment",
+  "status_code": 200,
+  "trans_id": "f8b2f32d-5cde-4474-bbe3-bec6900f4ab8",
+  "request": {
+    "method": "POST",
+    "path": "/shipments/v2409/ship",
+    "query": {
+      "additionaladdressvalidation": "city"
+    }
+  },
+  "data": {},
+  "error": null
+}
+```
+
+For failed calls:
+- `ok` is `false`
+- `data` is `null`
+- `error` contains `code`, `message`, and `details`
+
+### Notes
+
+- Deprecated endpoints defined in the OpenAPI specs are intentionally not exposed as MCP tools.
+- Request bodies for spec-backed tools are validated against OpenAPI schemas before calling UPS.
