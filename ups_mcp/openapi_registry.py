@@ -6,9 +6,6 @@ from pathlib import Path
 from typing import Any, Iterable
 import os
 
-import jsonschema
-from referencing import Registry, Resource
-from referencing.jsonschema import DRAFT7
 import yaml
 
 HTTP_METHODS = {"get", "post", "put", "delete", "patch", "head", "options"}
@@ -32,8 +29,6 @@ class OperationSpec:
     deprecated: bool
     summary: str
     request_body_required: bool
-    request_body_schema: str | None
-    response_schemas: dict[str, str | None]
     path_params: tuple[ParameterSpec, ...]
     query_params: tuple[ParameterSpec, ...]
     header_params: tuple[ParameterSpec, ...]
@@ -47,24 +42,14 @@ class OperationSpec:
 
 
 class OpenAPIRegistry:
-    def __init__(self, operations: dict[str, OperationSpec], source_documents: dict[str, dict[str, Any]]) -> None:
+    def __init__(self, operations: dict[str, OperationSpec]) -> None:
         self._operations = operations
-        self._source_documents = source_documents
-        self._validator_cache: dict[tuple[str, str], jsonschema.Draft7Validator] = {}
-        self._jsonschema_registry = Registry()
-        for source_file, source_document in source_documents.items():
-            self._jsonschema_registry = self._jsonschema_registry.with_resource(
-                _source_uri(source_file),
-                Resource(contents=source_document, specification=DRAFT7),
-            )
 
     @classmethod
     def from_spec_files(cls, spec_paths: Iterable[Path]) -> "OpenAPIRegistry":
         operations: dict[str, OperationSpec] = {}
-        source_documents: dict[str, dict[str, Any]] = {}
         for spec_path in spec_paths:
             data = yaml.safe_load(spec_path.read_text())
-            source_documents[spec_path.name] = data
             for path, path_item in (data.get("paths") or {}).items():
                 for method, operation in path_item.items():
                     method_lc = method.lower()
@@ -81,7 +66,7 @@ class OpenAPIRegistry:
                     if operation_id in operations:
                         raise ValueError(f"Duplicate operationId detected: {operation_id}")
                     operations[operation_id] = parsed
-        return cls(operations=operations, source_documents=source_documents)
+        return cls(operations=operations)
 
     @staticmethod
     def _parse_operation(
@@ -110,19 +95,6 @@ class OpenAPIRegistry:
 
         request_body = operation.get("requestBody") or {}
         request_body_required = bool(request_body.get("required", False))
-        json_schema = (
-            ((request_body.get("content") or {}).get("application/json") or {}).get("schema")
-            or {}
-        )
-        request_body_schema = json_schema.get("$ref")
-
-        response_schemas: dict[str, str | None] = {}
-        for status_code, response in (operation.get("responses") or {}).items():
-            schema = (
-                (((response or {}).get("content") or {}).get("application/json") or {}).get("schema")
-                or {}
-            )
-            response_schemas[str(status_code)] = schema.get("$ref")
 
         return OperationSpec(
             source_file=source_file,
@@ -132,8 +104,6 @@ class OpenAPIRegistry:
             deprecated=bool(operation.get("deprecated", False)),
             summary=operation.get("summary", ""),
             request_body_required=request_body_required,
-            request_body_schema=request_body_schema,
-            response_schemas=response_schemas,
             path_params=tuple(path_params),
             query_params=tuple(query_params),
             header_params=tuple(header_params),
@@ -152,42 +122,6 @@ class OpenAPIRegistry:
             (item for item in operations if not item.deprecated),
             key=lambda item: item.operation_id,
         )
-
-    def validate_request_body(self, operation_id: str, request_body: Any) -> list[str]:
-        operation = self.get_operation(operation_id)
-        if not operation.request_body_schema:
-            return []
-
-        validator = self._get_validator(operation)
-        errors = sorted(validator.iter_errors(request_body), key=lambda err: list(err.path))
-        messages: list[str] = []
-        for error in errors:
-            location = ".".join(str(segment) for segment in error.path)
-            if location:
-                messages.append(f"{location}: {error.message}")
-            else:
-                messages.append(error.message)
-        return messages
-
-    def _get_validator(self, operation: OperationSpec) -> jsonschema.Draft7Validator:
-        if not operation.request_body_schema:
-            raise ValueError(f"Operation has no request body schema: {operation.operation_id}")
-
-        cache_key = (operation.source_file, operation.request_body_schema)
-        if cache_key in self._validator_cache:
-            return self._validator_cache[cache_key]
-
-        if operation.source_file not in self._source_documents:
-            raise ValueError(f"Missing source document for operation: {operation.operation_id}")
-
-        schema_wrapper = {"$ref": f"{_source_uri(operation.source_file)}{operation.request_body_schema}"}
-        validator = jsonschema.Draft7Validator(schema_wrapper, registry=self._jsonschema_registry)
-        self._validator_cache[cache_key] = validator
-        return validator
-
-
-def _source_uri(source_file: str) -> str:
-    return f"urn:ups:{source_file}"
 
 
 def default_spec_paths(specs_dir: Path | None = None) -> list[Path]:

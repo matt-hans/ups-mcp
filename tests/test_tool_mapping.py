@@ -23,7 +23,6 @@ class ToolMappingTests(unittest.TestCase):
         )
         self.fake_http_client = FakeHTTPClient()
         self.manager.http_client = self.fake_http_client
-        self.manager.registry.validate_request_body = lambda operation_id, request_body: []  # type: ignore[method-assign]
 
     def test_rate_shipment_maps_inputs_to_rate_operation(self) -> None:
         response = self.manager.rate_shipment(
@@ -67,17 +66,6 @@ class ToolMappingTests(unittest.TestCase):
         self.assertIn("Invalid requestoption", str(ctx.exception))
         self.assertEqual(len(self.fake_http_client.calls), 0)
 
-    def test_schema_validation_error_raises_tool_error(self) -> None:
-        self.manager.registry.validate_request_body = lambda operation_id, request_body: ["RateRequest is required"]  # type: ignore[method-assign]
-
-        with self.assertRaises(ToolError) as ctx:
-            self.manager.rate_shipment(
-                requestoption="rate",
-                request_body={},
-            )
-
-        self.assertIn("validation failed", str(ctx.exception))
-        self.assertEqual(len(self.fake_http_client.calls), 0)
 
 
 if __name__ == "__main__":

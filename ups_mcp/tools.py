@@ -29,8 +29,6 @@ TRACK_OPERATION = OperationSpec(
     deprecated=False,
     summary="Track package",
     request_body_required=False,
-    request_body_schema=None,
-    response_schemas={},
     path_params=(),
     query_params=(),
     header_params=(),
@@ -44,8 +42,6 @@ ADDRESS_VALIDATION_OPERATION = OperationSpec(
     deprecated=False,
     summary="Validate address",
     request_body_required=True,
-    request_body_schema=None,
-    response_schemas={},
     path_params=(),
     query_params=(),
     header_params=(),
@@ -274,14 +270,6 @@ class ToolManager:
         resolved_path_params.update(path_params)
         if operation.request_body_required and request_body is None:
             raise ToolError(f"request_body is required for operation {operation.operation_id}")
-
-        if request_body is not None and operation.request_body_schema:
-            validation_errors = self.registry.validate_request_body(operation_id, request_body)
-            if validation_errors:
-                raise ToolError(
-                    f"request_body validation failed for {operation.operation_id}: "
-                    + "; ".join(validation_errors[:25])
-                )
 
         return self.http_client.call_operation(
             operation,

@@ -24,12 +24,6 @@ class OpenAPIRegistryTests(unittest.TestCase):
         self.assertGreaterEqual(len(deprecated_operations), 1)
         self.assertIn("Deprecated Rate", {operation.operation_id for operation in deprecated_operations})
 
-    def test_request_body_validation_uses_openapi_schema(self) -> None:
-        registry = OpenAPIRegistry.from_spec_files(default_spec_paths())
-        errors = registry.validate_request_body("Rate", {})
-
-        self.assertGreater(len(errors), 0)
-        self.assertTrue(any("RateRequest" in item for item in errors))
 
 
 if __name__ == "__main__":
