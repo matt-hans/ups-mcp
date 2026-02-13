@@ -2,23 +2,44 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
 import os
+import sys
 from . import tools
 from . import constants
+from .openapi_registry import OpenAPISpecLoadError
 
 # Initialize FastMCP server
 mcp = FastMCP("ups-mcp")
 
-# Initialize tool manager
 load_dotenv()
-if os.getenv("ENVIRONMENT") == "production":
-    base_url = constants.PRODUCTION_URL
-else:
-    base_url = constants.CIE_URL
+base_url = constants.CIE_URL
+client_id: str | None = None
+client_secret: str | None = None
+tool_manager: tools.ToolManager | None = None
 
-client_id = os.getenv("CLIENT_ID")
-client_secret = os.getenv("CLIENT_SECRET")
 
-tool_manager = tools.ToolManager(base_url=base_url, client_id=client_id, client_secret=client_secret)
+def _refresh_runtime_configuration() -> None:
+    global base_url, client_id, client_secret
+    if os.getenv("ENVIRONMENT") == "production":
+        base_url = constants.PRODUCTION_URL
+    else:
+        base_url = constants.CIE_URL
+    client_id = os.getenv("CLIENT_ID")
+    client_secret = os.getenv("CLIENT_SECRET")
+
+
+def _initialize_tool_manager() -> None:
+    global tool_manager
+    tool_manager = tools.ToolManager(
+        base_url=base_url,
+        client_id=client_id,
+        client_secret=client_secret,
+    )
+
+
+def _require_tool_manager() -> tools.ToolManager:
+    if tool_manager is None:
+        raise RuntimeError("Tool manager is not initialized. Start UPS MCP via server.main().")
+    return tool_manager
 
 @mcp.tool()
 async def track_package(
@@ -49,7 +70,7 @@ async def track_package(
         dict[str, Any]: Raw UPS Track API response (e.g. {"trackResponse": {...}}).
         On error, raises ToolError with JSON containing status_code, code, message, details.
     """
-    tracking_data = tool_manager.track_package(
+    tracking_data = _require_tool_manager().track_package(
         inquiryNum=inquiryNumber,
         locale=locale,
         returnSignature=returnSignature,
@@ -96,7 +117,7 @@ async def validate_address(
         - NoCandidatesIndicator: Address could not be validated or does not exist in the USPS database.
         On error, raises ToolError with JSON containing status_code, code, message, details.
     """
-    validation_data = tool_manager.validate_address(
+    validation_data = _require_tool_manager().validate_address(
         addressLine1=addressLine1,
         addressLine2=addressLine2,
         politicalDivision1=politicalDivision1,
@@ -139,7 +160,7 @@ async def rate_shipment(
     Returns:
         dict[str, Any]: Raw UPS API response payload. On error, raises ToolError.
     """
-    return tool_manager.rate_shipment(
+    return _require_tool_manager().rate_shipment(
         requestoption=requestoption,
         request_body=request_body,
         version=version,
@@ -176,7 +197,7 @@ async def create_shipment(
     Returns:
         dict[str, Any]: Raw UPS API response payload. On error, raises ToolError.
     """
-    return tool_manager.create_shipment(
+    return _require_tool_manager().create_shipment(
         request_body=request_body,
         version=version,
         additionaladdressvalidation=additionaladdressvalidation or None,
@@ -205,7 +226,7 @@ async def void_shipment(
     Returns:
         dict[str, Any]: Raw UPS API response payload. On error, raises ToolError.
     """
-    return tool_manager.void_shipment(
+    return _require_tool_manager().void_shipment(
         shipmentidentificationnumber=shipmentidentificationnumber,
         version=version,
         trackingnumber=trackingnumber,
@@ -236,7 +257,7 @@ async def recover_label(
     Returns:
         dict[str, Any]: Raw UPS API response payload. On error, raises ToolError.
     """
-    return tool_manager.recover_label(
+    return _require_tool_manager().recover_label(
         request_body=request_body,
         version=version,
         trans_id=trans_id or None,
@@ -267,7 +288,7 @@ async def get_time_in_transit(
     Returns:
         dict[str, Any]: Raw UPS API response payload. On error, raises ToolError.
     """
-    return tool_manager.get_time_in_transit(
+    return _require_tool_manager().get_time_in_transit(
         request_body=request_body,
         version=version,
         trans_id=trans_id or None,
@@ -281,7 +302,14 @@ def _validate_runtime_configuration() -> None:
 
 def main():
     print("Starting UPS MCP Server...")
+    _refresh_runtime_configuration()
     _validate_runtime_configuration()
+    try:
+        _initialize_tool_manager()
+    except OpenAPISpecLoadError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1) from exc
+
     try:
         mcp.run(transport='stdio')
     except KeyboardInterrupt:

@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "ups-mcp"
 version = "1.1.0"
@@ -18,3 +22,12 @@ Homepage = "https://github.com/UPS-API/ups-mcp"
 
 [project.scripts]
 ups-mcp = "ups_mcp.server:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["ups_mcp*"]
+
+[tool.setuptools.package-data]
+ups_mcp = ["specs/*.yaml"]

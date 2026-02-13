@@ -13,6 +13,7 @@ Users can integrate with the MCP server to allow AI agents to facilitate trackin
 - ```CLIENT_ID``` - UPS Client ID
 - ```CLIENT_SECRET``` - UPS Client Secret
 - ```ENVIRONMENT``` - Whether to point to Test (CIE) or Production (Accepted values: test, production)
+- ```UPS_MCP_SPECS_DIR``` - Optional absolute path to a directory containing `Rating.yaml`, `Shipping.yaml`, and `TimeInTransit.yaml`. If set, this override is used before bundled package specs.
 
 **Note**: Your API credentials are sensitive. Do not commit them to version control. We recommend managing secrets securely using GitHub Secrets, a vault, or a password manager.
 

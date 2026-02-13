@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+from importlib import resources
 from pathlib import Path
 from typing import Any, Iterable
 import os
@@ -10,6 +11,21 @@ import yaml
 
 HTTP_METHODS = {"get", "post", "put", "delete", "patch", "head", "options"}
 DEFAULT_SPEC_FILES = ("Rating.yaml", "Shipping.yaml", "TimeInTransit.yaml")
+
+
+class OpenAPISpecLoadError(RuntimeError):
+    def __init__(self, *, source: str, missing_files: Iterable[str]) -> None:
+        missing = tuple(sorted(missing_files))
+        self.source = source
+        self.missing_files = missing
+        required = ", ".join(DEFAULT_SPEC_FILES)
+        missing_csv = ", ".join(missing)
+        super().__init__(
+            "OpenAPI specs are unavailable. "
+            f"Missing from {source}: {missing_csv}. "
+            "Reinstall ups-mcp with bundled specs or set UPS_MCP_SPECS_DIR "
+            f"to a directory containing: {required}."
+        )
 
 
 @dataclass(frozen=True)
@@ -47,9 +63,16 @@ class OpenAPIRegistry:
 
     @classmethod
     def from_spec_files(cls, spec_paths: Iterable[Path]) -> "OpenAPIRegistry":
-        operations: dict[str, OperationSpec] = {}
+        loaded_specs = []
         for spec_path in spec_paths:
-            data = yaml.safe_load(spec_path.read_text())
+            loaded_specs.append((spec_path.name, spec_path.read_text(encoding="utf-8")))
+        return cls.from_spec_texts(loaded_specs)
+
+    @classmethod
+    def from_spec_texts(cls, specs: Iterable[tuple[str, str]]) -> "OpenAPIRegistry":
+        operations: dict[str, OperationSpec] = {}
+        for source_file, spec_text in specs:
+            data = yaml.safe_load(spec_text) or {}
             for path, path_item in (data.get("paths") or {}).items():
                 for method, operation in path_item.items():
                     method_lc = method.lower()
@@ -57,7 +80,7 @@ class OpenAPIRegistry:
                         continue
                     operation_id = operation.get("operationId") or f"{method.upper()} {path}"
                     parsed = cls._parse_operation(
-                        source_file=spec_path.name,
+                        source_file=source_file,
                         operation=operation,
                         operation_id=operation_id,
                         method=method_lc.upper(),
@@ -125,15 +148,58 @@ class OpenAPIRegistry:
 
 
 def default_spec_paths(specs_dir: Path | None = None) -> list[Path]:
-    if specs_dir is None:
+    resolved_specs_dir = specs_dir
+    if resolved_specs_dir is None:
         configured = os.getenv("UPS_MCP_SPECS_DIR")
         if configured:
-            specs_dir = Path(configured)
+            resolved_specs_dir = Path(configured)
         else:
-            specs_dir = Path(__file__).resolve().parent.parent / "docs"
-    return [specs_dir / file_name for file_name in DEFAULT_SPEC_FILES]
+            resolved_specs_dir = Path(__file__).resolve().parent / "specs"
+    return [resolved_specs_dir / file_name for file_name in DEFAULT_SPEC_FILES]
+
+
+def _load_spec_texts_from_dir(specs_dir: Path) -> list[tuple[str, str]]:
+    missing_files: list[str] = []
+    loaded_specs: list[tuple[str, str]] = []
+    for file_name in DEFAULT_SPEC_FILES:
+        spec_path = specs_dir / file_name
+        if not spec_path.is_file():
+            missing_files.append(file_name)
+            continue
+        loaded_specs.append((file_name, spec_path.read_text(encoding="utf-8")))
+
+    if missing_files:
+        raise OpenAPISpecLoadError(
+            source=f"UPS_MCP_SPECS_DIR={specs_dir}",
+            missing_files=missing_files,
+        )
+    return loaded_specs
+
+
+def _load_spec_texts_from_package() -> list[tuple[str, str]]:
+    specs_dir = resources.files("ups_mcp").joinpath("specs")
+    missing_files: list[str] = []
+    loaded_specs: list[tuple[str, str]] = []
+    for file_name in DEFAULT_SPEC_FILES:
+        spec_resource = specs_dir.joinpath(file_name)
+        if not spec_resource.is_file():
+            missing_files.append(file_name)
+            continue
+        loaded_specs.append((file_name, spec_resource.read_text(encoding="utf-8")))
+
+    if missing_files:
+        raise OpenAPISpecLoadError(
+            source="bundled package resources (ups_mcp/specs)",
+            missing_files=missing_files,
+        )
+    return loaded_specs
 
 
 @lru_cache(maxsize=1)
 def load_default_registry() -> OpenAPIRegistry:
-    return OpenAPIRegistry.from_spec_files(default_spec_paths())
+    configured = os.getenv("UPS_MCP_SPECS_DIR")
+    if configured:
+        loaded_specs = _load_spec_texts_from_dir(Path(configured))
+    else:
+        loaded_specs = _load_spec_texts_from_package()
+    return OpenAPIRegistry.from_spec_texts(loaded_specs)
