@@ -453,5 +453,51 @@ class FindMissingFieldsUnconditionalTests(unittest.TestCase):
         self.assertIn("shipper_name", flat_keys)
 
 
+class FindMissingFieldsPackageTests(unittest.TestCase):
+    def test_missing_package_key_emits_package_1_fields(self) -> None:
+        body = make_complete_body()
+        del body["ShipmentRequest"]["Shipment"]["Package"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("package_1_packaging_code", flat_keys)
+        self.assertIn("package_1_weight_unit", flat_keys)
+        self.assertIn("package_1_weight", flat_keys)
+
+    def test_empty_package_list_emits_package_1_fields(self) -> None:
+        body = make_complete_body()
+        body["ShipmentRequest"]["Shipment"]["Package"] = []
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("package_1_weight", flat_keys)
+
+    def test_single_dict_package_validates_as_index_0(self) -> None:
+        """Package as a single dict (not list) is normalized and validated."""
+        body = make_complete_body()
+        # Convert Package from list to dict for this test
+        pkg = body["ShipmentRequest"]["Shipment"]["Package"][0]
+        body["ShipmentRequest"]["Shipment"]["Package"] = pkg
+        self.assertIsInstance(body["ShipmentRequest"]["Shipment"]["Package"], dict)
+        missing = find_missing_fields(body)
+        pkg_missing = [mf for mf in missing if "package_" in mf.flat_key]
+        self.assertEqual(pkg_missing, [])
+
+    def test_multi_package_validates_each(self) -> None:
+        body = make_complete_body(num_packages=2)
+        body["ShipmentRequest"]["Shipment"]["Package"][1].pop("PackageWeight")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("package_1_weight", flat_keys)
+        self.assertIn("package_2_weight", flat_keys)
+        self.assertIn("package_2_weight_unit", flat_keys)
+
+    def test_multi_package_prompts_include_index(self) -> None:
+        body = make_complete_body(num_packages=2)
+        body["ShipmentRequest"]["Shipment"]["Package"][0].pop("PackageWeight")
+        missing = find_missing_fields(body)
+        pkg1_weight = [mf for mf in missing if mf.flat_key == "package_1_weight"]
+        self.assertEqual(len(pkg1_weight), 1)
+        self.assertIn("Package 1", pkg1_weight[0].prompt)
+
+
 if __name__ == "__main__":
     unittest.main()
