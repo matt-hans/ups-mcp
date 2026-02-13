@@ -75,11 +75,18 @@ Payer validation is conditional: check which billing object (BillShipper, BillRe
 
 Applied per-address based on that address's `CountryCode` value. No other country-specific rules in v1.
 
-### Deterministic Package Behavior
+### Body Canonicalization
 
+`canonicalize_body(request_body)` normalizes both `Package` and `ShipmentCharge` from dict to list form. This is applied at the start of `find_missing_fields`, in `rehydrate`, and before sending to UPS, ensuring all `[0]`-indexed paths resolve correctly regardless of input shape.
+
+**Package:**
 - If `Package` key missing or empty array: validate against package index 0 fields (`package_1_*`).
 - If `Package` is a single dict (not array): treat as `[Package]`, validate index 0.
 - If `Package` is an array: validate each element at its index.
+
+**ShipmentCharge:**
+- If `ShipmentCharge` is a single dict: treat as `[ShipmentCharge]`.
+- If `ShipmentCharge` is an array: use as-is.
 
 ### Default Values (3-tier merge)
 
@@ -101,6 +108,11 @@ No country code defaults. No packaging code defaults. No weight unit defaults.
 ### Functions
 
 ```python
+def canonicalize_body(request_body: dict) -> dict
+```
+Normalize Package and ShipmentCharge to list form. Returns new dict (non-mutating). Single entry point for all body normalization.
+
+```python
 def apply_defaults(request_body: dict, env_config: dict[str, str]) -> dict
 ```
 Merge 3-tier defaults. Returns new dict (non-mutating).
@@ -108,7 +120,7 @@ Merge 3-tier defaults. Returns new dict (non-mutating).
 ```python
 def find_missing_fields(request_body: dict) -> list[MissingField]
 ```
-Check unconditional + country-conditional rules. Returns list of `MissingField(dot_path, flat_key, prompt)`.
+Canonicalizes body first, then checks unconditional + payment + package + country-conditional rules. Returns list of `MissingField(dot_path, flat_key, prompt)`.
 
 ```python
 def build_elicitation_schema(missing: list[MissingField]) -> type[BaseModel]

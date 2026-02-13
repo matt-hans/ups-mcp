@@ -936,41 +936,52 @@ Expected: FAIL with `ImportError: cannot import name 'find_missing_fields'`
 Add to `ups_mcp/shipment_validator.py`:
 
 ```python
-def _normalize_packages(request_body: dict) -> list[dict]:
-    """Extract Package from body, normalize to a list of dicts.
+def _normalize_list_field(container: dict, key: str) -> None:
+    """Normalize a field in container from dict -> [dict], preserving lists.
 
-    - dict -> [dict]
-    - list -> list (or [{}] if empty)
-    - missing/None -> [{}]
+    Mutates container in place.
+    """
+    if key not in container:
+        return
+    value = container[key]
+    if isinstance(value, dict):
+        container[key] = [value]
+    elif isinstance(value, list):
+        if not value:
+            container[key] = [{}]
+    else:
+        container[key] = [{}]
 
-    This is the canonical internal representation. All downstream validation
-    and rehydration operates on the list form.
+
+def canonicalize_body(request_body: dict) -> dict:
+    """Return a deep copy of request_body with Package and ShipmentCharge
+    normalized to list form.
+
+    This is the single normalization entry point. All validation,
+    rehydration, and UPS API calls should operate on the canonical form.
+    """
+    result = copy.deepcopy(request_body)
+    shipment = result.get("ShipmentRequest", {}).get("Shipment", {})
+    _normalize_list_field(shipment, "Package")
+    payment = shipment.get("PaymentInformation", {})
+    _normalize_list_field(payment, "ShipmentCharge")
+    return result
+
+
+def _get_packages(request_body: dict) -> list[dict]:
+    """Extract the Package list from a (preferably canonical) body.
+
+    If Package is missing, returns [{}] for index-0 validation.
     """
     shipment = request_body.get("ShipmentRequest", {}).get("Shipment", {})
     packages = shipment.get("Package")
     if packages is None:
         return [{}]
-    if isinstance(packages, dict):
-        return [packages]
     if isinstance(packages, list):
         return packages if packages else [{}]
+    if isinstance(packages, dict):
+        return [packages]
     return [{}]
-
-
-def _ensure_package_list(request_body: dict) -> dict:
-    """Return a copy of request_body with Package normalized to a list.
-
-    This ensures all downstream code operates on a consistent structure.
-    """
-    result = copy.deepcopy(request_body)
-    shipment = result.get("ShipmentRequest", {}).get("Shipment", {})
-    if "Package" in shipment:
-        pkg = shipment["Package"]
-        if isinstance(pkg, dict):
-            shipment["Package"] = [pkg]
-        elif not isinstance(pkg, list):
-            shipment["Package"] = [{}]
-    return result
 
 
 def find_missing_fields(request_body: dict) -> list[MissingField]:
@@ -979,17 +990,21 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
     Checks unconditional rules, payment rules, per-package rules,
     and country-conditional rules.
 
-    Package is normalized to list internally for consistent path resolution.
+    Body is canonicalized first (Package + ShipmentCharge normalized to
+    list form) so that all _field_exists calls with [0] paths work correctly
+    regardless of whether the caller provided dicts or lists.
     """
+    # Canonicalize once — all subsequent _field_exists calls use this copy.
+    body = canonicalize_body(request_body)
     missing: list[MissingField] = []
 
     # Unconditional non-package fields
     for rule in UNCONDITIONAL_RULES:
-        if not _field_exists(request_body, rule.dot_path):
+        if not _field_exists(body, rule.dot_path):
             missing.append(MissingField(rule.dot_path, rule.flat_key, rule.prompt))
 
     # Payment: charge type is always required
-    if not _field_exists(request_body, PAYMENT_CHARGE_TYPE_RULE.dot_path):
+    if not _field_exists(body, PAYMENT_CHARGE_TYPE_RULE.dot_path):
         missing.append(MissingField(
             PAYMENT_CHARGE_TYPE_RULE.dot_path,
             PAYMENT_CHARGE_TYPE_RULE.flat_key,
@@ -997,39 +1012,32 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
         ))
 
     # Payment: payer account is conditional on which billing object is present.
-    # Check BillShipper, BillReceiver, BillThirdParty in order. If one is
-    # present, validate its account number. If none is present, default to
-    # requiring BillShipper.AccountNumber.
-    charge = (
-        request_body
+    # Body is canonical so ShipmentCharge is always a list here.
+    first_charge = (
+        body
         .get("ShipmentRequest", {})
         .get("Shipment", {})
         .get("PaymentInformation", {})
         .get("ShipmentCharge", [{}])
     )
-    # Normalize ShipmentCharge: dict -> [dict], like Package normalization
-    if isinstance(charge, dict):
-        charge = [charge]
-    elif not isinstance(charge, list):
-        charge = [{}]
-    first_charge = charge[0] if charge else {}
+    first_charge = first_charge[0] if first_charge else {}
     payer_found = False
     for payer_key, rule in PAYMENT_PAYER_RULES.items():
         if payer_key in first_charge:
             payer_found = True
-            if not _field_exists(request_body, rule.dot_path):
+            if not _field_exists(body, rule.dot_path):
                 missing.append(MissingField(rule.dot_path, rule.flat_key, rule.prompt))
             break
     if not payer_found:
         # No billing object present — require BillShipper.AccountNumber
         default_rule = PAYMENT_PAYER_RULES["BillShipper"]
-        if not _field_exists(request_body, default_rule.dot_path):
+        if not _field_exists(body, default_rule.dot_path):
             missing.append(MissingField(
                 default_rule.dot_path, default_rule.flat_key, default_rule.prompt,
             ))
 
-    # Per-package fields
-    packages = _normalize_packages(request_body)
+    # Per-package fields — body is canonical so Package is always a list
+    packages = _get_packages(body)
     for i, pkg in enumerate(packages):
         n = i + 1  # 1-indexed for user-facing flat keys
         for rule in PACKAGE_RULES:
@@ -1040,7 +1048,7 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
                 missing.append(MissingField(full_dot_path, flat_key, prompt))
 
     # Country-conditional fields
-    shipment = request_body.get("ShipmentRequest", {}).get("Shipment", {})
+    shipment = body.get("ShipmentRequest", {}).get("Shipment", {})
     for role, prefix in [("Shipper", "shipper"), ("ShipTo", "ship_to")]:
         address = shipment.get(role, {}).get("Address", {})
         country = str(address.get("CountryCode", "")).strip().upper()
@@ -1310,7 +1318,55 @@ git commit -m "feat: implement build_elicitation_schema for dynamic Pydantic mod
 Append to `tests/test_shipment_validator.py`:
 
 ```python
-from ups_mcp.shipment_validator import normalize_elicited_values, rehydrate, RehydrationError
+from ups_mcp.shipment_validator import (
+    normalize_elicited_values,
+    rehydrate,
+    canonicalize_body,
+    RehydrationError,
+)
+
+
+class CanonicalizeBodyTests(unittest.TestCase):
+    def test_package_dict_becomes_list(self) -> None:
+        body = {"ShipmentRequest": {"Shipment": {"Package": {"Packaging": {"Code": "02"}}}}}
+        result = canonicalize_body(body)
+        pkg = result["ShipmentRequest"]["Shipment"]["Package"]
+        self.assertIsInstance(pkg, list)
+        self.assertEqual(len(pkg), 1)
+        self.assertEqual(pkg[0]["Packaging"]["Code"], "02")
+
+    def test_shipment_charge_dict_becomes_list(self) -> None:
+        body = {
+            "ShipmentRequest": {
+                "Shipment": {
+                    "PaymentInformation": {
+                        "ShipmentCharge": {"Type": "01", "BillShipper": {"AccountNumber": "X"}}
+                    }
+                }
+            }
+        }
+        result = canonicalize_body(body)
+        sc = result["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"]
+        self.assertIsInstance(sc, list)
+        self.assertEqual(sc[0]["Type"], "01")
+
+    def test_already_lists_unchanged(self) -> None:
+        body = make_complete_body()
+        result = canonicalize_body(body)
+        self.assertEqual(
+            result["ShipmentRequest"]["Shipment"]["Package"],
+            body["ShipmentRequest"]["Shipment"]["Package"],
+        )
+
+    def test_does_not_mutate_input(self) -> None:
+        body = {"ShipmentRequest": {"Shipment": {"Package": {"Packaging": {"Code": "02"}}}}}
+        original = copy.deepcopy(body)
+        canonicalize_body(body)
+        self.assertEqual(body, original)
+
+    def test_missing_fields_tolerated(self) -> None:
+        result = canonicalize_body({})
+        self.assertEqual(result, {})
 
 
 class NormalizeElicitedValuesTests(unittest.TestCase):
@@ -1567,13 +1623,13 @@ def rehydrate(
 
     Uses the ``missing`` list as the flat_key -> dot_path mapping.
     Skips empty/None values. Does not overwrite existing non-empty values.
-    Normalizes Package dict to list for consistent structure.
+    Canonicalizes body (Package + ShipmentCharge to list) for consistent structure.
     Returns a new dict — does not mutate the input.
 
     Raises RehydrationError if a structural conflict prevents setting a value.
     """
     flat_to_dot = {mf.flat_key: mf.dot_path for mf in missing}
-    result = _ensure_package_list(request_body)
+    result = canonicalize_body(request_body)
 
     for flat_key, value in flat_data.items():
         if not value:
@@ -1916,6 +1972,19 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(str(cm.exception))
         self.assertEqual(payload["code"], "INCOMPLETE_SHIPMENT")
 
+    async def test_malformed_body_raises_structured_tool_error(self) -> None:
+        """Structural TypeError during apply_defaults wraps as MALFORMED_REQUEST."""
+        body = {
+            "ShipmentRequest": {
+                "Request": "not_a_dict",  # Should be dict, _set_field will fail
+            }
+        }
+        with self.assertRaises(ToolError) as cm:
+            await server.create_shipment(request_body=body)
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "MALFORMED_REQUEST")
+        self.assertEqual(payload["reason"], "malformed_structure")
+
     async def test_rehydration_error_raises_structured_tool_error(self) -> None:
         """When rehydrate hits a structural conflict, ToolError wraps it."""
         body = make_complete_body()
@@ -1955,6 +2024,19 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         call_args = self.fake_tool_manager.calls[0][1]
         pkg = call_args["request_body"]["ShipmentRequest"]["Shipment"]["Package"]
         self.assertIsInstance(pkg, list)
+
+    async def test_shipment_charge_dict_canonicalized_to_list_before_ups_call(self) -> None:
+        """A complete body with ShipmentCharge as dict should be canonicalized to list."""
+        body = make_complete_body()
+        # Convert ShipmentCharge from list to dict
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"] = (
+            body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"][0]
+        )
+        result = await server.create_shipment(request_body=body)
+        self.assertIn("ShipmentResponse", result)
+        call_args = self.fake_tool_manager.calls[0][1]
+        sc = call_args["request_body"]["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"]
+        self.assertIsInstance(sc, list)
 
     async def test_error_payload_structured_missing_objects(self) -> None:
         """Error payload uses structured missing array, not split parallel structures."""
@@ -2024,20 +2106,13 @@ async def create_shipment(
         build_elicitation_schema,
         normalize_elicited_values,
         rehydrate,
+        canonicalize_body,
         RehydrationError,
-        _ensure_package_list,
     )
 
-    # 1. Apply 3-tier defaults
-    env_config = {"UPS_ACCOUNT_NUMBER": os.getenv("UPS_ACCOUNT_NUMBER", "")}
-    merged_body = apply_defaults(request_body, env_config)
-
-    # 2. Preflight: find missing required fields
-    missing = find_missing_fields(merged_body)
-
-    # Helper: canonicalize Package to list and send to UPS
+    # Helper: canonicalize and send to UPS
     def _send_to_ups(body):
-        canonical = _ensure_package_list(body)
+        canonical = canonicalize_body(body)
         return _require_tool_manager().create_shipment(
             request_body=canonical,
             version=version,
@@ -2045,6 +2120,21 @@ async def create_shipment(
             trans_id=trans_id or None,
             transaction_src=transaction_src,
         )
+
+    # 1. Apply 3-tier defaults (may raise TypeError on malformed bodies)
+    env_config = {"UPS_ACCOUNT_NUMBER": os.getenv("UPS_ACCOUNT_NUMBER", "")}
+    try:
+        merged_body = apply_defaults(request_body, env_config)
+    except TypeError as exc:
+        raise ToolError(json.dumps({
+            "code": "MALFORMED_REQUEST",
+            "message": f"Request body has structural conflicts: {exc}",
+            "reason": "malformed_structure",
+            "missing": [],
+        }))
+
+    # 2. Preflight: find missing required fields
+    missing = find_missing_fields(merged_body)
 
     # 3. Happy path — all fields present
     if not missing:
@@ -2214,6 +2304,14 @@ git commit -m "fix: update existing create_shipment tests for preflight validati
 | ShipmentCharge shape not normalized | P1 | Added dict→list normalization in `find_missing_fields()` payer detection and in `_has_payer_object()`. Test `test_shipment_charge_as_dict_normalized` verifies. |
 | TypeError from `_set_field` surfaces as non-structured error | P1 | Added `RehydrationError` exception. `rehydrate()` catches `TypeError` and wraps as `RehydrationError`. Server catches `RehydrationError` and wraps as `ToolError` with code `ELICITATION_INVALID_RESPONSE`. Tests at both levels. |
 | Task 2 commit message says "coercion" but impl raises TypeError | P2 | Updated commit message to say "raises TypeError on existing incompatible intermediate types". |
+
+### Round 4
+
+| Finding | Severity | Resolution |
+|---------|----------|------------|
+| ShipmentCharge dict normalization broken — `_field_exists` runs on un-normalized body | P0 | Replaced fragmented normalization (`_ensure_package_list`, local charge normalization) with unified `canonicalize_body()` that normalizes both Package and ShipmentCharge to list form. `find_missing_fields` canonicalizes first, then all `_field_exists` calls operate on canonical body where `[0]` paths resolve correctly. |
+| Structural TypeError leaks before elicitation | P1 | Wrapped `apply_defaults()` call in server.py with `try/except TypeError` → structured `ToolError` with code `MALFORMED_REQUEST`. Test verifies. |
+| ShipmentCharge not canonicalized before UPS call | P1 | `_send_to_ups()` now calls `canonicalize_body()` (not just `_ensure_package_list`), normalizing both Package and ShipmentCharge. Test `test_shipment_charge_dict_canonicalized_to_list_before_ups_call` verifies. |
 
 ## Commit History (expected)
 
