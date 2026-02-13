@@ -295,5 +295,163 @@ class ApplyDefaultsTests(unittest.TestCase):
         self.assertEqual(body, original)
 
 
+from ups_mcp.shipment_validator import find_missing_fields, MissingField, AmbiguousPayerError
+
+
+class FindMissingFieldsUnconditionalTests(unittest.TestCase):
+    def test_complete_body_returns_empty(self) -> None:
+        body = make_complete_body()
+        missing = find_missing_fields(body)
+        self.assertEqual(missing, [])
+
+    def test_empty_body_returns_all_fields(self) -> None:
+        missing = find_missing_fields({})
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("request_option", flat_keys)
+        self.assertIn("shipper_name", flat_keys)
+        self.assertIn("shipper_number", flat_keys)
+        self.assertIn("shipper_address_line_1", flat_keys)
+        self.assertIn("ship_to_name", flat_keys)
+        self.assertIn("service_code", flat_keys)
+        self.assertIn("package_1_packaging_code", flat_keys)
+        self.assertIn("package_1_weight_unit", flat_keys)
+        self.assertIn("package_1_weight", flat_keys)
+        self.assertIn("payment_charge_type", flat_keys)
+        self.assertIn("payment_account_number", flat_keys)
+
+    def test_missing_shipper_name_detected(self) -> None:
+        body = make_complete_body()
+        del body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("shipper_name", flat_keys)
+
+    def test_missing_ship_to_address_detected(self) -> None:
+        body = make_complete_body()
+        del body["ShipmentRequest"]["Shipment"]["ShipTo"]["Address"]["AddressLine"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("ship_to_address_line_1", flat_keys)
+
+    def test_missing_service_code_detected(self) -> None:
+        body = make_complete_body()
+        del body["ShipmentRequest"]["Shipment"]["Service"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("service_code", flat_keys)
+
+    def test_missing_payment_info_detected(self) -> None:
+        body = make_complete_body()
+        del body["ShipmentRequest"]["Shipment"]["PaymentInformation"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("payment_charge_type", flat_keys)
+        self.assertIn("payment_account_number", flat_keys)
+
+    def test_bill_receiver_account_validated(self) -> None:
+        """BillReceiver present but missing AccountNumber triggers validation."""
+        body = make_complete_body()
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"] = [{
+            "Type": "01",
+            "BillReceiver": {},
+        }]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("payment_account_number", flat_keys)
+        # Dot path should point to BillReceiver, not BillShipper
+        account_rule = [mf for mf in missing if mf.flat_key == "payment_account_number"]
+        self.assertIn("BillReceiver", account_rule[0].dot_path)
+
+    def test_bill_third_party_account_validated(self) -> None:
+        """BillThirdParty present but missing AccountNumber triggers validation."""
+        body = make_complete_body()
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"] = [{
+            "Type": "01",
+            "BillThirdParty": {},
+        }]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("payment_account_number", flat_keys)
+        account_rule = [mf for mf in missing if mf.flat_key == "payment_account_number"]
+        self.assertIn("BillThirdParty", account_rule[0].dot_path)
+
+    def test_bill_receiver_with_account_passes(self) -> None:
+        """BillReceiver with AccountNumber present should not be flagged."""
+        body = make_complete_body()
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"] = [{
+            "Type": "01",
+            "BillReceiver": {"AccountNumber": "RCV123"},
+        }]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("payment_account_number", flat_keys)
+
+    def test_no_billing_object_defaults_to_bill_shipper(self) -> None:
+        """No billing object present defaults to requiring BillShipper.AccountNumber."""
+        body = make_complete_body()
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"] = [{
+            "Type": "01",
+        }]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("payment_account_number", flat_keys)
+        account_rule = [mf for mf in missing if mf.flat_key == "payment_account_number"]
+        self.assertIn("BillShipper", account_rule[0].dot_path)
+
+    def test_shipment_charge_as_dict_normalized(self) -> None:
+        """ShipmentCharge as a dict (not list) should be normalized and validated."""
+        body = make_complete_body()
+        # Convert ShipmentCharge from list to dict
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"] = {
+            "Type": "01",
+            "BillShipper": {"AccountNumber": "129D9Y"},
+        }
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("payment_charge_type", flat_keys)
+        self.assertNotIn("payment_account_number", flat_keys)
+
+    def test_multiple_payer_objects_raises_ambiguous_error(self) -> None:
+        """Multiple billing objects in the same ShipmentCharge raises AmbiguousPayerError."""
+        body = make_complete_body()
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"] = [{
+            "Type": "01",
+            "BillShipper": {"AccountNumber": "ABC"},
+            "BillReceiver": {"AccountNumber": "DEF"},
+        }]
+        with self.assertRaises(AmbiguousPayerError) as cm:
+            find_missing_fields(body)
+        self.assertIn("BillShipper", cm.exception.payer_keys)
+        self.assertIn("BillReceiver", cm.exception.payer_keys)
+
+    def test_three_payer_objects_raises_ambiguous_error(self) -> None:
+        """All three billing objects present also raises AmbiguousPayerError."""
+        body = make_complete_body()
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"] = [{
+            "Type": "01",
+            "BillShipper": {"AccountNumber": "A"},
+            "BillReceiver": {"AccountNumber": "B"},
+            "BillThirdParty": {"AccountNumber": "C"},
+        }]
+        with self.assertRaises(AmbiguousPayerError):
+            find_missing_fields(body)
+
+    def test_returns_missing_field_instances(self) -> None:
+        body = make_complete_body()
+        del body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"]
+        missing = find_missing_fields(body)
+        shipper_name = [mf for mf in missing if mf.flat_key == "shipper_name"]
+        self.assertEqual(len(shipper_name), 1)
+        self.assertEqual(shipper_name[0].dot_path, "ShipmentRequest.Shipment.Shipper.Name")
+        self.assertEqual(shipper_name[0].prompt, "Shipper name")
+
+    def test_whitespace_value_treated_as_missing(self) -> None:
+        body = make_complete_body()
+        body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"] = "   "
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("shipper_name", flat_keys)
+
+
 if __name__ == "__main__":
     unittest.main()

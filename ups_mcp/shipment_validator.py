@@ -277,3 +277,164 @@ def apply_defaults(request_body: dict, env_config: dict[str, str]) -> dict:
         _set_field(result, bill_shipper_path, account_number)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class AmbiguousPayerError(Exception):
+    """Raised when multiple billing payer objects exist in the same ShipmentCharge."""
+    def __init__(self, payer_keys: list[str]):
+        self.payer_keys = payer_keys
+        super().__init__(
+            f"Ambiguous payer: multiple billing objects present ({', '.join(payer_keys)}). "
+            f"Only one of BillShipper, BillReceiver, BillThirdParty is allowed per charge."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Body canonicalization
+# ---------------------------------------------------------------------------
+
+def _normalize_list_field(container: dict, key: str) -> None:
+    """Normalize a field in container from dict -> [dict], preserving lists.
+
+    Non-dict list elements are coerced to {} to prevent confusing downstream
+    errors (e.g. a string element where _field_exists expects a dict).
+
+    Mutates container in place.
+    """
+    if key not in container:
+        return
+    value = container[key]
+    if isinstance(value, dict):
+        container[key] = [value]
+    elif isinstance(value, list):
+        if not value:
+            container[key] = [{}]
+        else:
+            container[key] = [el if isinstance(el, dict) else {} for el in value]
+    else:
+        container[key] = [{}]
+
+
+def canonicalize_body(request_body: dict) -> dict:
+    """Return a deep copy of request_body with Package and ShipmentCharge
+    normalized to list form.
+
+    This is the single normalization entry point. All validation,
+    rehydration, and UPS API calls should operate on the canonical form.
+    """
+    result = copy.deepcopy(request_body)
+    shipment = result.get("ShipmentRequest", {}).get("Shipment", {})
+    _normalize_list_field(shipment, "Package")
+    payment = shipment.get("PaymentInformation", {})
+    _normalize_list_field(payment, "ShipmentCharge")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Preflight validation
+# ---------------------------------------------------------------------------
+
+def _get_packages(request_body: dict) -> list[dict]:
+    """Extract the Package list from a (preferably canonical) body.
+
+    If Package is missing, returns [{}] for index-0 validation.
+    """
+    shipment = request_body.get("ShipmentRequest", {}).get("Shipment", {})
+    packages = shipment.get("Package")
+    if packages is None:
+        return [{}]
+    if isinstance(packages, list):
+        return packages if packages else [{}]
+    if isinstance(packages, dict):
+        return [packages]
+    return [{}]
+
+
+def find_missing_fields(request_body: dict) -> list[MissingField]:
+    """Check required fields and return those that are missing.
+
+    Checks unconditional rules, payment rules, per-package rules,
+    and country-conditional rules.
+
+    Body is canonicalized first (Package + ShipmentCharge normalized to
+    list form) so that all _field_exists calls with [0] paths work correctly
+    regardless of whether the caller provided dicts or lists.
+    """
+    # Canonicalize once — all subsequent _field_exists calls use this copy.
+    body = canonicalize_body(request_body)
+    missing: list[MissingField] = []
+
+    # Unconditional non-package fields
+    for rule in UNCONDITIONAL_RULES:
+        if not _field_exists(body, rule.dot_path):
+            missing.append(MissingField(rule.dot_path, rule.flat_key, rule.prompt))
+
+    # Payment: charge type is always required
+    if not _field_exists(body, PAYMENT_CHARGE_TYPE_RULE.dot_path):
+        missing.append(MissingField(
+            PAYMENT_CHARGE_TYPE_RULE.dot_path,
+            PAYMENT_CHARGE_TYPE_RULE.flat_key,
+            PAYMENT_CHARGE_TYPE_RULE.prompt,
+        ))
+
+    # Payment: payer account is conditional on which billing object is present.
+    # Body is canonical so ShipmentCharge is always a list here.
+    first_charge = (
+        body
+        .get("ShipmentRequest", {})
+        .get("Shipment", {})
+        .get("PaymentInformation", {})
+        .get("ShipmentCharge", [{}])
+    )
+    first_charge = first_charge[0] if first_charge else {}
+
+    # Detect ambiguous payer: multiple billing objects in the same charge
+    present_payers = [k for k in PAYMENT_PAYER_RULES if k in first_charge]
+    if len(present_payers) > 1:
+        raise AmbiguousPayerError(present_payers)
+
+    payer_found = False
+    for payer_key, rule in PAYMENT_PAYER_RULES.items():
+        if payer_key in first_charge:
+            payer_found = True
+            if not _field_exists(body, rule.dot_path):
+                missing.append(MissingField(rule.dot_path, rule.flat_key, rule.prompt))
+            break
+    if not payer_found:
+        # No billing object present — require BillShipper.AccountNumber
+        default_rule = PAYMENT_PAYER_RULES["BillShipper"]
+        if not _field_exists(body, default_rule.dot_path):
+            missing.append(MissingField(
+                default_rule.dot_path, default_rule.flat_key, default_rule.prompt,
+            ))
+
+    # Per-package fields — body is canonical so Package is always a list
+    packages = _get_packages(body)
+    for i, pkg in enumerate(packages):
+        n = i + 1  # 1-indexed for user-facing flat keys
+        for rule in PACKAGE_RULES:
+            full_dot_path = f"ShipmentRequest.Shipment.Package[{i}].{rule.dot_path}"
+            flat_key = f"package_{n}_{rule.flat_key}"
+            prompt = f"Package {n}: {rule.prompt}" if len(packages) > 1 else rule.prompt
+            if not _field_exists(pkg, rule.dot_path):
+                missing.append(MissingField(full_dot_path, flat_key, prompt))
+
+    # Country-conditional fields
+    shipment = body.get("ShipmentRequest", {}).get("Shipment", {})
+    for role, prefix in [("Shipper", "shipper"), ("ShipTo", "ship_to")]:
+        address = shipment.get(role, {}).get("Address", {})
+        country = str(address.get("CountryCode", "")).strip().upper()
+        for countries, rules in COUNTRY_CONDITIONAL_RULES.items():
+            if country in countries:
+                for rule in rules:
+                    full_dot_path = f"ShipmentRequest.Shipment.{role}.Address.{rule.dot_path}"
+                    flat_key = f"{prefix}_{rule.flat_key}"
+                    prompt = f"{'Shipper' if role == 'Shipper' else 'Recipient'} {rule.prompt.lower()}"
+                    if not _field_exists(address, rule.dot_path):
+                        missing.append(MissingField(full_dot_path, flat_key, prompt))
+
+    return missing
