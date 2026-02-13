@@ -544,5 +544,45 @@ class FindMissingFieldsCountryTests(unittest.TestCase):
         self.assertNotIn("shipper_postal_code", flat_keys)
 
 
+from ups_mcp.shipment_validator import build_elicitation_schema
+from pydantic import BaseModel
+
+
+class BuildElicitationSchemaTests(unittest.TestCase):
+    def test_schema_has_only_missing_fields(self) -> None:
+        missing = [
+            MissingField("a.b", "shipper_name", "Shipper name"),
+            MissingField("c.d", "service_code", "Service code"),
+        ]
+        schema = build_elicitation_schema(missing)
+        self.assertTrue(issubclass(schema, BaseModel))
+        field_names = set(schema.model_fields.keys())
+        self.assertEqual(field_names, {"shipper_name", "service_code"})
+
+    def test_all_fields_are_str_type(self) -> None:
+        missing = [
+            MissingField("a.b", "shipper_name", "Shipper name"),
+            MissingField("c.d", "package_1_weight", "Package weight"),
+        ]
+        schema = build_elicitation_schema(missing)
+        for field_info in schema.model_fields.values():
+            self.assertEqual(field_info.annotation, str)
+
+    def test_field_descriptions_match_prompts(self) -> None:
+        missing = [
+            MissingField("a.b", "shipper_name", "Shipper name"),
+        ]
+        schema = build_elicitation_schema(missing)
+        self.assertEqual(
+            schema.model_fields["shipper_name"].description,
+            "Shipper name",
+        )
+
+    def test_empty_missing_returns_valid_model(self) -> None:
+        schema = build_elicitation_schema([])
+        self.assertTrue(issubclass(schema, BaseModel))
+        self.assertEqual(len(schema.model_fields), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

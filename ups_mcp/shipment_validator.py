@@ -438,3 +438,19 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
                         missing.append(MissingField(full_dot_path, flat_key, prompt))
 
     return missing
+
+
+# ---------------------------------------------------------------------------
+# Elicitation schema generation
+# ---------------------------------------------------------------------------
+
+def build_elicitation_schema(missing: list[MissingField]) -> type[BaseModel]:
+    """Create a dynamic flat Pydantic model with one str field per missing field.
+
+    All fields are required str types with descriptions from the MissingField prompts.
+    This model is suitable for passing to ``ctx.elicit(schema=...)``.
+    """
+    field_definitions: dict[str, Any] = {}
+    for mf in missing:
+        field_definitions[mf.flat_key] = (str, Field(description=mf.prompt))
+    return create_model("MissingShipmentFields", **field_definitions)
