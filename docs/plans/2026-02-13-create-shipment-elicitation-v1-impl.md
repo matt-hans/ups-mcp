@@ -107,7 +107,8 @@ from ups_mcp.shipment_validator import (
     MissingField,
     UNCONDITIONAL_RULES,
     PACKAGE_RULES,
-    PAYMENT_RULES,
+    PAYMENT_CHARGE_TYPE_RULE,
+    PAYMENT_PAYER_RULES,
     COUNTRY_CONDITIONAL_RULES,
     BUILT_IN_DEFAULTS,
     ENV_DEFAULTS,
@@ -133,14 +134,20 @@ class DataStructureTests(unittest.TestCase):
         self.assertIsInstance(PACKAGE_RULES, list)
         self.assertEqual(len(PACKAGE_RULES), 3)  # packaging code, weight unit, weight
 
-    def test_payment_rules_is_nonempty_list(self) -> None:
-        self.assertIsInstance(PAYMENT_RULES, list)
-        self.assertGreater(len(PAYMENT_RULES), 0)
+    def test_payment_charge_type_rule_exists(self) -> None:
+        self.assertIsInstance(PAYMENT_CHARGE_TYPE_RULE, FieldRule)
+        self.assertEqual(PAYMENT_CHARGE_TYPE_RULE.flat_key, "payment_charge_type")
 
-    def test_payment_rules_include_charge_type_and_account(self) -> None:
-        flat_keys = {r.flat_key for r in PAYMENT_RULES}
-        self.assertIn("payment_charge_type", flat_keys)
-        self.assertIn("payment_account_number", flat_keys)
+    def test_payment_payer_rules_has_bill_shipper(self) -> None:
+        self.assertIn("BillShipper", PAYMENT_PAYER_RULES)
+        rule = PAYMENT_PAYER_RULES["BillShipper"]
+        self.assertEqual(rule.flat_key, "payment_account_number")
+
+    def test_payment_payer_rules_has_bill_receiver(self) -> None:
+        self.assertIn("BillReceiver", PAYMENT_PAYER_RULES)
+
+    def test_payment_payer_rules_has_bill_third_party(self) -> None:
+        self.assertIn("BillThirdParty", PAYMENT_PAYER_RULES)
 
     def test_country_conditional_rules_has_us_ca_pr(self) -> None:
         self.assertIn(("US", "CA", "PR"), COUNTRY_CONDITIONAL_RULES)
@@ -168,7 +175,7 @@ class DataStructureTests(unittest.TestCase):
             "UPS_ACCOUNT_NUMBER",
         )
 
-    def test_env_defaults_has_payment_account_number(self) -> None:
+    def test_env_defaults_has_bill_shipper_account(self) -> None:
         self.assertIn(
             "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].BillShipper.AccountNumber",
             ENV_DEFAULTS,
@@ -245,21 +252,38 @@ UNCONDITIONAL_RULES: list[FieldRule] = [
 
 
 # ---------------------------------------------------------------------------
-# Required field rules — payment (charge type + payer account)
+# Required field rules — payment
+#
+# Charge type is always required. Payer account is conditional on which
+# billing object is present (BillShipper, BillReceiver, BillThirdParty).
+# If no billing object is present, we default to requiring BillShipper.
 # ---------------------------------------------------------------------------
 
-PAYMENT_RULES: list[FieldRule] = [
-    FieldRule(
-        "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].Type",
-        "payment_charge_type",
-        "Shipment charge type (01=Transportation, 02=Duties and Taxes)",
-    ),
-    FieldRule(
+PAYMENT_CHARGE_TYPE_RULE: FieldRule = FieldRule(
+    "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].Type",
+    "payment_charge_type",
+    "Shipment charge type (01=Transportation, 02=Duties and Taxes)",
+)
+
+# Maps billing object key -> FieldRule for the account number within that object.
+# find_missing_fields checks which billing object is present and validates accordingly.
+PAYMENT_PAYER_RULES: dict[str, FieldRule] = {
+    "BillShipper": FieldRule(
         "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].BillShipper.AccountNumber",
         "payment_account_number",
         "Billing account number",
     ),
-]
+    "BillReceiver": FieldRule(
+        "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].BillReceiver.AccountNumber",
+        "payment_account_number",
+        "Billing account number",
+    ),
+    "BillThirdParty": FieldRule(
+        "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].BillThirdParty.AccountNumber",
+        "payment_account_number",
+        "Billing account number",
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +300,10 @@ PACKAGE_RULES: list[FieldRule] = [
 # ---------------------------------------------------------------------------
 # Required field rules — conditional by country
 # Sub-paths relative to each address (Shipper.Address or ShipTo.Address).
+#
+# v1 scope: Only US/CA/PR are enforced. Other countries may require postal
+# codes or province codes, but UPS API will catch those. A broader postal
+# requirement strategy is planned for v2.
 # ---------------------------------------------------------------------------
 
 COUNTRY_CONDITIONAL_RULES: dict[tuple[str, ...], list[FieldRule]] = {
@@ -408,17 +436,17 @@ class SetFieldTests(unittest.TestCase):
             "Test",
         )
 
-    def test_coerces_non_dict_intermediate_to_dict(self) -> None:
-        """When an intermediate node is a string but we need a dict, coerce it."""
+    def test_raises_on_existing_non_dict_intermediate(self) -> None:
+        """When an existing intermediate node is a string but we need a dict, raise."""
         data: dict = {"a": {"b": "was_a_string"}}
-        _set_field(data, "a.b.c", "value")
-        self.assertEqual(data["a"]["b"], {"c": "value"})
+        with self.assertRaises(TypeError):
+            _set_field(data, "a.b.c", "value")
 
-    def test_coerces_non_list_intermediate_to_list(self) -> None:
-        """When an intermediate node should be a list but isn't, coerce it."""
+    def test_raises_on_existing_non_list_intermediate(self) -> None:
+        """When an existing intermediate should be a list but isn't, raise."""
         data: dict = {"a": {"b": "was_a_string"}}
-        _set_field(data, "a.b[0]", "value")
-        self.assertEqual(data["a"]["b"], ["value"])
+        with self.assertRaises(TypeError):
+            _set_field(data, "a.b[0]", "value")
 
     def test_preserves_existing_list_elements(self) -> None:
         data: dict = {"a": {"b": ["existing"]}}
@@ -475,36 +503,48 @@ def _field_exists(data: dict, dot_path: str) -> bool:
 def _set_field(data: dict, dot_path: str, value: Any) -> None:
     """Set a value at a dot-path, creating intermediate dicts/lists as needed.
 
-    If an intermediate node has an incompatible type (e.g. a string where a dict
-    is needed), it is coerced to the required type. This is intentional — callers
-    are responsible for not calling _set_field on paths with conflicting semantics.
+    Only creates intermediates when the node is missing. If an existing node
+    has an incompatible type (e.g. a string where a dict is needed), raises
+    TypeError instead of silently overwriting data.
     """
     segments = dot_path.split(".")
     current = data
     for segment in segments[:-1]:
         key, idx = _parse_path_segment(segment)
-        if key not in current or not isinstance(current[key], (dict, list)):
+        if key not in current:
             current[key] = [] if idx is not None else {}
         target = current[key]
         if idx is not None:
             if not isinstance(target, list):
-                current[key] = []
-                target = current[key]
+                raise TypeError(
+                    f"Expected list at '{key}' in path '{dot_path}', "
+                    f"got {type(target).__name__}"
+                )
             while len(target) <= idx:
                 target.append({})
             if not isinstance(target[idx], dict):
-                target[idx] = {}
+                raise TypeError(
+                    f"Expected dict at '{key}[{idx}]' in path '{dot_path}', "
+                    f"got {type(target[idx]).__name__}"
+                )
             current = target[idx]
         else:
             if not isinstance(target, dict):
-                current[key] = {}
-                target = current[key]
+                raise TypeError(
+                    f"Expected dict at '{key}' in path '{dot_path}', "
+                    f"got {type(target).__name__}"
+                )
             current = target
 
     last_key, last_idx = _parse_path_segment(segments[-1])
     if last_idx is not None:
-        if last_key not in current or not isinstance(current.get(last_key), list):
+        if last_key not in current:
             current[last_key] = []
+        if not isinstance(current[last_key], list):
+            raise TypeError(
+                f"Expected list at '{last_key}' in path '{dot_path}', "
+                f"got {type(current[last_key]).__name__}"
+            )
         while len(current[last_key]) <= last_idx:
             current[last_key].append(None)
         current[last_key][last_idx] = value
@@ -719,6 +759,56 @@ class FindMissingFieldsUnconditionalTests(unittest.TestCase):
         self.assertIn("payment_charge_type", flat_keys)
         self.assertIn("payment_account_number", flat_keys)
 
+    def test_bill_receiver_account_validated(self) -> None:
+        """BillReceiver present but missing AccountNumber triggers validation."""
+        body = make_complete_body()
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"] = [{
+            "Type": "01",
+            "BillReceiver": {},
+        }]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("payment_account_number", flat_keys)
+        # Dot path should point to BillReceiver, not BillShipper
+        account_rule = [mf for mf in missing if mf.flat_key == "payment_account_number"]
+        self.assertIn("BillReceiver", account_rule[0].dot_path)
+
+    def test_bill_third_party_account_validated(self) -> None:
+        """BillThirdParty present but missing AccountNumber triggers validation."""
+        body = make_complete_body()
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"] = [{
+            "Type": "01",
+            "BillThirdParty": {},
+        }]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("payment_account_number", flat_keys)
+        account_rule = [mf for mf in missing if mf.flat_key == "payment_account_number"]
+        self.assertIn("BillThirdParty", account_rule[0].dot_path)
+
+    def test_bill_receiver_with_account_passes(self) -> None:
+        """BillReceiver with AccountNumber present should not be flagged."""
+        body = make_complete_body()
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"] = [{
+            "Type": "01",
+            "BillReceiver": {"AccountNumber": "RCV123"},
+        }]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("payment_account_number", flat_keys)
+
+    def test_no_billing_object_defaults_to_bill_shipper(self) -> None:
+        """No billing object present defaults to requiring BillShipper.AccountNumber."""
+        body = make_complete_body()
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"] = [{
+            "Type": "01",
+        }]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("payment_account_number", flat_keys)
+        account_rule = [mf for mf in missing if mf.flat_key == "payment_account_number"]
+        self.assertIn("BillShipper", account_rule[0].dot_path)
+
     def test_returns_missing_field_instances(self) -> None:
         body = make_complete_body()
         del body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"]
@@ -798,10 +888,40 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
         if not _field_exists(request_body, rule.dot_path):
             missing.append(MissingField(rule.dot_path, rule.flat_key, rule.prompt))
 
-    # Payment fields (fixed paths with array indices)
-    for rule in PAYMENT_RULES:
-        if not _field_exists(request_body, rule.dot_path):
-            missing.append(MissingField(rule.dot_path, rule.flat_key, rule.prompt))
+    # Payment: charge type is always required
+    if not _field_exists(request_body, PAYMENT_CHARGE_TYPE_RULE.dot_path):
+        missing.append(MissingField(
+            PAYMENT_CHARGE_TYPE_RULE.dot_path,
+            PAYMENT_CHARGE_TYPE_RULE.flat_key,
+            PAYMENT_CHARGE_TYPE_RULE.prompt,
+        ))
+
+    # Payment: payer account is conditional on which billing object is present.
+    # Check BillShipper, BillReceiver, BillThirdParty in order. If one is
+    # present, validate its account number. If none is present, default to
+    # requiring BillShipper.AccountNumber.
+    charge = (
+        request_body
+        .get("ShipmentRequest", {})
+        .get("Shipment", {})
+        .get("PaymentInformation", {})
+        .get("ShipmentCharge", [{}])
+    )
+    first_charge = charge[0] if isinstance(charge, list) and charge else {}
+    payer_found = False
+    for payer_key, rule in PAYMENT_PAYER_RULES.items():
+        if payer_key in first_charge:
+            payer_found = True
+            if not _field_exists(request_body, rule.dot_path):
+                missing.append(MissingField(rule.dot_path, rule.flat_key, rule.prompt))
+            break
+    if not payer_found:
+        # No billing object present — require BillShipper.AccountNumber
+        default_rule = PAYMENT_PAYER_RULES["BillShipper"]
+        if not _field_exists(request_body, default_rule.dot_path):
+            missing.append(MissingField(
+                default_rule.dot_path, default_rule.flat_key, default_rule.prompt,
+            ))
 
     # Per-package fields
     packages = _normalize_packages(request_body)
@@ -1515,13 +1635,25 @@ from unittest.mock import AsyncMock
 from mcp.server.fastmcp.exceptions import ToolError
 
 from tests.shipment_fixtures import make_complete_body
-from tests.test_server_tools import FakeToolManager
+
+
+class _FakeToolManager:
+    """Minimal fake ToolManager for elicitation integration tests.
+
+    Defined locally to avoid cross-test coupling with test_server_tools.py.
+    """
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def create_shipment(self, **kwargs):
+        self.calls.append(("create_shipment", kwargs))
+        return {"ShipmentResponse": {"ShipmentResults": {}}}
 
 
 class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.original_tool_manager = server.tool_manager
-        self.fake_tool_manager = FakeToolManager()
+        self.fake_tool_manager = _FakeToolManager()
         server.tool_manager = self.fake_tool_manager
 
     def tearDown(self) -> None:
@@ -1643,6 +1775,21 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(str(cm.exception))
         self.assertEqual(payload["code"], "INCOMPLETE_SHIPMENT")
 
+    async def test_package_dict_canonicalized_to_list_before_ups_call(self) -> None:
+        """A complete body with Package as dict should be canonicalized to list."""
+        body = make_complete_body()
+        # Convert Package from list to dict
+        body["ShipmentRequest"]["Shipment"]["Package"] = (
+            body["ShipmentRequest"]["Shipment"]["Package"][0]
+        )
+        self.assertIsInstance(body["ShipmentRequest"]["Shipment"]["Package"], dict)
+        result = await server.create_shipment(request_body=body)
+        self.assertIn("ShipmentResponse", result)
+        # Verify the body sent to UPS has Package as list
+        call_args = self.fake_tool_manager.calls[0][1]
+        pkg = call_args["request_body"]["ShipmentRequest"]["Shipment"]["Package"]
+        self.assertIsInstance(pkg, list)
+
     async def test_error_payload_structured_missing_objects(self) -> None:
         """Error payload uses structured missing array, not split parallel structures."""
         body: dict = {"ShipmentRequest": {}}
@@ -1711,6 +1858,7 @@ async def create_shipment(
         build_elicitation_schema,
         normalize_elicited_values,
         rehydrate,
+        _ensure_package_list,
     )
 
     # 1. Apply 3-tier defaults
@@ -1720,15 +1868,20 @@ async def create_shipment(
     # 2. Preflight: find missing required fields
     missing = find_missing_fields(merged_body)
 
-    # 3. Happy path — all fields present
-    if not missing:
+    # Helper: canonicalize Package to list and send to UPS
+    def _send_to_ups(body):
+        canonical = _ensure_package_list(body)
         return _require_tool_manager().create_shipment(
-            request_body=merged_body,
+            request_body=canonical,
             version=version,
             additionaladdressvalidation=additionaladdressvalidation or None,
             trans_id=trans_id or None,
             transaction_src=transaction_src,
         )
+
+    # 3. Happy path — all fields present
+    if not missing:
+        return _send_to_ups(merged_body)
 
     # Helper: build structured missing payload
     def _missing_payload(fields):
@@ -1756,13 +1909,7 @@ async def create_shipment(
                     "reason": "still_missing",
                     "missing": _missing_payload(still_missing),
                 }))
-            return _require_tool_manager().create_shipment(
-                request_body=merged_body,
-                version=version,
-                additionaladdressvalidation=additionaladdressvalidation or None,
-                trans_id=trans_id or None,
-                transaction_src=transaction_src,
-            )
+            return _send_to_ups(merged_body)
 
         elif result.action == "decline":
             raise ToolError(json.dumps({
@@ -1860,16 +2007,28 @@ git commit -m "fix: update existing create_shipment tests for preflight validati
 
 ## Review Findings Addressed
 
+### Round 1
+
 | Finding | Severity | Resolution |
 |---------|----------|------------|
 | Import path risk (`from tests.` without `__init__.py`) | P0 | Added `tests/__init__.py` in Task 1 |
-| Missing PaymentInformation rules | P0 | Added `PAYMENT_RULES` + built-in/env defaults for charge type + billing account |
+| Missing PaymentInformation rules | P0 | Added payment rules + built-in/env defaults for charge type + billing account (superseded by round 2 P0 conditional payment fix) |
 | Package dict vs list instability | P1 | `_ensure_package_list()` normalizes to list in `rehydrate()` and `_normalize_packages()` in `find_missing_fields()` |
 | Whitespace-only values bypass detection | P1 | `_field_exists()` strips and rejects whitespace-only strings |
-| `_set_field` overwrite of incompatible types | P1 | Coercion with explicit docstring; tests for non-dict/non-list intermediates |
+| `_set_field` overwrite of incompatible types | P1 | Originally added coercion; superseded by round 2 P1 — now raises `TypeError` instead |
 | Error payload split structures | P1 | Replaced `missing_fields`/`field_prompts` with single `missing` array of `{dot_path, flat_key, prompt}` objects |
 | No post-elicitation normalization | P1 | Added `normalize_elicited_values()`: trim, uppercase codes, remove empties |
 | Mock-heavy capability tests | P2 | Added `test_with_real_capability_objects` and `test_attribute_error_returns_false` |
+
+### Round 2
+
+| Finding | Severity | Resolution |
+|---------|----------|------------|
+| Payment validation too rigid (rejects BillReceiver/BillThirdParty) | P0 | Replaced static `PAYMENT_RULES` with `PAYMENT_CHARGE_TYPE_RULE` (always required) + `PAYMENT_PAYER_RULES` dict (conditional on which billing object is present). `find_missing_fields` checks BillShipper/BillReceiver/BillThirdParty in order; defaults to BillShipper if none present. Tests cover all payer types. |
+| `_set_field` allows destructive coercion of existing structures | P1 | Changed to only create intermediates when node is missing. Raises `TypeError` when an existing node has an incompatible type instead of silently overwriting. Tests updated to assert `TypeError`. |
+| Package shape not canonicalized before UPS call | P1 | Added `_send_to_ups()` helper in server orchestration that calls `_ensure_package_list()` before every `_require_tool_manager().create_shipment()` call. Test `test_package_dict_canonicalized_to_list_before_ups_call` verifies. |
+| Country-conditional rules narrow scope | P1 | Added v1 scope comment to `COUNTRY_CONDITIONAL_RULES` documenting that only US/CA/PR are enforced, broader strategy planned for v2. Acceptable for v1. |
+| Test coupling (FakeToolManager import from test_server_tools) | P2 | Defined local `_FakeToolManager` in `test_server_elicitation.py` with only `create_shipment` method. No cross-test imports. |
 
 ## Commit History (expected)
 

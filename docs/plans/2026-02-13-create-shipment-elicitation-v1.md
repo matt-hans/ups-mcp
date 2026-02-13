@@ -56,6 +56,17 @@ Pure functions, zero MCP/protocol dependencies.
 
 `{i}` is 0-indexed (internal), `{n}` is 1-indexed (user-facing flat keys).
 
+### Required Fields — Payment (Conditional on Payer Type)
+
+| Dot Path | Flat Key | Prompt | Condition |
+|----------|----------|--------|-----------|
+| `ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].Type` | `payment_charge_type` | Shipment charge type (01=Transportation, 02=Duties and Taxes) | Always required |
+| `ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].BillShipper.AccountNumber` | `payment_account_number` | Billing account number | When BillShipper present or no billing object present |
+| `ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].BillReceiver.AccountNumber` | `payment_account_number` | Billing account number | When BillReceiver present |
+| `ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].BillThirdParty.AccountNumber` | `payment_account_number` | Billing account number | When BillThirdParty present |
+
+Payer validation is conditional: check which billing object (BillShipper, BillReceiver, BillThirdParty) is present in ShipmentCharge[0] and validate its AccountNumber. If no billing object is present, default to requiring BillShipper.AccountNumber.
+
 ### Required Fields — Conditional by Country
 
 | Countries | Additional Fields |
