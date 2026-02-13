@@ -105,6 +105,7 @@ import unittest
 
 from ups_mcp.shipment_validator import (
     MissingField,
+    FieldRule,
     UNCONDITIONAL_RULES,
     PACKAGE_RULES,
     PAYMENT_CHARGE_TYPE_RULE,
@@ -175,8 +176,9 @@ class DataStructureTests(unittest.TestCase):
             "UPS_ACCOUNT_NUMBER",
         )
 
-    def test_env_defaults_has_bill_shipper_account(self) -> None:
-        self.assertIn(
+    def test_env_defaults_does_not_have_bill_shipper_account(self) -> None:
+        """BillShipper.AccountNumber is conditionally applied, not in ENV_DEFAULTS."""
+        self.assertNotIn(
             "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].BillShipper.AccountNumber",
             ENV_DEFAULTS,
         )
@@ -326,8 +328,16 @@ BUILT_IN_DEFAULTS: dict[str, str] = {
 ENV_DEFAULTS: dict[str, str] = {
     # key = dot-path, value = env-var name to read from env_config
     "ShipmentRequest.Shipment.Shipper.ShipperNumber": "UPS_ACCOUNT_NUMBER",
-    "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].BillShipper.AccountNumber": "UPS_ACCOUNT_NUMBER",
+    # NOTE: BillShipper.AccountNumber is NOT in ENV_DEFAULTS. It is applied
+    # conditionally in apply_defaults() only when no payer object
+    # (BillShipper/BillReceiver/BillThirdParty) is present, to avoid
+    # injecting BillShipper into BillReceiver/BillThirdParty flows.
 }
+
+# Billing payer keys to check — if any of these exist in the first
+# ShipmentCharge, the caller has chosen a payer and we must not inject
+# BillShipper.AccountNumber from env.
+_PAYER_OBJECT_KEYS = ("BillShipper", "BillReceiver", "BillThirdParty")
 ```
 
 **Step 6: Run test to verify it passes**
@@ -564,8 +574,8 @@ git add ups_mcp/shipment_validator.py tests/test_shipment_validator.py
 git commit -m "feat: add dict navigation helpers with whitespace and type safety
 
 _field_exists treats whitespace-only strings as missing.
-_set_field coerces incompatible intermediate types instead of
-silently corrupting data structures."
+_set_field raises TypeError on existing incompatible intermediate
+types instead of silently overwriting data."
 ```
 
 ---
@@ -617,12 +627,63 @@ class ApplyDefaultsTests(unittest.TestCase):
             "ABC123",
         )
 
-    def test_env_default_fills_payment_account_number(self) -> None:
+    def test_env_default_fills_bill_shipper_when_no_payer(self) -> None:
+        """When no payer object exists, env default injects BillShipper.AccountNumber."""
         result = apply_defaults({}, {"UPS_ACCOUNT_NUMBER": "ABC123"})
         self.assertEqual(
             result["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"][0]["BillShipper"]["AccountNumber"],
             "ABC123",
         )
+
+    def test_env_default_skips_bill_shipper_when_bill_receiver_present(self) -> None:
+        """When BillReceiver is present, env default must NOT inject BillShipper."""
+        body = {
+            "ShipmentRequest": {
+                "Shipment": {
+                    "PaymentInformation": {
+                        "ShipmentCharge": [{"Type": "01", "BillReceiver": {"AccountNumber": "RCV456"}}]
+                    }
+                }
+            }
+        }
+        result = apply_defaults(body, {"UPS_ACCOUNT_NUMBER": "ABC123"})
+        first_charge = result["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"][0]
+        self.assertNotIn("BillShipper", first_charge)
+        self.assertEqual(first_charge["BillReceiver"]["AccountNumber"], "RCV456")
+
+    def test_env_default_skips_bill_shipper_when_bill_third_party_present(self) -> None:
+        """When BillThirdParty is present, env default must NOT inject BillShipper."""
+        body = {
+            "ShipmentRequest": {
+                "Shipment": {
+                    "PaymentInformation": {
+                        "ShipmentCharge": [{"Type": "01", "BillThirdParty": {"AccountNumber": "TRD789"}}]
+                    }
+                }
+            }
+        }
+        result = apply_defaults(body, {"UPS_ACCOUNT_NUMBER": "ABC123"})
+        first_charge = result["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"][0]
+        self.assertNotIn("BillShipper", first_charge)
+
+    def test_env_default_fills_bill_shipper_when_bill_shipper_present_but_no_account(self) -> None:
+        """When BillShipper exists but has no AccountNumber, env fills it."""
+        body = {
+            "ShipmentRequest": {
+                "Shipment": {
+                    "PaymentInformation": {
+                        "ShipmentCharge": [{"Type": "01", "BillShipper": {}}]
+                    }
+                }
+            }
+        }
+        result = apply_defaults(body, {"UPS_ACCOUNT_NUMBER": "ABC123"})
+        # BillShipper is a payer object, but _has_payer_object returns True.
+        # The conditional skips. BillShipper.AccountNumber stays empty.
+        # This is correct — the caller explicitly chose BillShipper but
+        # didn't provide the account. find_missing_fields will catch it.
+        first_charge = result["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"][0]
+        self.assertNotIn("AccountNumber", first_charge.get("BillShipper", {}))
 
     def test_caller_value_overrides_env_default(self) -> None:
         body = {
@@ -658,8 +719,27 @@ Expected: FAIL with `ImportError: cannot import name 'apply_defaults'`
 Add to `ups_mcp/shipment_validator.py`:
 
 ```python
+def _has_payer_object(request_body: dict) -> bool:
+    """Check if any billing payer object exists in the first ShipmentCharge."""
+    charge = (
+        request_body
+        .get("ShipmentRequest", {})
+        .get("Shipment", {})
+        .get("PaymentInformation", {})
+        .get("ShipmentCharge", [{}])
+    )
+    first_charge = charge[0] if isinstance(charge, list) and charge else (
+        charge if isinstance(charge, dict) else {}
+    )
+    return any(key in first_charge for key in _PAYER_OBJECT_KEYS)
+
+
 def apply_defaults(request_body: dict, env_config: dict[str, str]) -> dict:
     """Apply 3-tier defaults: built-in -> env -> caller body (highest priority).
+
+    BillShipper.AccountNumber env default is only applied when no payer
+    object (BillShipper/BillReceiver/BillThirdParty) exists in the request,
+    to avoid overriding the caller's intended billing flow.
 
     Returns a new dict — does not mutate the input.
     """
@@ -675,6 +755,13 @@ def apply_defaults(request_body: dict, env_config: dict[str, str]) -> dict:
         env_value = env_config.get(env_var_name, "")
         if env_value and not _field_exists(result, dot_path):
             _set_field(result, dot_path, env_value)
+
+    # Conditional env default: BillShipper.AccountNumber
+    # Only inject when NO payer object exists in the request.
+    bill_shipper_path = "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].BillShipper.AccountNumber"
+    account_number = env_config.get("UPS_ACCOUNT_NUMBER", "")
+    if account_number and not _has_payer_object(result) and not _field_exists(result, bill_shipper_path):
+        _set_field(result, bill_shipper_path, account_number)
 
     return result
 ```
@@ -809,6 +896,19 @@ class FindMissingFieldsUnconditionalTests(unittest.TestCase):
         account_rule = [mf for mf in missing if mf.flat_key == "payment_account_number"]
         self.assertIn("BillShipper", account_rule[0].dot_path)
 
+    def test_shipment_charge_as_dict_normalized(self) -> None:
+        """ShipmentCharge as a dict (not list) should be normalized and validated."""
+        body = make_complete_body()
+        # Convert ShipmentCharge from list to dict
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"] = {
+            "Type": "01",
+            "BillShipper": {"AccountNumber": "129D9Y"},
+        }
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("payment_charge_type", flat_keys)
+        self.assertNotIn("payment_account_number", flat_keys)
+
     def test_returns_missing_field_instances(self) -> None:
         body = make_complete_body()
         del body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"]
@@ -907,7 +1007,12 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
         .get("PaymentInformation", {})
         .get("ShipmentCharge", [{}])
     )
-    first_charge = charge[0] if isinstance(charge, list) and charge else {}
+    # Normalize ShipmentCharge: dict -> [dict], like Package normalization
+    if isinstance(charge, dict):
+        charge = [charge]
+    elif not isinstance(charge, list):
+        charge = [{}]
+    first_charge = charge[0] if charge else {}
     payer_found = False
     for payer_key, rule in PAYMENT_PAYER_RULES.items():
         if payer_key in first_charge:
@@ -1205,7 +1310,7 @@ git commit -m "feat: implement build_elicitation_schema for dynamic Pydantic mod
 Append to `tests/test_shipment_validator.py`:
 
 ```python
-from ups_mcp.shipment_validator import normalize_elicited_values, rehydrate
+from ups_mcp.shipment_validator import normalize_elicited_values, rehydrate, RehydrationError
 
 
 class NormalizeElicitedValuesTests(unittest.TestCase):
@@ -1364,6 +1469,26 @@ class RehydrateTests(unittest.TestCase):
             "10",
         )
 
+    def test_structural_conflict_raises_rehydration_error(self) -> None:
+        """When _set_field hits a type conflict, RehydrationError is raised."""
+        body: dict = {
+            "ShipmentRequest": {
+                "Shipment": {
+                    "Shipper": {"Address": "not_a_dict"},
+                }
+            }
+        }
+        missing = [
+            MissingField(
+                "ShipmentRequest.Shipment.Shipper.Address.City",
+                "shipper_city",
+                "Shipper city",
+            ),
+        ]
+        with self.assertRaises(RehydrationError) as cm:
+            rehydrate(body, {"shipper_city": "NYC"}, missing)
+        self.assertEqual(cm.exception.flat_key, "shipper_city")
+
     def test_normalizes_package_dict_to_list_during_rehydration(self) -> None:
         """If Package was a dict, rehydrate should still work via list normalization."""
         body: dict = {
@@ -1422,6 +1547,17 @@ def normalize_elicited_values(flat_data: dict[str, str]) -> dict[str, str]:
     return result
 
 
+class RehydrationError(Exception):
+    """Raised when rehydration encounters a structural conflict in the request body."""
+    def __init__(self, flat_key: str, dot_path: str, original_error: TypeError):
+        self.flat_key = flat_key
+        self.dot_path = dot_path
+        self.original_error = original_error
+        super().__init__(
+            f"Cannot set '{flat_key}' at '{dot_path}': {original_error}"
+        )
+
+
 def rehydrate(
     request_body: dict,
     flat_data: dict[str, str],
@@ -1433,6 +1569,8 @@ def rehydrate(
     Skips empty/None values. Does not overwrite existing non-empty values.
     Normalizes Package dict to list for consistent structure.
     Returns a new dict — does not mutate the input.
+
+    Raises RehydrationError if a structural conflict prevents setting a value.
     """
     flat_to_dot = {mf.flat_key: mf.dot_path for mf in missing}
     result = _ensure_package_list(request_body)
@@ -1444,7 +1582,10 @@ def rehydrate(
         if dot_path is None:
             continue
         if not _field_exists(result, dot_path):
-            _set_field(result, dot_path, value)
+            try:
+                _set_field(result, dot_path, value)
+            except TypeError as exc:
+                raise RehydrationError(flat_key, dot_path, exc) from exc
 
     return result
 ```
@@ -1775,6 +1916,31 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(str(cm.exception))
         self.assertEqual(payload["code"], "INCOMPLETE_SHIPMENT")
 
+    async def test_rehydration_error_raises_structured_tool_error(self) -> None:
+        """When rehydrate hits a structural conflict, ToolError wraps it."""
+        body = make_complete_body()
+        del body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"]
+        # Corrupt the structure so rehydration will fail
+        body["ShipmentRequest"]["Shipment"]["Shipper"]["Address"] = "not_a_dict"
+
+        mock_data = MagicMock()
+        mock_data.model_dump.return_value = {
+            "shipper_name": "Test",
+            "shipper_address_line_1": "123 Main",  # This will fail — Address is a string
+        }
+        accepted = MagicMock()
+        accepted.action = "accept"
+        accepted.data = mock_data
+
+        # Missing fields will include shipper_name and shipper_address_line_1
+        # because we deleted Name and corrupted Address
+        ctx = self._make_ctx(form_supported=True, elicit_result=accepted)
+        with self.assertRaises(ToolError) as cm:
+            await server.create_shipment(request_body=body, ctx=ctx)
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "ELICITATION_INVALID_RESPONSE")
+        self.assertEqual(payload["reason"], "rehydration_error")
+
     async def test_package_dict_canonicalized_to_list_before_ups_call(self) -> None:
         """A complete body with Package as dict should be canonicalized to list."""
         body = make_complete_body()
@@ -1858,6 +2024,7 @@ async def create_shipment(
         build_elicitation_schema,
         normalize_elicited_values,
         rehydrate,
+        RehydrationError,
         _ensure_package_list,
     )
 
@@ -1900,7 +2067,15 @@ async def create_shipment(
 
         if result.action == "accept":
             normalized = normalize_elicited_values(result.data.model_dump())
-            merged_body = rehydrate(merged_body, normalized, missing)
+            try:
+                merged_body = rehydrate(merged_body, normalized, missing)
+            except RehydrationError as exc:
+                raise ToolError(json.dumps({
+                    "code": "ELICITATION_INVALID_RESPONSE",
+                    "message": f"Elicited data conflicts with request structure: {exc}",
+                    "reason": "rehydration_error",
+                    "missing": _missing_payload(missing),
+                }))
             still_missing = find_missing_fields(merged_body)
             if still_missing:
                 raise ToolError(json.dumps({
@@ -2029,6 +2204,16 @@ git commit -m "fix: update existing create_shipment tests for preflight validati
 | Package shape not canonicalized before UPS call | P1 | Added `_send_to_ups()` helper in server orchestration that calls `_ensure_package_list()` before every `_require_tool_manager().create_shipment()` call. Test `test_package_dict_canonicalized_to_list_before_ups_call` verifies. |
 | Country-conditional rules narrow scope | P1 | Added v1 scope comment to `COUNTRY_CONDITIONAL_RULES` documenting that only US/CA/PR are enforced, broader strategy planned for v2. Acceptable for v1. |
 | Test coupling (FakeToolManager import from test_server_tools) | P2 | Defined local `_FakeToolManager` in `test_server_elicitation.py` with only `create_shipment` method. No cross-test imports. |
+
+### Round 3
+
+| Finding | Severity | Resolution |
+|---------|----------|------------|
+| Payment env default overrides intended payer flow | P0 | Removed `BillShipper.AccountNumber` from `ENV_DEFAULTS`. Added `_has_payer_object()` helper. `apply_defaults()` only injects BillShipper.AccountNumber when no payer object (BillShipper/BillReceiver/BillThirdParty) exists. 4 new tests cover all payer scenarios. |
+| `FieldRule` not imported in Task 1 test | P1 | Added `FieldRule` to test imports. |
+| ShipmentCharge shape not normalized | P1 | Added dict→list normalization in `find_missing_fields()` payer detection and in `_has_payer_object()`. Test `test_shipment_charge_as_dict_normalized` verifies. |
+| TypeError from `_set_field` surfaces as non-structured error | P1 | Added `RehydrationError` exception. `rehydrate()` catches `TypeError` and wraps as `RehydrationError`. Server catches `RehydrationError` and wraps as `ToolError` with code `ELICITATION_INVALID_RESPONSE`. Tests at both levels. |
+| Task 2 commit message says "coercion" but impl raises TypeError | P2 | Updated commit message to say "raises TypeError on existing incompatible intermediate types". |
 
 ## Commit History (expected)
 

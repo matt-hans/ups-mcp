@@ -91,9 +91,10 @@ Precedence: caller `request_body` (highest) > env config > built-in defaults (lo
 | `ShipmentRequest.Request.RequestOption` | `"nonvalidate"` |
 
 **Env defaults:**
-| Field | Env Var |
-|-------|---------|
-| `ShipmentRequest.Shipment.Shipper.ShipperNumber` | `UPS_ACCOUNT_NUMBER` |
+| Field | Env Var | Condition |
+|-------|---------|-----------|
+| `ShipmentRequest.Shipment.Shipper.ShipperNumber` | `UPS_ACCOUNT_NUMBER` | Always (when not already set) |
+| `ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].BillShipper.AccountNumber` | `UPS_ACCOUNT_NUMBER` | Only when no payer object (BillShipper/BillReceiver/BillThirdParty) exists |
 
 No country code defaults. No packaging code defaults. No weight unit defaults.
 
