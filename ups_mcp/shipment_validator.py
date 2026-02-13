@@ -226,3 +226,54 @@ def _set_field(data: dict, dot_path: str, value: Any) -> None:
         current[last_key][last_idx] = value
     else:
         current[last_key] = value
+
+
+# ---------------------------------------------------------------------------
+# 3-tier defaults application
+# ---------------------------------------------------------------------------
+
+def _has_payer_object(request_body: dict) -> bool:
+    """Check if any billing payer object exists in the first ShipmentCharge."""
+    charge = (
+        request_body
+        .get("ShipmentRequest", {})
+        .get("Shipment", {})
+        .get("PaymentInformation", {})
+        .get("ShipmentCharge", [{}])
+    )
+    first_charge = charge[0] if isinstance(charge, list) and charge else (
+        charge if isinstance(charge, dict) else {}
+    )
+    return any(key in first_charge for key in _PAYER_OBJECT_KEYS)
+
+
+def apply_defaults(request_body: dict, env_config: dict[str, str]) -> dict:
+    """Apply 3-tier defaults: built-in -> env -> caller body (highest priority).
+
+    BillShipper.AccountNumber env default is only applied when no payer
+    object (BillShipper/BillReceiver/BillThirdParty) exists in the request,
+    to avoid overriding the caller's intended billing flow.
+
+    Returns a new dict — does not mutate the input.
+    """
+    result = copy.deepcopy(request_body)
+
+    # Built-in defaults (lowest priority)
+    for dot_path, value in BUILT_IN_DEFAULTS.items():
+        if not _field_exists(result, dot_path):
+            _set_field(result, dot_path, value)
+
+    # Env defaults (middle priority)
+    for dot_path, env_var_name in ENV_DEFAULTS.items():
+        env_value = env_config.get(env_var_name, "")
+        if env_value and not _field_exists(result, dot_path):
+            _set_field(result, dot_path, env_value)
+
+    # Conditional env default: BillShipper.AccountNumber
+    # Only inject when NO payer object exists in the request.
+    bill_shipper_path = "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].BillShipper.AccountNumber"
+    account_number = env_config.get("UPS_ACCOUNT_NUMBER", "")
+    if account_number and not _has_payer_object(result) and not _field_exists(result, bill_shipper_path):
+        _set_field(result, bill_shipper_path, account_number)
+
+    return result

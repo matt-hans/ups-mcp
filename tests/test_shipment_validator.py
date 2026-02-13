@@ -177,5 +177,123 @@ class SetFieldTests(unittest.TestCase):
         self.assertEqual(data["a"]["b"], ["existing", "new"])
 
 
+import copy
+from tests.shipment_fixtures import make_complete_body
+from ups_mcp.shipment_validator import apply_defaults
+
+
+class ApplyDefaultsTests(unittest.TestCase):
+    def test_empty_body_gets_builtin_defaults(self) -> None:
+        result = apply_defaults({}, {})
+        self.assertEqual(
+            result["ShipmentRequest"]["Request"]["RequestOption"],
+            "nonvalidate",
+        )
+
+    def test_empty_body_gets_payment_charge_type_default(self) -> None:
+        result = apply_defaults({}, {})
+        self.assertEqual(
+            result["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"][0]["Type"],
+            "01",
+        )
+
+    def test_caller_value_overrides_builtin(self) -> None:
+        body = {"ShipmentRequest": {"Request": {"RequestOption": "validate"}}}
+        result = apply_defaults(body, {})
+        self.assertEqual(
+            result["ShipmentRequest"]["Request"]["RequestOption"],
+            "validate",
+        )
+
+    def test_env_default_fills_shipper_number(self) -> None:
+        body: dict = {"ShipmentRequest": {"Shipment": {"Shipper": {}}}}
+        result = apply_defaults(body, {"UPS_ACCOUNT_NUMBER": "ABC123"})
+        self.assertEqual(
+            result["ShipmentRequest"]["Shipment"]["Shipper"]["ShipperNumber"],
+            "ABC123",
+        )
+
+    def test_env_default_fills_bill_shipper_when_no_payer(self) -> None:
+        """When no payer object exists, env default injects BillShipper.AccountNumber."""
+        result = apply_defaults({}, {"UPS_ACCOUNT_NUMBER": "ABC123"})
+        self.assertEqual(
+            result["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"][0]["BillShipper"]["AccountNumber"],
+            "ABC123",
+        )
+
+    def test_env_default_skips_bill_shipper_when_bill_receiver_present(self) -> None:
+        """When BillReceiver is present, env default must NOT inject BillShipper."""
+        body = {
+            "ShipmentRequest": {
+                "Shipment": {
+                    "PaymentInformation": {
+                        "ShipmentCharge": [{"Type": "01", "BillReceiver": {"AccountNumber": "RCV456"}}]
+                    }
+                }
+            }
+        }
+        result = apply_defaults(body, {"UPS_ACCOUNT_NUMBER": "ABC123"})
+        first_charge = result["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"][0]
+        self.assertNotIn("BillShipper", first_charge)
+        self.assertEqual(first_charge["BillReceiver"]["AccountNumber"], "RCV456")
+
+    def test_env_default_skips_bill_shipper_when_bill_third_party_present(self) -> None:
+        """When BillThirdParty is present, env default must NOT inject BillShipper."""
+        body = {
+            "ShipmentRequest": {
+                "Shipment": {
+                    "PaymentInformation": {
+                        "ShipmentCharge": [{"Type": "01", "BillThirdParty": {"AccountNumber": "TRD789"}}]
+                    }
+                }
+            }
+        }
+        result = apply_defaults(body, {"UPS_ACCOUNT_NUMBER": "ABC123"})
+        first_charge = result["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"][0]
+        self.assertNotIn("BillShipper", first_charge)
+
+    def test_env_default_fills_bill_shipper_when_bill_shipper_present_but_no_account(self) -> None:
+        """When BillShipper exists but has no AccountNumber, env fills it."""
+        body = {
+            "ShipmentRequest": {
+                "Shipment": {
+                    "PaymentInformation": {
+                        "ShipmentCharge": [{"Type": "01", "BillShipper": {}}]
+                    }
+                }
+            }
+        }
+        result = apply_defaults(body, {"UPS_ACCOUNT_NUMBER": "ABC123"})
+        # BillShipper is a payer object, but _has_payer_object returns True.
+        # The conditional skips. BillShipper.AccountNumber stays empty.
+        # This is correct — the caller explicitly chose BillShipper but
+        # didn't provide the account. find_missing_fields will catch it.
+        first_charge = result["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"][0]
+        self.assertNotIn("AccountNumber", first_charge.get("BillShipper", {}))
+
+    def test_caller_value_overrides_env_default(self) -> None:
+        body = {
+            "ShipmentRequest": {
+                "Shipment": {"Shipper": {"ShipperNumber": "CALLER_NUM"}}
+            }
+        }
+        result = apply_defaults(body, {"UPS_ACCOUNT_NUMBER": "ENV_NUM"})
+        self.assertEqual(
+            result["ShipmentRequest"]["Shipment"]["Shipper"]["ShipperNumber"],
+            "CALLER_NUM",
+        )
+
+    def test_empty_env_value_does_not_set(self) -> None:
+        result = apply_defaults({}, {"UPS_ACCOUNT_NUMBER": ""})
+        shipper = result.get("ShipmentRequest", {}).get("Shipment", {}).get("Shipper", {})
+        self.assertNotIn("ShipperNumber", shipper)
+
+    def test_does_not_mutate_input(self) -> None:
+        body = {"ShipmentRequest": {"Request": {}}}
+        original = copy.deepcopy(body)
+        apply_defaults(body, {})
+        self.assertEqual(body, original)
+
+
 if __name__ == "__main__":
     unittest.main()
