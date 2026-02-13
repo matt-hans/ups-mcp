@@ -427,6 +427,8 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
     shipment = body.get("ShipmentRequest", {}).get("Shipment", {})
     for role, prefix in [("Shipper", "shipper"), ("ShipTo", "ship_to")]:
         address = shipment.get(role, {}).get("Address", {})
+        if not isinstance(address, dict):
+            continue
         country = str(address.get("CountryCode", "")).strip().upper()
         for countries, rules in COUNTRY_CONDITIONAL_RULES.items():
             if country in countries:

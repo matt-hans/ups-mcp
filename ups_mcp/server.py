@@ -1,6 +1,8 @@
 from typing import Any
 from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp.exceptions import ToolError
 from dotenv import load_dotenv
+import json
 import os
 import sys
 from . import tools
@@ -200,9 +202,14 @@ async def create_shipment(
     additionaladdressvalidation: str = "",
     trans_id: str = "",
     transaction_src: str = "ups-mcp",
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """
     Create a shipment using UPS Shipping API (`POST /shipments/{version}/ship`).
+
+    If required fields are missing and the client supports form-mode elicitation,
+    the server will prompt for the missing information. Otherwise, a structured
+    ToolError is raised listing the missing fields.
 
     Args:
         request_body (dict): JSON object matching `SHIPRequestWrapper`.
@@ -210,24 +217,127 @@ async def create_shipment(
             - ShipmentRequest.Request
             - ShipmentRequest.Shipment.Shipper
             - ShipmentRequest.Shipment.ShipTo
-            - ShipmentRequest.Shipment.ShipFrom
             - ShipmentRequest.Shipment.Service
             - ShipmentRequest.Shipment.Package
+            - ShipmentRequest.Shipment.PaymentInformation
         version (str): API version. Default `v2409`.
         additionaladdressvalidation (str): Optional query param (for example `city`).
         trans_id (str): Optional request id.
         transaction_src (str): Optional caller source name. Default `ups-mcp`.
+        ctx: MCP Context (injected by FastMCP, not provided by callers).
 
     Returns:
         dict[str, Any]: Raw UPS API response payload. On error, raises ToolError.
     """
-    return _require_tool_manager().create_shipment(
-        request_body=request_body,
-        version=version,
-        additionaladdressvalidation=additionaladdressvalidation or None,
-        trans_id=trans_id or None,
-        transaction_src=transaction_src,
+    from .shipment_validator import (
+        apply_defaults,
+        find_missing_fields,
+        build_elicitation_schema,
+        normalize_elicited_values,
+        rehydrate,
+        canonicalize_body,
+        RehydrationError,
+        AmbiguousPayerError,
     )
+
+    # Helper: canonicalize and send to UPS
+    def _send_to_ups(body):
+        canonical = canonicalize_body(body)
+        return _require_tool_manager().create_shipment(
+            request_body=canonical,
+            version=version,
+            additionaladdressvalidation=additionaladdressvalidation or None,
+            trans_id=trans_id or None,
+            transaction_src=transaction_src,
+        )
+
+    # 1. Canonicalize then apply 3-tier defaults (may raise TypeError on malformed bodies)
+    env_config = {"UPS_ACCOUNT_NUMBER": os.getenv("UPS_ACCOUNT_NUMBER", "")}
+    try:
+        canonical_input = canonicalize_body(request_body)
+        merged_body = apply_defaults(canonical_input, env_config)
+    except TypeError as exc:
+        raise ToolError(json.dumps({
+            "code": "MALFORMED_REQUEST",
+            "message": f"Request body has structural conflicts: {exc}",
+            "reason": "malformed_structure",
+            "missing": [],
+        }))
+
+    # 2. Preflight: find missing required fields
+    try:
+        missing = find_missing_fields(merged_body)
+    except AmbiguousPayerError as exc:
+        raise ToolError(json.dumps({
+            "code": "MALFORMED_REQUEST",
+            "message": str(exc),
+            "reason": "ambiguous_payer",
+            "missing": [],
+        }))
+
+    # 3. Happy path — all fields present
+    if not missing:
+        return _send_to_ups(merged_body)
+
+    # Helper: build structured missing payload
+    def _missing_payload(fields):
+        return [
+            {"dot_path": mf.dot_path, "flat_key": mf.flat_key, "prompt": mf.prompt}
+            for mf in fields
+        ]
+
+    # 4. Check form-mode elicitation support
+    if _check_form_elicitation(ctx):
+        schema = build_elicitation_schema(missing)
+        result = await ctx.elicit(
+            message=f"Missing {len(missing)} required field(s) for shipment creation.",
+            schema=schema,
+        )
+
+        if result.action == "accept":
+            normalized = normalize_elicited_values(result.data.model_dump())
+            try:
+                merged_body = rehydrate(merged_body, normalized, missing)
+            except RehydrationError as exc:
+                raise ToolError(json.dumps({
+                    "code": "ELICITATION_INVALID_RESPONSE",
+                    "message": f"Elicited data conflicts with request structure: {exc}",
+                    "reason": "rehydration_error",
+                    "missing": _missing_payload(missing),
+                }))
+            still_missing = find_missing_fields(merged_body)
+            if still_missing:
+                raise ToolError(json.dumps({
+                    "code": "INCOMPLETE_SHIPMENT",
+                    "message": "Still missing required fields after elicitation",
+                    "reason": "still_missing",
+                    "missing": _missing_payload(still_missing),
+                }))
+            return _send_to_ups(merged_body)
+
+        elif result.action == "decline":
+            raise ToolError(json.dumps({
+                "code": "ELICITATION_DECLINED",
+                "message": "User declined to provide missing shipment fields",
+                "reason": "declined",
+                "missing": _missing_payload(missing),
+            }))
+
+        else:  # cancel
+            raise ToolError(json.dumps({
+                "code": "ELICITATION_CANCELLED",
+                "message": "User cancelled shipment field elicitation",
+                "reason": "cancelled",
+                "missing": _missing_payload(missing),
+            }))
+
+    # 5. No form elicitation — structured ToolError for agent fallback
+    raise ToolError(json.dumps({
+        "code": "ELICITATION_UNSUPPORTED",
+        "message": f"Missing {len(missing)} required field(s) and client does not support form elicitation",
+        "reason": "unsupported",
+        "missing": _missing_payload(missing),
+    }))
 
 @mcp.tool()
 async def void_shipment(
