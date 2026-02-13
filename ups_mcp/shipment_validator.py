@@ -138,3 +138,91 @@ ENV_DEFAULTS: dict[str, str] = {
 # ShipmentCharge, the caller has chosen a payer and we must not inject
 # BillShipper.AccountNumber from env.
 _PAYER_OBJECT_KEYS = ("BillShipper", "BillReceiver", "BillThirdParty")
+
+
+# ---------------------------------------------------------------------------
+# Dict navigation helpers
+# ---------------------------------------------------------------------------
+
+def _parse_path_segment(segment: str) -> tuple[str, int | None]:
+    """Parse 'Key[0]' into ('Key', 0) or 'Key' into ('Key', None)."""
+    if "[" in segment:
+        key, bracket = segment.split("[", 1)
+        idx = int(bracket.rstrip("]"))
+        return key, idx
+    return segment, None
+
+
+def _field_exists(data: dict, dot_path: str) -> bool:
+    """Check if a dot-path resolves to a non-empty value in a nested dict.
+
+    Returns False for None, empty string, and whitespace-only strings.
+    Returns True for 0, False, and other falsy-but-meaningful values.
+    """
+    current: Any = data
+    for segment in dot_path.split("."):
+        key, idx = _parse_path_segment(segment)
+        if not isinstance(current, dict) or key not in current:
+            return False
+        current = current[key]
+        if idx is not None:
+            if not isinstance(current, list) or len(current) <= idx:
+                return False
+            current = current[idx]
+    if current is None:
+        return False
+    if isinstance(current, str) and current.strip() == "":
+        return False
+    return True
+
+
+def _set_field(data: dict, dot_path: str, value: Any) -> None:
+    """Set a value at a dot-path, creating intermediate dicts/lists as needed.
+
+    Only creates intermediates when the node is missing. If an existing node
+    has an incompatible type (e.g. a string where a dict is needed), raises
+    TypeError instead of silently overwriting data.
+    """
+    segments = dot_path.split(".")
+    current = data
+    for segment in segments[:-1]:
+        key, idx = _parse_path_segment(segment)
+        if key not in current:
+            current[key] = [] if idx is not None else {}
+        target = current[key]
+        if idx is not None:
+            if not isinstance(target, list):
+                raise TypeError(
+                    f"Expected list at '{key}' in path '{dot_path}', "
+                    f"got {type(target).__name__}"
+                )
+            while len(target) <= idx:
+                target.append({})
+            if not isinstance(target[idx], dict):
+                raise TypeError(
+                    f"Expected dict at '{key}[{idx}]' in path '{dot_path}', "
+                    f"got {type(target[idx]).__name__}"
+                )
+            current = target[idx]
+        else:
+            if not isinstance(target, dict):
+                raise TypeError(
+                    f"Expected dict at '{key}' in path '{dot_path}', "
+                    f"got {type(target).__name__}"
+                )
+            current = target
+
+    last_key, last_idx = _parse_path_segment(segments[-1])
+    if last_idx is not None:
+        if last_key not in current:
+            current[last_key] = []
+        if not isinstance(current[last_key], list):
+            raise TypeError(
+                f"Expected list at '{last_key}' in path '{dot_path}', "
+                f"got {type(current[last_key]).__name__}"
+            )
+        while len(current[last_key]) <= last_idx:
+            current[last_key].append(None)
+        current[last_key][last_idx] = value
+    else:
+        current[last_key] = value
