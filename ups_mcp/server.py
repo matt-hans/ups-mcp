@@ -1,5 +1,5 @@
 from typing import Any
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 from dotenv import load_dotenv
 import os
 import sys
@@ -40,6 +40,30 @@ def _require_tool_manager() -> tools.ToolManager:
     if tool_manager is None:
         raise RuntimeError("Tool manager is not initialized. Start UPS MCP via server.main().")
     return tool_manager
+
+
+def _check_form_elicitation(ctx: Context | None) -> bool:
+    """Check if the connected client supports form-mode elicitation."""
+    if ctx is None:
+        return False
+    try:
+        params = ctx.request_context.session.client_params
+        if params is None:
+            return False
+        caps = params.capabilities
+        if caps.elicitation is None:
+            return False
+        # Form supported if .form is explicitly present
+        if caps.elicitation.form is not None:
+            return True
+        # Backward compat: empty elicitation object (neither form nor url set)
+        if caps.elicitation.url is None:
+            return True
+        # Only url is set — form not supported
+        return False
+    except AttributeError:
+        return False
+
 
 @mcp.tool()
 async def track_package(
