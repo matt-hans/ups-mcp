@@ -584,5 +584,283 @@ class BuildElicitationSchemaTests(unittest.TestCase):
         self.assertEqual(len(schema.model_fields), 0)
 
 
+from ups_mcp.shipment_validator import (
+    normalize_elicited_values,
+    rehydrate,
+    canonicalize_body,
+    RehydrationError,
+)
+
+
+class CanonicalizeBodyTests(unittest.TestCase):
+    def test_package_dict_becomes_list(self) -> None:
+        body = {"ShipmentRequest": {"Shipment": {"Package": {"Packaging": {"Code": "02"}}}}}
+        result = canonicalize_body(body)
+        pkg = result["ShipmentRequest"]["Shipment"]["Package"]
+        self.assertIsInstance(pkg, list)
+        self.assertEqual(len(pkg), 1)
+        self.assertEqual(pkg[0]["Packaging"]["Code"], "02")
+
+    def test_shipment_charge_dict_becomes_list(self) -> None:
+        body = {
+            "ShipmentRequest": {
+                "Shipment": {
+                    "PaymentInformation": {
+                        "ShipmentCharge": {"Type": "01", "BillShipper": {"AccountNumber": "X"}}
+                    }
+                }
+            }
+        }
+        result = canonicalize_body(body)
+        sc = result["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"]
+        self.assertIsInstance(sc, list)
+        self.assertEqual(sc[0]["Type"], "01")
+
+    def test_already_lists_unchanged(self) -> None:
+        body = make_complete_body()
+        result = canonicalize_body(body)
+        self.assertEqual(
+            result["ShipmentRequest"]["Shipment"]["Package"],
+            body["ShipmentRequest"]["Shipment"]["Package"],
+        )
+
+    def test_does_not_mutate_input(self) -> None:
+        body = {"ShipmentRequest": {"Shipment": {"Package": {"Packaging": {"Code": "02"}}}}}
+        original = copy.deepcopy(body)
+        canonicalize_body(body)
+        self.assertEqual(body, original)
+
+    def test_missing_fields_tolerated(self) -> None:
+        result = canonicalize_body({})
+        self.assertEqual(result, {})
+
+    def test_non_dict_list_elements_coerced_to_empty_dict(self) -> None:
+        body = {
+            "ShipmentRequest": {
+                "Shipment": {
+                    "Package": ["not_a_dict", 42, None],
+                }
+            }
+        }
+        result = canonicalize_body(body)
+        pkgs = result["ShipmentRequest"]["Shipment"]["Package"]
+        self.assertEqual(pkgs, [{}, {}, {}])
+
+    def test_non_dict_shipment_charge_elements_coerced(self) -> None:
+        body = {
+            "ShipmentRequest": {
+                "Shipment": {
+                    "PaymentInformation": {
+                        "ShipmentCharge": ["bad_element"],
+                    }
+                }
+            }
+        }
+        result = canonicalize_body(body)
+        charges = result["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"]
+        self.assertEqual(charges, [{}])
+
+    def test_non_list_non_dict_package_becomes_empty_list(self) -> None:
+        body = {"ShipmentRequest": {"Shipment": {"Package": "invalid"}}}
+        result = canonicalize_body(body)
+        self.assertEqual(result["ShipmentRequest"]["Shipment"]["Package"], [{}])
+
+
+class NormalizeElicitedValuesTests(unittest.TestCase):
+    def test_trims_whitespace(self) -> None:
+        result = normalize_elicited_values({"shipper_name": "  Acme Corp  "})
+        self.assertEqual(result["shipper_name"], "Acme Corp")
+
+    def test_uppercases_country_codes(self) -> None:
+        result = normalize_elicited_values({
+            "shipper_country_code": "us",
+            "ship_to_country_code": "ca",
+        })
+        self.assertEqual(result["shipper_country_code"], "US")
+        self.assertEqual(result["ship_to_country_code"], "CA")
+
+    def test_uppercases_state_codes(self) -> None:
+        result = normalize_elicited_values({
+            "shipper_state": "ny",
+            "ship_to_state": "ca",
+        })
+        self.assertEqual(result["shipper_state"], "NY")
+        self.assertEqual(result["ship_to_state"], "CA")
+
+    def test_uppercases_weight_unit(self) -> None:
+        result = normalize_elicited_values({"package_1_weight_unit": "lbs"})
+        self.assertEqual(result["package_1_weight_unit"], "LBS")
+
+    def test_strips_weight_value(self) -> None:
+        result = normalize_elicited_values({"package_1_weight": " 5.0 "})
+        self.assertEqual(result["package_1_weight"], "5.0")
+
+    def test_preserves_other_values(self) -> None:
+        result = normalize_elicited_values({"shipper_name": "Test Co"})
+        self.assertEqual(result["shipper_name"], "Test Co")
+
+    def test_removes_empty_values(self) -> None:
+        result = normalize_elicited_values({
+            "shipper_name": "Test",
+            "service_code": "",
+            "shipper_city": "   ",
+        })
+        self.assertIn("shipper_name", result)
+        self.assertNotIn("service_code", result)
+        self.assertNotIn("shipper_city", result)
+
+
+class RehydrateTests(unittest.TestCase):
+    def test_flat_data_creates_nested_structure(self) -> None:
+        body: dict = {"ShipmentRequest": {"Shipment": {"Shipper": {}}}}
+        missing = [
+            MissingField(
+                "ShipmentRequest.Shipment.Shipper.Name",
+                "shipper_name",
+                "Shipper name",
+            ),
+        ]
+        result = rehydrate(body, {"shipper_name": "Acme Corp"}, missing)
+        self.assertEqual(
+            result["ShipmentRequest"]["Shipment"]["Shipper"]["Name"],
+            "Acme Corp",
+        )
+
+    def test_address_line_becomes_array(self) -> None:
+        body: dict = {"ShipmentRequest": {"Shipment": {"Shipper": {"Address": {}}}}}
+        missing = [
+            MissingField(
+                "ShipmentRequest.Shipment.Shipper.Address.AddressLine[0]",
+                "shipper_address_line_1",
+                "Shipper street address",
+            ),
+        ]
+        result = rehydrate(body, {"shipper_address_line_1": "123 Main St"}, missing)
+        self.assertEqual(
+            result["ShipmentRequest"]["Shipment"]["Shipper"]["Address"]["AddressLine"],
+            ["123 Main St"],
+        )
+
+    def test_package_index_routes_correctly(self) -> None:
+        body: dict = {
+            "ShipmentRequest": {
+                "Shipment": {"Package": [{"Packaging": {"Code": "02"}}, {}]}
+            }
+        }
+        missing = [
+            MissingField(
+                "ShipmentRequest.Shipment.Package[1].PackageWeight.Weight",
+                "package_2_weight",
+                "Package 2: Package weight",
+            ),
+        ]
+        result = rehydrate(body, {"package_2_weight": "10"}, missing)
+        self.assertEqual(
+            result["ShipmentRequest"]["Shipment"]["Package"][1]["PackageWeight"]["Weight"],
+            "10",
+        )
+
+    def test_does_not_overwrite_existing(self) -> None:
+        body = make_complete_body()
+        original_name = body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"]
+        missing = [
+            MissingField(
+                "ShipmentRequest.Shipment.Shipper.Name",
+                "shipper_name",
+                "Shipper name",
+            ),
+        ]
+        result = rehydrate(body, {"shipper_name": ""}, missing)
+        self.assertEqual(
+            result["ShipmentRequest"]["Shipment"]["Shipper"]["Name"],
+            original_name,
+        )
+
+    def test_does_not_mutate_input(self) -> None:
+        body: dict = {"ShipmentRequest": {"Shipment": {"Shipper": {}}}}
+        original = copy.deepcopy(body)
+        missing = [
+            MissingField(
+                "ShipmentRequest.Shipment.Shipper.Name",
+                "shipper_name",
+                "Shipper name",
+            ),
+        ]
+        rehydrate(body, {"shipper_name": "Test"}, missing)
+        self.assertEqual(body, original)
+
+    def test_skips_unknown_flat_keys(self) -> None:
+        body: dict = {"ShipmentRequest": {}}
+        result = rehydrate(body, {"unknown_key": "value"}, [])
+        self.assertEqual(result, {"ShipmentRequest": {}})
+
+    def test_multi_package_rehydration(self) -> None:
+        body: dict = {"ShipmentRequest": {"Shipment": {"Package": [{}, {}]}}}
+        missing = [
+            MissingField(
+                "ShipmentRequest.Shipment.Package[0].PackageWeight.Weight",
+                "package_1_weight",
+                "Package weight",
+            ),
+            MissingField(
+                "ShipmentRequest.Shipment.Package[1].PackageWeight.Weight",
+                "package_2_weight",
+                "Package 2: Package weight",
+            ),
+        ]
+        result = rehydrate(
+            body,
+            {"package_1_weight": "5", "package_2_weight": "10"},
+            missing,
+        )
+        self.assertEqual(
+            result["ShipmentRequest"]["Shipment"]["Package"][0]["PackageWeight"]["Weight"],
+            "5",
+        )
+        self.assertEqual(
+            result["ShipmentRequest"]["Shipment"]["Package"][1]["PackageWeight"]["Weight"],
+            "10",
+        )
+
+    def test_structural_conflict_raises_rehydration_error(self) -> None:
+        """When _set_field hits a type conflict, RehydrationError is raised."""
+        body: dict = {
+            "ShipmentRequest": {
+                "Shipment": {
+                    "Shipper": {"Address": "not_a_dict"},
+                }
+            }
+        }
+        missing = [
+            MissingField(
+                "ShipmentRequest.Shipment.Shipper.Address.City",
+                "shipper_city",
+                "Shipper city",
+            ),
+        ]
+        with self.assertRaises(RehydrationError) as cm:
+            rehydrate(body, {"shipper_city": "NYC"}, missing)
+        self.assertEqual(cm.exception.flat_key, "shipper_city")
+
+    def test_normalizes_package_dict_to_list_during_rehydration(self) -> None:
+        """If Package was a dict, rehydrate should still work via list normalization."""
+        body: dict = {
+            "ShipmentRequest": {"Shipment": {"Package": {"Packaging": {"Code": "02"}}}}
+        }
+        missing = [
+            MissingField(
+                "ShipmentRequest.Shipment.Package[0].PackageWeight.Weight",
+                "package_1_weight",
+                "Package weight",
+            ),
+        ]
+        result = rehydrate(body, {"package_1_weight": "5"}, missing)
+        pkg = result["ShipmentRequest"]["Shipment"]["Package"]
+        self.assertIsInstance(pkg, list)
+        self.assertEqual(pkg[0]["PackageWeight"]["Weight"], "5")
+        # Original packaging preserved
+        self.assertEqual(pkg[0]["Packaging"]["Code"], "02")
+
+
 if __name__ == "__main__":
     unittest.main()

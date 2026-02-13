@@ -454,3 +454,81 @@ def build_elicitation_schema(missing: list[MissingField]) -> type[BaseModel]:
     for mf in missing:
         field_definitions[mf.flat_key] = (str, Field(description=mf.prompt))
     return create_model("MissingShipmentFields", **field_definitions)
+
+
+# ---------------------------------------------------------------------------
+# Post-elicitation normalization
+# ---------------------------------------------------------------------------
+
+# Flat key patterns for normalization
+_COUNTRY_CODE_KEYS = re.compile(r".*_country_code$")
+_STATE_KEYS = re.compile(r".*_state$")
+_WEIGHT_UNIT_KEYS = re.compile(r".*_weight_unit$")
+
+
+def normalize_elicited_values(flat_data: dict[str, str]) -> dict[str, str]:
+    """Apply minimal normalization to elicited values before rehydration.
+
+    - Trims all values
+    - Uppercases country codes, state codes, and weight unit codes
+    - Strips weight values
+    - Removes empty/whitespace-only values
+    """
+    result: dict[str, str] = {}
+    for key, value in flat_data.items():
+        if not isinstance(value, str):
+            value = str(value)
+        value = value.strip()
+        if not value:
+            continue
+        if _COUNTRY_CODE_KEYS.match(key) or _STATE_KEYS.match(key) or _WEIGHT_UNIT_KEYS.match(key):
+            value = value.upper()
+        result[key] = value
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Rehydration
+# ---------------------------------------------------------------------------
+
+class RehydrationError(Exception):
+    """Raised when rehydration encounters a structural conflict in the request body."""
+    def __init__(self, flat_key: str, dot_path: str, original_error: TypeError):
+        self.flat_key = flat_key
+        self.dot_path = dot_path
+        self.original_error = original_error
+        super().__init__(
+            f"Cannot set '{flat_key}' at '{dot_path}': {original_error}"
+        )
+
+
+def rehydrate(
+    request_body: dict,
+    flat_data: dict[str, str],
+    missing: list[MissingField],
+) -> dict:
+    """Merge flat elicitation responses back into nested UPS structure.
+
+    Uses the ``missing`` list as the flat_key -> dot_path mapping.
+    Skips empty/None values. Does not overwrite existing non-empty values.
+    Canonicalizes body (Package + ShipmentCharge to list) for consistent structure.
+    Returns a new dict — does not mutate the input.
+
+    Raises RehydrationError if a structural conflict prevents setting a value.
+    """
+    flat_to_dot = {mf.flat_key: mf.dot_path for mf in missing}
+    result = canonicalize_body(request_body)
+
+    for flat_key, value in flat_data.items():
+        if not value:
+            continue
+        dot_path = flat_to_dot.get(flat_key)
+        if dot_path is None:
+            continue
+        if not _field_exists(result, dot_path):
+            try:
+                _set_field(result, dot_path, value)
+            except TypeError as exc:
+                raise RehydrationError(flat_key, dot_path, exc) from exc
+
+    return result
