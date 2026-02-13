@@ -499,5 +499,50 @@ class FindMissingFieldsPackageTests(unittest.TestCase):
         self.assertIn("Package 1", pkg1_weight[0].prompt)
 
 
+class FindMissingFieldsCountryTests(unittest.TestCase):
+    def test_us_address_requires_state_and_postal(self) -> None:
+        body = make_complete_body(shipper_country="US")
+        del body["ShipmentRequest"]["Shipment"]["Shipper"]["Address"]["StateProvinceCode"]
+        del body["ShipmentRequest"]["Shipment"]["Shipper"]["Address"]["PostalCode"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("shipper_state", flat_keys)
+        self.assertIn("shipper_postal_code", flat_keys)
+
+    def test_ca_address_requires_state_and_postal(self) -> None:
+        body = make_complete_body(shipper_country="CA")
+        del body["ShipmentRequest"]["Shipment"]["Shipper"]["Address"]["StateProvinceCode"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("shipper_state", flat_keys)
+
+    def test_pr_address_requires_state_and_postal(self) -> None:
+        body = make_complete_body(ship_to_country="PR")
+        del body["ShipmentRequest"]["Shipment"]["ShipTo"]["Address"]["PostalCode"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("ship_to_postal_code", flat_keys)
+
+    def test_gb_address_does_not_require_state(self) -> None:
+        body = make_complete_body(shipper_country="GB")
+        del body["ShipmentRequest"]["Shipment"]["Shipper"]["Address"]["StateProvinceCode"]
+        del body["ShipmentRequest"]["Shipment"]["Shipper"]["Address"]["PostalCode"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("shipper_state", flat_keys)
+        self.assertNotIn("shipper_postal_code", flat_keys)
+
+    def test_no_country_code_skips_conditional(self) -> None:
+        body = make_complete_body()
+        del body["ShipmentRequest"]["Shipment"]["Shipper"]["Address"]["CountryCode"]
+        del body["ShipmentRequest"]["Shipment"]["Shipper"]["Address"]["StateProvinceCode"]
+        del body["ShipmentRequest"]["Shipment"]["Shipper"]["Address"]["PostalCode"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("shipper_country_code", flat_keys)
+        self.assertNotIn("shipper_state", flat_keys)
+        self.assertNotIn("shipper_postal_code", flat_keys)
+
+
 if __name__ == "__main__":
     unittest.main()
