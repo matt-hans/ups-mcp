@@ -4,7 +4,7 @@
 
 **Goal:** Add preflight validation and MCP form-mode elicitation to `create_shipment` so missing required fields are either collected from the user via `ctx.elicit()` or reported in a structured `ToolError`.
 
-**Architecture:** New pure-logic `shipment_validator.py` module handles rules, defaults, flatten/unflatten. `server.py::create_shipment` orchestrates: apply defaults → preflight → elicit (if supported) or ToolError → ToolManager. `tools.py` is unchanged.
+**Architecture:** New pure-logic `shipment_validator.py` module handles rules, defaults, flatten/unflatten, and post-elicitation normalization. `server.py::create_shipment` orchestrates: apply defaults → preflight → elicit (if supported) or ToolError → normalize → ToolManager. `tools.py` is unchanged.
 
 **Tech Stack:** Python 3.14, Pydantic v2 (dynamic models), MCP Python SDK v1.26.0 (`Context.elicit()`, `ElicitationCapability`), unittest/IsolatedAsyncioTestCase.
 
@@ -22,7 +22,10 @@ def make_complete_body(
     ship_to_country: str = "US",
     num_packages: int = 1,
 ) -> dict:
-    """Return a minimal-but-complete ShipmentRequest body."""
+    """Return a minimal-but-complete ShipmentRequest body.
+
+    Package is always returned as a list for internal consistency.
+    """
     packages = []
     for _ in range(num_packages):
         packages.append({
@@ -57,8 +60,14 @@ def make_complete_body(
                         "CountryCode": ship_to_country,
                     },
                 },
+                "PaymentInformation": {
+                    "ShipmentCharge": [{
+                        "Type": "01",
+                        "BillShipper": {"AccountNumber": "129D9Y"},
+                    }],
+                },
                 "Service": {"Code": "03"},
-                "Package": packages if len(packages) > 1 else packages[0],
+                "Package": packages,
             },
         }
     }
@@ -71,14 +80,23 @@ def make_complete_body(
 
 **Files:**
 - Create: `ups_mcp/shipment_validator.py`
+- Create: `tests/__init__.py`
 - Create: `tests/shipment_fixtures.py`
 - Create: `tests/test_shipment_validator.py`
 
-**Step 1: Create the test fixture file**
+**Step 1: Create `tests/__init__.py`**
+
+Write an empty `tests/__init__.py` so the `tests` directory is a proper Python package and `from tests.shipment_fixtures import ...` resolves correctly.
+
+```python
+# tests/__init__.py
+```
+
+**Step 2: Create the test fixture file**
 
 Write `tests/shipment_fixtures.py` with the `make_complete_body()` function from the shared fixtures section above.
 
-**Step 2: Write failing test for data structures**
+**Step 3: Write failing test for data structures**
 
 Write `tests/test_shipment_validator.py`:
 
@@ -89,6 +107,7 @@ from ups_mcp.shipment_validator import (
     MissingField,
     UNCONDITIONAL_RULES,
     PACKAGE_RULES,
+    PAYMENT_RULES,
     COUNTRY_CONDITIONAL_RULES,
     BUILT_IN_DEFAULTS,
     ENV_DEFAULTS,
@@ -114,6 +133,15 @@ class DataStructureTests(unittest.TestCase):
         self.assertIsInstance(PACKAGE_RULES, list)
         self.assertEqual(len(PACKAGE_RULES), 3)  # packaging code, weight unit, weight
 
+    def test_payment_rules_is_nonempty_list(self) -> None:
+        self.assertIsInstance(PAYMENT_RULES, list)
+        self.assertGreater(len(PAYMENT_RULES), 0)
+
+    def test_payment_rules_include_charge_type_and_account(self) -> None:
+        flat_keys = {r.flat_key for r in PAYMENT_RULES}
+        self.assertIn("payment_charge_type", flat_keys)
+        self.assertIn("payment_account_number", flat_keys)
+
     def test_country_conditional_rules_has_us_ca_pr(self) -> None:
         self.assertIn(("US", "CA", "PR"), COUNTRY_CONDITIONAL_RULES)
 
@@ -122,6 +150,12 @@ class DataStructureTests(unittest.TestCase):
         self.assertEqual(
             BUILT_IN_DEFAULTS["ShipmentRequest.Request.RequestOption"],
             "nonvalidate",
+        )
+
+    def test_built_in_defaults_has_payment_charge_type(self) -> None:
+        self.assertIn(
+            "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].Type",
+            BUILT_IN_DEFAULTS,
         )
 
     def test_env_defaults_has_shipper_number(self) -> None:
@@ -134,17 +168,23 @@ class DataStructureTests(unittest.TestCase):
             "UPS_ACCOUNT_NUMBER",
         )
 
+    def test_env_defaults_has_payment_account_number(self) -> None:
+        self.assertIn(
+            "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].BillShipper.AccountNumber",
+            ENV_DEFAULTS,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
 ```
 
-**Step 3: Run test to verify it fails**
+**Step 4: Run test to verify it fails**
 
 Run: `python3 -m pytest tests/test_shipment_validator.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'ups_mcp.shipment_validator'`
 
-**Step 4: Implement shipment_validator.py with data structures**
+**Step 5: Implement shipment_validator.py with data structures**
 
 Write `ups_mcp/shipment_validator.py`:
 
@@ -157,8 +197,12 @@ and safe to test in isolation.
 
 from __future__ import annotations
 
+import copy
+import re
 from dataclasses import dataclass
 from typing import Any
+
+from pydantic import BaseModel, Field, create_model
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +245,24 @@ UNCONDITIONAL_RULES: list[FieldRule] = [
 
 
 # ---------------------------------------------------------------------------
+# Required field rules — payment (charge type + payer account)
+# ---------------------------------------------------------------------------
+
+PAYMENT_RULES: list[FieldRule] = [
+    FieldRule(
+        "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].Type",
+        "payment_charge_type",
+        "Shipment charge type (01=Transportation, 02=Duties and Taxes)",
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].BillShipper.AccountNumber",
+        "payment_account_number",
+        "Billing account number",
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
 # Required field rules — per-package (sub-paths relative to each Package element)
 # ---------------------------------------------------------------------------
 
@@ -230,24 +292,29 @@ COUNTRY_CONDITIONAL_RULES: dict[tuple[str, ...], list[FieldRule]] = {
 
 BUILT_IN_DEFAULTS: dict[str, str] = {
     "ShipmentRequest.Request.RequestOption": "nonvalidate",
+    "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].Type": "01",
 }
 
 ENV_DEFAULTS: dict[str, str] = {
     # key = dot-path, value = env-var name to read from env_config
     "ShipmentRequest.Shipment.Shipper.ShipperNumber": "UPS_ACCOUNT_NUMBER",
+    "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].BillShipper.AccountNumber": "UPS_ACCOUNT_NUMBER",
 }
 ```
 
-**Step 5: Run test to verify it passes**
+**Step 6: Run test to verify it passes**
 
 Run: `python3 -m pytest tests/test_shipment_validator.py -v`
-Expected: All 6 tests PASS
+Expected: All tests PASS
 
-**Step 6: Commit**
+**Step 7: Commit**
 
 ```bash
-git add ups_mcp/shipment_validator.py tests/shipment_fixtures.py tests/test_shipment_validator.py
-git commit -m "feat: add shipment_validator data structures and field rules"
+git add ups_mcp/shipment_validator.py tests/__init__.py tests/shipment_fixtures.py tests/test_shipment_validator.py
+git commit -m "feat: add shipment_validator data structures and field rules
+
+Includes payment rules (charge type + billing account) and
+tests/__init__.py for proper pytest import resolution."
 ```
 
 ---
@@ -282,6 +349,14 @@ class FieldExistsTests(unittest.TestCase):
     def test_empty_string_is_missing(self) -> None:
         data = {"a": {"b": ""}}
         self.assertFalse(_field_exists(data, "a.b"))
+
+    def test_whitespace_only_is_missing(self) -> None:
+        data = {"a": {"b": "   "}}
+        self.assertFalse(_field_exists(data, "a.b"))
+
+    def test_whitespace_with_tabs_is_missing(self) -> None:
+        data = {"a": " \t\n "}
+        self.assertFalse(_field_exists(data, "a"))
 
     def test_none_is_missing(self) -> None:
         data = {"a": None}
@@ -320,10 +395,9 @@ class SetFieldTests(unittest.TestCase):
         _set_field(data, "a.b[0]", "first")
         self.assertEqual(data, {"a": {"b": ["first"]}})
 
-    def test_does_not_overwrite_existing(self) -> None:
+    def test_overwrites_leaf_value(self) -> None:
         data = {"a": {"b": "existing"}}
         _set_field(data, "a.b", "new")
-        # _set_field should overwrite — caller is responsible for checking
         self.assertEqual(data["a"]["b"], "new")
 
     def test_creates_intermediate_dicts(self) -> None:
@@ -333,6 +407,23 @@ class SetFieldTests(unittest.TestCase):
             data["ShipmentRequest"]["Shipment"]["Shipper"]["Name"],
             "Test",
         )
+
+    def test_coerces_non_dict_intermediate_to_dict(self) -> None:
+        """When an intermediate node is a string but we need a dict, coerce it."""
+        data: dict = {"a": {"b": "was_a_string"}}
+        _set_field(data, "a.b.c", "value")
+        self.assertEqual(data["a"]["b"], {"c": "value"})
+
+    def test_coerces_non_list_intermediate_to_list(self) -> None:
+        """When an intermediate node should be a list but isn't, coerce it."""
+        data: dict = {"a": {"b": "was_a_string"}}
+        _set_field(data, "a.b[0]", "value")
+        self.assertEqual(data["a"]["b"], ["value"])
+
+    def test_preserves_existing_list_elements(self) -> None:
+        data: dict = {"a": {"b": ["existing"]}}
+        _set_field(data, "a.b[1]", "new")
+        self.assertEqual(data["a"]["b"], ["existing", "new"])
 ```
 
 **Step 2: Run test to verify it fails**
@@ -359,7 +450,11 @@ def _parse_path_segment(segment: str) -> tuple[str, int | None]:
 
 
 def _field_exists(data: dict, dot_path: str) -> bool:
-    """Check if a dot-path resolves to a non-empty value in a nested dict."""
+    """Check if a dot-path resolves to a non-empty value in a nested dict.
+
+    Returns False for None, empty string, and whitespace-only strings.
+    Returns True for 0, False, and other falsy-but-meaningful values.
+    """
     current: Any = data
     for segment in dot_path.split("."):
         key, idx = _parse_path_segment(segment)
@@ -370,16 +465,25 @@ def _field_exists(data: dict, dot_path: str) -> bool:
             if not isinstance(current, list) or len(current) <= idx:
                 return False
             current = current[idx]
-    return current is not None and current != ""
+    if current is None:
+        return False
+    if isinstance(current, str) and current.strip() == "":
+        return False
+    return True
 
 
 def _set_field(data: dict, dot_path: str, value: Any) -> None:
-    """Set a value at a dot-path, creating intermediate dicts/lists as needed."""
+    """Set a value at a dot-path, creating intermediate dicts/lists as needed.
+
+    If an intermediate node has an incompatible type (e.g. a string where a dict
+    is needed), it is coerced to the required type. This is intentional — callers
+    are responsible for not calling _set_field on paths with conflicting semantics.
+    """
     segments = dot_path.split(".")
     current = data
     for segment in segments[:-1]:
         key, idx = _parse_path_segment(segment)
-        if key not in current:
+        if key not in current or not isinstance(current[key], (dict, list)):
             current[key] = [] if idx is not None else {}
         target = current[key]
         if idx is not None:
@@ -388,13 +492,18 @@ def _set_field(data: dict, dot_path: str, value: Any) -> None:
                 target = current[key]
             while len(target) <= idx:
                 target.append({})
+            if not isinstance(target[idx], dict):
+                target[idx] = {}
             current = target[idx]
         else:
+            if not isinstance(target, dict):
+                current[key] = {}
+                target = current[key]
             current = target
 
     last_key, last_idx = _parse_path_segment(segments[-1])
     if last_idx is not None:
-        if last_key not in current:
+        if last_key not in current or not isinstance(current.get(last_key), list):
             current[last_key] = []
         while len(current[last_key]) <= last_idx:
             current[last_key].append(None)
@@ -412,7 +521,11 @@ Expected: All tests PASS
 
 ```bash
 git add ups_mcp/shipment_validator.py tests/test_shipment_validator.py
-git commit -m "feat: add dict navigation helpers _field_exists and _set_field"
+git commit -m "feat: add dict navigation helpers with whitespace and type safety
+
+_field_exists treats whitespace-only strings as missing.
+_set_field coerces incompatible intermediate types instead of
+silently corrupting data structures."
 ```
 
 ---
@@ -441,6 +554,13 @@ class ApplyDefaultsTests(unittest.TestCase):
             "nonvalidate",
         )
 
+    def test_empty_body_gets_payment_charge_type_default(self) -> None:
+        result = apply_defaults({}, {})
+        self.assertEqual(
+            result["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"][0]["Type"],
+            "01",
+        )
+
     def test_caller_value_overrides_builtin(self) -> None:
         body = {"ShipmentRequest": {"Request": {"RequestOption": "validate"}}}
         result = apply_defaults(body, {})
@@ -454,6 +574,13 @@ class ApplyDefaultsTests(unittest.TestCase):
         result = apply_defaults(body, {"UPS_ACCOUNT_NUMBER": "ABC123"})
         self.assertEqual(
             result["ShipmentRequest"]["Shipment"]["Shipper"]["ShipperNumber"],
+            "ABC123",
+        )
+
+    def test_env_default_fills_payment_account_number(self) -> None:
+        result = apply_defaults({}, {"UPS_ACCOUNT_NUMBER": "ABC123"})
+        self.assertEqual(
+            result["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"][0]["BillShipper"]["AccountNumber"],
             "ABC123",
         )
 
@@ -491,9 +618,6 @@ Expected: FAIL with `ImportError: cannot import name 'apply_defaults'`
 Add to `ups_mcp/shipment_validator.py`:
 
 ```python
-import copy
-
-
 def apply_defaults(request_body: dict, env_config: dict[str, str]) -> dict:
     """Apply 3-tier defaults: built-in -> env -> caller body (highest priority).
 
@@ -524,12 +648,14 @@ Expected: All tests PASS
 
 ```bash
 git add ups_mcp/shipment_validator.py tests/test_shipment_validator.py
-git commit -m "feat: implement apply_defaults with 3-tier merge"
+git commit -m "feat: implement apply_defaults with 3-tier merge
+
+Includes payment charge type (built-in) and billing account number (env)."
 ```
 
 ---
 
-### Task 4: Implement and test `find_missing_fields` — unconditional rules
+### Task 4: Implement and test `find_missing_fields` — unconditional + payment rules
 
 **Files:**
 - Modify: `ups_mcp/shipment_validator.py`
@@ -551,8 +677,6 @@ class FindMissingFieldsUnconditionalTests(unittest.TestCase):
 
     def test_empty_body_returns_all_fields(self) -> None:
         missing = find_missing_fields({})
-        # Should include all unconditional + package_1 fields (no country-conditional
-        # since no country code present)
         flat_keys = {mf.flat_key for mf in missing}
         self.assertIn("request_option", flat_keys)
         self.assertIn("shipper_name", flat_keys)
@@ -563,6 +687,8 @@ class FindMissingFieldsUnconditionalTests(unittest.TestCase):
         self.assertIn("package_1_packaging_code", flat_keys)
         self.assertIn("package_1_weight_unit", flat_keys)
         self.assertIn("package_1_weight", flat_keys)
+        self.assertIn("payment_charge_type", flat_keys)
+        self.assertIn("payment_account_number", flat_keys)
 
     def test_missing_shipper_name_detected(self) -> None:
         body = make_complete_body()
@@ -585,6 +711,14 @@ class FindMissingFieldsUnconditionalTests(unittest.TestCase):
         flat_keys = {mf.flat_key for mf in missing}
         self.assertIn("service_code", flat_keys)
 
+    def test_missing_payment_info_detected(self) -> None:
+        body = make_complete_body()
+        del body["ShipmentRequest"]["Shipment"]["PaymentInformation"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("payment_charge_type", flat_keys)
+        self.assertIn("payment_account_number", flat_keys)
+
     def test_returns_missing_field_instances(self) -> None:
         body = make_complete_body()
         del body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"]
@@ -593,6 +727,13 @@ class FindMissingFieldsUnconditionalTests(unittest.TestCase):
         self.assertEqual(len(shipper_name), 1)
         self.assertEqual(shipper_name[0].dot_path, "ShipmentRequest.Shipment.Shipper.Name")
         self.assertEqual(shipper_name[0].prompt, "Shipper name")
+
+    def test_whitespace_value_treated_as_missing(self) -> None:
+        body = make_complete_body()
+        body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"] = "   "
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("shipper_name", flat_keys)
 ```
 
 **Step 2: Run test to verify it fails**
@@ -606,7 +747,15 @@ Add to `ups_mcp/shipment_validator.py`:
 
 ```python
 def _normalize_packages(request_body: dict) -> list[dict]:
-    """Extract Package from body, normalize to a list of dicts."""
+    """Extract Package from body, normalize to a list of dicts.
+
+    - dict -> [dict]
+    - list -> list (or [{}] if empty)
+    - missing/None -> [{}]
+
+    This is the canonical internal representation. All downstream validation
+    and rehydration operates on the list form.
+    """
     shipment = request_body.get("ShipmentRequest", {}).get("Shipment", {})
     packages = shipment.get("Package")
     if packages is None:
@@ -618,15 +767,39 @@ def _normalize_packages(request_body: dict) -> list[dict]:
     return [{}]
 
 
+def _ensure_package_list(request_body: dict) -> dict:
+    """Return a copy of request_body with Package normalized to a list.
+
+    This ensures all downstream code operates on a consistent structure.
+    """
+    result = copy.deepcopy(request_body)
+    shipment = result.get("ShipmentRequest", {}).get("Shipment", {})
+    if "Package" in shipment:
+        pkg = shipment["Package"]
+        if isinstance(pkg, dict):
+            shipment["Package"] = [pkg]
+        elif not isinstance(pkg, list):
+            shipment["Package"] = [{}]
+    return result
+
+
 def find_missing_fields(request_body: dict) -> list[MissingField]:
     """Check required fields and return those that are missing.
 
-    Checks unconditional rules, per-package rules, and country-conditional rules.
+    Checks unconditional rules, payment rules, per-package rules,
+    and country-conditional rules.
+
+    Package is normalized to list internally for consistent path resolution.
     """
     missing: list[MissingField] = []
 
     # Unconditional non-package fields
     for rule in UNCONDITIONAL_RULES:
+        if not _field_exists(request_body, rule.dot_path):
+            missing.append(MissingField(rule.dot_path, rule.flat_key, rule.prompt))
+
+    # Payment fields (fixed paths with array indices)
+    for rule in PAYMENT_RULES:
         if not _field_exists(request_body, rule.dot_path):
             missing.append(MissingField(rule.dot_path, rule.flat_key, rule.prompt))
 
@@ -645,7 +818,7 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
     shipment = request_body.get("ShipmentRequest", {}).get("Shipment", {})
     for role, prefix in [("Shipper", "shipper"), ("ShipTo", "ship_to")]:
         address = shipment.get(role, {}).get("Address", {})
-        country = str(address.get("CountryCode", "")).upper()
+        country = str(address.get("CountryCode", "")).strip().upper()
         for countries, rules in COUNTRY_CONDITIONAL_RULES.items():
             if country in countries:
                 for rule in rules:
@@ -667,7 +840,10 @@ Expected: All tests PASS
 
 ```bash
 git add ups_mcp/shipment_validator.py tests/test_shipment_validator.py
-git commit -m "feat: implement find_missing_fields with unconditional rules"
+git commit -m "feat: implement find_missing_fields with payment and package rules
+
+Normalizes Package to list internally. Validates payment charge type
+and billing account. Whitespace-only values treated as missing."
 ```
 
 ---
@@ -700,17 +876,18 @@ class FindMissingFieldsPackageTests(unittest.TestCase):
         self.assertIn("package_1_weight", flat_keys)
 
     def test_single_dict_package_validates_as_index_0(self) -> None:
+        """Package as a single dict (not list) is normalized and validated."""
         body = make_complete_body()
-        # make_complete_body returns single package as dict (not list)
+        # Convert Package from list to dict for this test
+        pkg = body["ShipmentRequest"]["Shipment"]["Package"][0]
+        body["ShipmentRequest"]["Shipment"]["Package"] = pkg
         self.assertIsInstance(body["ShipmentRequest"]["Shipment"]["Package"], dict)
         missing = find_missing_fields(body)
-        # Should be complete — no package fields missing
         pkg_missing = [mf for mf in missing if "package_" in mf.flat_key]
         self.assertEqual(pkg_missing, [])
 
     def test_multi_package_validates_each(self) -> None:
         body = make_complete_body(num_packages=2)
-        # Remove weight from package 2
         body["ShipmentRequest"]["Shipment"]["Package"][1].pop("PackageWeight")
         missing = find_missing_fields(body)
         flat_keys = {mf.flat_key for mf in missing}
@@ -730,7 +907,7 @@ class FindMissingFieldsPackageTests(unittest.TestCase):
 **Step 2: Run tests**
 
 Run: `python3 -m pytest tests/test_shipment_validator.py::FindMissingFieldsPackageTests -v`
-Expected: All PASS (implementation already handles these cases)
+Expected: All PASS
 
 **Step 3: Commit**
 
@@ -777,7 +954,6 @@ class FindMissingFieldsCountryTests(unittest.TestCase):
 
     def test_gb_address_does_not_require_state(self) -> None:
         body = make_complete_body(shipper_country="GB")
-        # Remove state — should NOT be flagged for GB
         del body["ShipmentRequest"]["Shipment"]["Shipper"]["Address"]["StateProvinceCode"]
         del body["ShipmentRequest"]["Shipment"]["Shipper"]["Address"]["PostalCode"]
         missing = find_missing_fields(body)
@@ -788,14 +964,11 @@ class FindMissingFieldsCountryTests(unittest.TestCase):
     def test_no_country_code_skips_conditional(self) -> None:
         body = make_complete_body()
         del body["ShipmentRequest"]["Shipment"]["Shipper"]["Address"]["CountryCode"]
-        # Remove state/postal — should NOT be flagged because country unknown
         del body["ShipmentRequest"]["Shipment"]["Shipper"]["Address"]["StateProvinceCode"]
         del body["ShipmentRequest"]["Shipment"]["Shipper"]["Address"]["PostalCode"]
         missing = find_missing_fields(body)
         flat_keys = {mf.flat_key for mf in missing}
-        # Country code itself should be missing (unconditional)
         self.assertIn("shipper_country_code", flat_keys)
-        # But state/postal should NOT be flagged (no country → no conditional)
         self.assertNotIn("shipper_state", flat_keys)
         self.assertNotIn("shipper_postal_code", flat_keys)
 ```
@@ -875,9 +1048,6 @@ Expected: FAIL with `ImportError: cannot import name 'build_elicitation_schema'`
 Add to `ups_mcp/shipment_validator.py`:
 
 ```python
-from pydantic import BaseModel, Field, create_model
-
-
 def build_elicitation_schema(missing: list[MissingField]) -> type[BaseModel]:
     """Create a dynamic flat Pydantic model with one str field per missing field.
 
@@ -904,7 +1074,7 @@ git commit -m "feat: implement build_elicitation_schema for dynamic Pydantic mod
 
 ---
 
-### Task 8: Implement and test `rehydrate`
+### Task 8: Implement and test `normalize_elicited_values` and `rehydrate`
 
 **Files:**
 - Modify: `ups_mcp/shipment_validator.py`
@@ -915,7 +1085,51 @@ git commit -m "feat: implement build_elicitation_schema for dynamic Pydantic mod
 Append to `tests/test_shipment_validator.py`:
 
 ```python
-from ups_mcp.shipment_validator import rehydrate
+from ups_mcp.shipment_validator import normalize_elicited_values, rehydrate
+
+
+class NormalizeElicitedValuesTests(unittest.TestCase):
+    def test_trims_whitespace(self) -> None:
+        result = normalize_elicited_values({"shipper_name": "  Acme Corp  "})
+        self.assertEqual(result["shipper_name"], "Acme Corp")
+
+    def test_uppercases_country_codes(self) -> None:
+        result = normalize_elicited_values({
+            "shipper_country_code": "us",
+            "ship_to_country_code": "ca",
+        })
+        self.assertEqual(result["shipper_country_code"], "US")
+        self.assertEqual(result["ship_to_country_code"], "CA")
+
+    def test_uppercases_state_codes(self) -> None:
+        result = normalize_elicited_values({
+            "shipper_state": "ny",
+            "ship_to_state": "ca",
+        })
+        self.assertEqual(result["shipper_state"], "NY")
+        self.assertEqual(result["ship_to_state"], "CA")
+
+    def test_uppercases_weight_unit(self) -> None:
+        result = normalize_elicited_values({"package_1_weight_unit": "lbs"})
+        self.assertEqual(result["package_1_weight_unit"], "LBS")
+
+    def test_strips_weight_value(self) -> None:
+        result = normalize_elicited_values({"package_1_weight": " 5.0 "})
+        self.assertEqual(result["package_1_weight"], "5.0")
+
+    def test_preserves_other_values(self) -> None:
+        result = normalize_elicited_values({"shipper_name": "Test Co"})
+        self.assertEqual(result["shipper_name"], "Test Co")
+
+    def test_removes_empty_values(self) -> None:
+        result = normalize_elicited_values({
+            "shipper_name": "Test",
+            "service_code": "",
+            "shipper_city": "   ",
+        })
+        self.assertIn("shipper_name", result)
+        self.assertNotIn("service_code", result)
+        self.assertNotIn("shipper_city", result)
 
 
 class RehydrateTests(unittest.TestCase):
@@ -978,7 +1192,6 @@ class RehydrateTests(unittest.TestCase):
                 "Shipper name",
             ),
         ]
-        # Rehydrate with empty value — should not clear existing
         result = rehydrate(body, {"shipper_name": ""}, missing)
         self.assertEqual(
             result["ShipmentRequest"]["Shipment"]["Shipper"]["Name"],
@@ -1030,18 +1243,65 @@ class RehydrateTests(unittest.TestCase):
             result["ShipmentRequest"]["Shipment"]["Package"][1]["PackageWeight"]["Weight"],
             "10",
         )
+
+    def test_normalizes_package_dict_to_list_during_rehydration(self) -> None:
+        """If Package was a dict, rehydrate should still work via list normalization."""
+        body: dict = {
+            "ShipmentRequest": {"Shipment": {"Package": {"Packaging": {"Code": "02"}}}}
+        }
+        missing = [
+            MissingField(
+                "ShipmentRequest.Shipment.Package[0].PackageWeight.Weight",
+                "package_1_weight",
+                "Package weight",
+            ),
+        ]
+        result = rehydrate(body, {"package_1_weight": "5"}, missing)
+        pkg = result["ShipmentRequest"]["Shipment"]["Package"]
+        self.assertIsInstance(pkg, list)
+        self.assertEqual(pkg[0]["PackageWeight"]["Weight"], "5")
+        # Original packaging preserved
+        self.assertEqual(pkg[0]["Packaging"]["Code"], "02")
 ```
 
 **Step 2: Run test to verify it fails**
 
-Run: `python3 -m pytest tests/test_shipment_validator.py::RehydrateTests -v`
-Expected: FAIL with `ImportError: cannot import name 'rehydrate'`
+Run: `python3 -m pytest tests/test_shipment_validator.py::NormalizeElicitedValuesTests -v`
+Expected: FAIL with `ImportError: cannot import name 'normalize_elicited_values'`
 
-**Step 3: Implement `rehydrate`**
+**Step 3: Implement `normalize_elicited_values` and `rehydrate`**
 
 Add to `ups_mcp/shipment_validator.py`:
 
 ```python
+# Flat key patterns for normalization
+_COUNTRY_CODE_KEYS = re.compile(r".*_country_code$")
+_STATE_KEYS = re.compile(r".*_state$")
+_WEIGHT_UNIT_KEYS = re.compile(r".*_weight_unit$")
+_WEIGHT_KEYS = re.compile(r".*_weight$")
+
+
+def normalize_elicited_values(flat_data: dict[str, str]) -> dict[str, str]:
+    """Apply minimal normalization to elicited values before rehydration.
+
+    - Trims all values
+    - Uppercases country codes, state codes, and weight unit codes
+    - Strips weight values
+    - Removes empty/whitespace-only values
+    """
+    result: dict[str, str] = {}
+    for key, value in flat_data.items():
+        if not isinstance(value, str):
+            value = str(value)
+        value = value.strip()
+        if not value:
+            continue
+        if _COUNTRY_CODE_KEYS.match(key) or _STATE_KEYS.match(key) or _WEIGHT_UNIT_KEYS.match(key):
+            value = value.upper()
+        result[key] = value
+    return result
+
+
 def rehydrate(
     request_body: dict,
     flat_data: dict[str, str],
@@ -1049,12 +1309,13 @@ def rehydrate(
 ) -> dict:
     """Merge flat elicitation responses back into nested UPS structure.
 
-    Uses the ``missing`` list as the flat_key → dot_path mapping.
+    Uses the ``missing`` list as the flat_key -> dot_path mapping.
     Skips empty/None values. Does not overwrite existing non-empty values.
+    Normalizes Package dict to list for consistent structure.
     Returns a new dict — does not mutate the input.
     """
     flat_to_dot = {mf.flat_key: mf.dot_path for mf in missing}
-    result = copy.deepcopy(request_body)
+    result = _ensure_package_list(request_body)
 
     for flat_key, value in flat_data.items():
         if not value:
@@ -1062,7 +1323,6 @@ def rehydrate(
         dot_path = flat_to_dot.get(flat_key)
         if dot_path is None:
             continue
-        # Only set if not already present
         if not _field_exists(result, dot_path):
             _set_field(result, dot_path, value)
 
@@ -1078,7 +1338,10 @@ Expected: All tests PASS
 
 ```bash
 git add ups_mcp/shipment_validator.py tests/test_shipment_validator.py
-git commit -m "feat: implement rehydrate for flat-to-nested conversion"
+git commit -m "feat: implement normalize_elicited_values and rehydrate
+
+Post-elicitation normalization: trim, uppercase codes, remove empties.
+Rehydrate normalizes Package dict to list for consistent structure."
 ```
 
 ---
@@ -1097,6 +1360,7 @@ Write `tests/test_server_elicitation.py`:
 import unittest
 from unittest.mock import MagicMock
 
+from mcp.server.fastmcp import Context
 from mcp.types import (
     ClientCapabilities,
     ElicitationCapability,
@@ -1124,9 +1388,6 @@ class CheckFormElicitationTests(unittest.TestCase):
         )
         ctx.request_context.session._client_params = params
         ctx.request_context.session.client_params = params
-        ctx.request_context.session.check_client_capability.side_effect = (
-            lambda c: c.elicitation is not None and params.capabilities.elicitation is not None
-        )
         return ctx
 
     def test_none_ctx_returns_false(self) -> None:
@@ -1143,7 +1404,6 @@ class CheckFormElicitationTests(unittest.TestCase):
         self.assertTrue(server._check_form_elicitation(ctx))
 
     def test_empty_elicitation_object_returns_true(self) -> None:
-        # Backward compat: empty ElicitationCapability (neither form nor url set)
         ctx = self._make_ctx(elicitation=ElicitationCapability())
         self.assertTrue(server._check_form_elicitation(ctx))
 
@@ -1160,6 +1420,26 @@ class CheckFormElicitationTests(unittest.TestCase):
                 url=UrlElicitationCapability(),
             )
         )
+        self.assertTrue(server._check_form_elicitation(ctx))
+
+    def test_attribute_error_returns_false(self) -> None:
+        """Integration safety: if ctx has unexpected shape, return False."""
+        ctx = MagicMock()
+        ctx.request_context.session.client_params = None
+        self.assertFalse(server._check_form_elicitation(ctx))
+
+    def test_with_real_capability_objects(self) -> None:
+        """Integration-style: use real Pydantic objects, minimal mocking."""
+        ctx = MagicMock(spec=Context)
+        caps = ClientCapabilities(
+            elicitation=ElicitationCapability(form=FormElicitationCapability())
+        )
+        params = InitializeRequestParams(
+            protocolVersion="2025-03-26",
+            capabilities=caps,
+            clientInfo=Implementation(name="real-client", version="2.0"),
+        )
+        ctx.request_context.session.client_params = params
         self.assertTrue(server._check_form_elicitation(ctx))
 
 
@@ -1206,13 +1486,15 @@ def _check_form_elicitation(ctx: Context | None) -> bool:
 **Step 4: Run tests to verify they pass**
 
 Run: `python3 -m pytest tests/test_server_elicitation.py -v`
-Expected: All 6 tests PASS
+Expected: All 8 tests PASS
 
 **Step 5: Commit**
 
 ```bash
 git add ups_mcp/server.py tests/test_server_elicitation.py
-git commit -m "feat: implement _check_form_elicitation capability check"
+git commit -m "feat: implement _check_form_elicitation capability check
+
+Includes integration-style test with real Pydantic capability objects."
 ```
 
 ---
@@ -1228,11 +1510,9 @@ Append to `tests/test_server_elicitation.py`:
 
 ```python
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 from mcp.server.fastmcp.exceptions import ToolError
-from mcp.server.elicitation import AcceptedElicitation, DeclinedElicitation, CancelledElicitation
-from pydantic import BaseModel
 
 from tests.shipment_fixtures import make_complete_body
 from tests.test_server_tools import FakeToolManager
@@ -1274,16 +1554,13 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         body = make_complete_body()
         result = await server.create_shipment(request_body=body)
         self.assertIn("ShipmentResponse", result)
-        # ToolManager was called
         self.assertEqual(len(self.fake_tool_manager.calls), 1)
 
     async def test_defaults_fill_gaps_preventing_elicitation(self) -> None:
         body = make_complete_body()
         del body["ShipmentRequest"]["Request"]["RequestOption"]
-        # RequestOption has a built-in default of "nonvalidate"
         result = await server.create_shipment(request_body=body)
         self.assertIn("ShipmentResponse", result)
-        # Check that the default was applied
         call_args = self.fake_tool_manager.calls[0][1]
         self.assertEqual(
             call_args["request_body"]["ShipmentRequest"]["Request"]["RequestOption"],
@@ -1296,8 +1573,13 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
             await server.create_shipment(request_body=body)
         payload = json.loads(str(cm.exception))
         self.assertEqual(payload["code"], "ELICITATION_UNSUPPORTED")
-        self.assertIn("missing_fields", payload)
-        self.assertIn("field_prompts", payload)
+        self.assertIn("missing", payload)
+        self.assertIsInstance(payload["missing"], list)
+        # Each item should have dot_path, flat_key, prompt
+        for item in payload["missing"]:
+            self.assertIn("dot_path", item)
+            self.assertIn("flat_key", item)
+            self.assertIn("prompt", item)
 
     async def test_no_elicitation_cap_raises_unsupported(self) -> None:
         body: dict = {"ShipmentRequest": {}}
@@ -1311,7 +1593,6 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         body = make_complete_body()
         del body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"]
 
-        # Create an AcceptedElicitation mock that has .action and .data
         mock_data = MagicMock()
         mock_data.model_dump.return_value = {"shipper_name": "Elicited Corp"}
         accepted = MagicMock()
@@ -1321,7 +1602,6 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         ctx = self._make_ctx(form_supported=True, elicit_result=accepted)
         result = await server.create_shipment(request_body=body, ctx=ctx)
         self.assertIn("ShipmentResponse", result)
-        # Verify elicit was called
         ctx.elicit.assert_called_once()
 
     async def test_declined_raises_elicitation_declined(self) -> None:
@@ -1351,10 +1631,8 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         del body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"]
         del body["ShipmentRequest"]["Shipment"]["ShipTo"]["Name"]
 
-        # Accept but only provide one of two missing fields
         mock_data = MagicMock()
         mock_data.model_dump.return_value = {"shipper_name": "Filled"}
-        # ship_to_name not provided
         accepted = MagicMock()
         accepted.action = "accept"
         accepted.data = mock_data
@@ -1365,7 +1643,8 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(str(cm.exception))
         self.assertEqual(payload["code"], "INCOMPLETE_SHIPMENT")
 
-    async def test_toolerror_payload_has_required_fields(self) -> None:
+    async def test_error_payload_structured_missing_objects(self) -> None:
+        """Error payload uses structured missing array, not split parallel structures."""
         body: dict = {"ShipmentRequest": {}}
         with self.assertRaises(ToolError) as cm:
             await server.create_shipment(request_body=body)
@@ -1373,10 +1652,13 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("code", payload)
         self.assertIn("message", payload)
         self.assertIn("reason", payload)
-        self.assertIn("missing_fields", payload)
-        self.assertIn("field_prompts", payload)
-        self.assertIsInstance(payload["missing_fields"], list)
-        self.assertIsInstance(payload["field_prompts"], dict)
+        self.assertIn("missing", payload)
+        self.assertIsInstance(payload["missing"], list)
+        self.assertGreater(len(payload["missing"]), 0)
+        first = payload["missing"][0]
+        self.assertIn("dot_path", first)
+        self.assertIn("flat_key", first)
+        self.assertIn("prompt", first)
 ```
 
 **Step 2: Run tests to verify they fail**
@@ -1413,6 +1695,7 @@ async def create_shipment(
             - ShipmentRequest.Shipment.ShipTo
             - ShipmentRequest.Shipment.Service
             - ShipmentRequest.Shipment.Package
+            - ShipmentRequest.Shipment.PaymentInformation
         version (str): API version. Default `v2409`.
         additionaladdressvalidation (str): Optional query param (for example `city`).
         trans_id (str): Optional request id.
@@ -1426,6 +1709,7 @@ async def create_shipment(
         apply_defaults,
         find_missing_fields,
         build_elicitation_schema,
+        normalize_elicited_values,
         rehydrate,
     )
 
@@ -1446,6 +1730,13 @@ async def create_shipment(
             transaction_src=transaction_src,
         )
 
+    # Helper: build structured missing payload
+    def _missing_payload(fields):
+        return [
+            {"dot_path": mf.dot_path, "flat_key": mf.flat_key, "prompt": mf.prompt}
+            for mf in fields
+        ]
+
     # 4. Check form-mode elicitation support
     if _check_form_elicitation(ctx):
         schema = build_elicitation_schema(missing)
@@ -1455,15 +1746,15 @@ async def create_shipment(
         )
 
         if result.action == "accept":
-            merged_body = rehydrate(merged_body, result.data.model_dump(), missing)
+            normalized = normalize_elicited_values(result.data.model_dump())
+            merged_body = rehydrate(merged_body, normalized, missing)
             still_missing = find_missing_fields(merged_body)
             if still_missing:
                 raise ToolError(json.dumps({
                     "code": "INCOMPLETE_SHIPMENT",
                     "message": "Still missing required fields after elicitation",
                     "reason": "still_missing",
-                    "missing_fields": [mf.dot_path for mf in still_missing],
-                    "field_prompts": {mf.flat_key: mf.prompt for mf in still_missing},
+                    "missing": _missing_payload(still_missing),
                 }))
             return _require_tool_manager().create_shipment(
                 request_body=merged_body,
@@ -1478,8 +1769,7 @@ async def create_shipment(
                 "code": "ELICITATION_DECLINED",
                 "message": "User declined to provide missing shipment fields",
                 "reason": "declined",
-                "missing_fields": [mf.dot_path for mf in missing],
-                "field_prompts": {mf.flat_key: mf.prompt for mf in missing},
+                "missing": _missing_payload(missing),
             }))
 
         else:  # cancel
@@ -1487,8 +1777,7 @@ async def create_shipment(
                 "code": "ELICITATION_CANCELLED",
                 "message": "User cancelled shipment field elicitation",
                 "reason": "cancelled",
-                "missing_fields": [mf.dot_path for mf in missing],
-                "field_prompts": {mf.flat_key: mf.prompt for mf in missing},
+                "missing": _missing_payload(missing),
             }))
 
     # 5. No form elicitation — structured ToolError for agent fallback
@@ -1496,8 +1785,7 @@ async def create_shipment(
         "code": "ELICITATION_UNSUPPORTED",
         "message": f"Missing {len(missing)} required field(s) and client does not support form elicitation",
         "reason": "unsupported",
-        "missing_fields": [mf.dot_path for mf in missing],
-        "field_prompts": {mf.flat_key: mf.prompt for mf in missing},
+        "missing": _missing_payload(missing),
     }))
 ```
 
@@ -1508,13 +1796,16 @@ Also add `import json` to the top of `server.py` if not already present.
 Run: `python3 -m pytest tests/ -v`
 Expected: All tests PASS (both new elicitation tests and existing server_tools tests)
 
-**IMPORTANT:** The existing `test_server_tools.py::test_new_tools_return_raw_ups_response` may need updating if it calls `create_shipment` without a complete body. Check and fix if needed — the test currently passes `{"RateRequest": {}}` style bodies which may now trigger missing-fields detection. If so, update that test to use `make_complete_body()`.
+**IMPORTANT:** The existing `test_server_tools.py` may call `create_shipment` without a complete body. If those tests fail, update them in the next task.
 
 **Step 5: Commit**
 
 ```bash
 git add ups_mcp/server.py tests/test_server_elicitation.py
-git commit -m "feat: wire up elicitation orchestration in create_shipment"
+git commit -m "feat: wire up elicitation orchestration in create_shipment
+
+Structured error payload uses 'missing' array with full field objects.
+Post-elicitation normalization applied before rehydration."
 ```
 
 ---
@@ -1536,9 +1827,7 @@ If `test_server_tools.py` tests for `create_shipment` fail because they now go t
 # In test_server_tools.py, update the create_shipment call:
 from tests.shipment_fixtures import make_complete_body
 
-# Replace:
-#   await server.create_shipment(request_body={"ShipmentRequest": {}})
-# With:
+# Replace any bare create_shipment calls with:
 #   await server.create_shipment(request_body=make_complete_body())
 ```
 
@@ -1560,24 +1849,38 @@ git commit -m "fix: update existing create_shipment tests for preflight validati
 
 | File | Action | Purpose |
 |------|--------|---------|
-| `ups_mcp/shipment_validator.py` | Create | Pure validation logic: rules, defaults, flatten/unflatten |
+| `ups_mcp/shipment_validator.py` | Create | Pure validation: rules, defaults, flatten/unflatten, normalization |
 | `ups_mcp/server.py` | Modify | Add ctx param, orchestration, `_check_form_elicitation` |
+| `tests/__init__.py` | Create | Make tests a proper package for imports |
 | `tests/shipment_fixtures.py` | Create | Shared test fixture `make_complete_body()` |
 | `tests/test_shipment_validator.py` | Create | Unit tests for validator module |
 | `tests/test_server_elicitation.py` | Create | Integration tests for server orchestration |
 | `tests/test_server_tools.py` | Modify | Update create_shipment calls if needed |
 | `ups_mcp/tools.py` | None | Unchanged |
 
+## Review Findings Addressed
+
+| Finding | Severity | Resolution |
+|---------|----------|------------|
+| Import path risk (`from tests.` without `__init__.py`) | P0 | Added `tests/__init__.py` in Task 1 |
+| Missing PaymentInformation rules | P0 | Added `PAYMENT_RULES` + built-in/env defaults for charge type + billing account |
+| Package dict vs list instability | P1 | `_ensure_package_list()` normalizes to list in `rehydrate()` and `_normalize_packages()` in `find_missing_fields()` |
+| Whitespace-only values bypass detection | P1 | `_field_exists()` strips and rejects whitespace-only strings |
+| `_set_field` overwrite of incompatible types | P1 | Coercion with explicit docstring; tests for non-dict/non-list intermediates |
+| Error payload split structures | P1 | Replaced `missing_fields`/`field_prompts` with single `missing` array of `{dot_path, flat_key, prompt}` objects |
+| No post-elicitation normalization | P1 | Added `normalize_elicited_values()`: trim, uppercase codes, remove empties |
+| Mock-heavy capability tests | P2 | Added `test_with_real_capability_objects` and `test_attribute_error_returns_false` |
+
 ## Commit History (expected)
 
 1. `feat: add shipment_validator data structures and field rules`
-2. `feat: add dict navigation helpers _field_exists and _set_field`
+2. `feat: add dict navigation helpers with whitespace and type safety`
 3. `feat: implement apply_defaults with 3-tier merge`
-4. `feat: implement find_missing_fields with unconditional rules`
+4. `feat: implement find_missing_fields with payment and package rules`
 5. `test: add package edge case tests for find_missing_fields`
 6. `test: add country-conditional tests for find_missing_fields`
 7. `feat: implement build_elicitation_schema for dynamic Pydantic models`
-8. `feat: implement rehydrate for flat-to-nested conversion`
+8. `feat: implement normalize_elicited_values and rehydrate`
 9. `feat: implement _check_form_elicitation capability check`
 10. `feat: wire up elicitation orchestration in create_shipment`
 11. `fix: update existing create_shipment tests for preflight validation` (if needed)
