@@ -243,6 +243,19 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["code"], "MALFORMED_REQUEST")
         self.assertEqual(payload["reason"], "malformed_structure")
 
+    async def test_malformed_shipment_node_raises_structured_tool_error(self) -> None:
+        """Malformed Shipment node should not leak AttributeError."""
+        body = {
+            "ShipmentRequest": {
+                "Shipment": "not_a_dict",
+            }
+        }
+        with self.assertRaises(ToolError) as cm:
+            await server.create_shipment(request_body=body)
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "MALFORMED_REQUEST")
+        self.assertEqual(payload["reason"], "malformed_structure")
+
     async def test_ambiguous_payer_raises_structured_tool_error(self) -> None:
         """Multiple billing objects in the same ShipmentCharge wraps as MALFORMED_REQUEST."""
         body = make_complete_body()

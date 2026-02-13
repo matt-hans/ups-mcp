@@ -665,6 +665,20 @@ class CanonicalizeBodyTests(unittest.TestCase):
         result = canonicalize_body(body)
         self.assertEqual(result["ShipmentRequest"]["Shipment"]["Package"], [{}])
 
+    def test_non_dict_shipment_raises_type_error(self) -> None:
+        body = {"ShipmentRequest": {"Shipment": "not_a_dict"}}
+        with self.assertRaises(TypeError):
+            canonicalize_body(body)
+
+    def test_non_dict_payment_information_raises_type_error(self) -> None:
+        body = {
+            "ShipmentRequest": {
+                "Shipment": {"PaymentInformation": "not_a_dict"},
+            }
+        }
+        with self.assertRaises(TypeError):
+            canonicalize_body(body)
+
 
 class NormalizeElicitedValuesTests(unittest.TestCase):
     def test_trims_whitespace(self) -> None:

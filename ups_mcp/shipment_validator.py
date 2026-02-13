@@ -327,9 +327,41 @@ def canonicalize_body(request_body: dict) -> dict:
     rehydration, and UPS API calls should operate on the canonical form.
     """
     result = copy.deepcopy(request_body)
-    shipment = result.get("ShipmentRequest", {}).get("Shipment", {})
+
+    # Validate structural anchors so callers receive a predictable TypeError
+    # instead of leaking AttributeError from chained .get() on non-dict nodes.
+    if not isinstance(result, dict):
+        raise TypeError(
+            f"Expected dict at request body root, got {type(result).__name__}"
+        )
+
+    shipment_request = result.get("ShipmentRequest")
+    if shipment_request is None:
+        return result
+    if not isinstance(shipment_request, dict):
+        raise TypeError(
+            f"Expected dict at 'ShipmentRequest', got {type(shipment_request).__name__}"
+        )
+
+    shipment = shipment_request.get("Shipment")
+    if shipment is None:
+        return result
+    if not isinstance(shipment, dict):
+        raise TypeError(
+            f"Expected dict at 'ShipmentRequest.Shipment', got {type(shipment).__name__}"
+        )
+
     _normalize_list_field(shipment, "Package")
-    payment = shipment.get("PaymentInformation", {})
+
+    payment = shipment.get("PaymentInformation")
+    if payment is None:
+        return result
+    if not isinstance(payment, dict):
+        raise TypeError(
+            "Expected dict at 'ShipmentRequest.Shipment.PaymentInformation', "
+            f"got {type(payment).__name__}"
+        )
+
     _normalize_list_field(payment, "ShipmentCharge")
     return result
 
