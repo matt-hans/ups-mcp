@@ -777,7 +777,7 @@ Expected: All tests PASS
 git add ups_mcp/shipment_validator.py tests/test_shipment_validator.py
 git commit -m "feat: implement apply_defaults with 3-tier merge
 
-Includes payment charge type (built-in) and billing account number (env)."
+Includes payment charge type (built-in) and conditional billing account (env, only when no payer object present)."
 ```
 
 ---
@@ -793,7 +793,7 @@ Includes payment charge type (built-in) and billing account number (env)."
 Append to `tests/test_shipment_validator.py`:
 
 ```python
-from ups_mcp.shipment_validator import find_missing_fields, MissingField
+from ups_mcp.shipment_validator import find_missing_fields, MissingField, AmbiguousPayerError
 
 
 class FindMissingFieldsUnconditionalTests(unittest.TestCase):
@@ -909,6 +909,31 @@ class FindMissingFieldsUnconditionalTests(unittest.TestCase):
         self.assertNotIn("payment_charge_type", flat_keys)
         self.assertNotIn("payment_account_number", flat_keys)
 
+    def test_multiple_payer_objects_raises_ambiguous_error(self) -> None:
+        """Multiple billing objects in the same ShipmentCharge raises AmbiguousPayerError."""
+        body = make_complete_body()
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"] = [{
+            "Type": "01",
+            "BillShipper": {"AccountNumber": "ABC"},
+            "BillReceiver": {"AccountNumber": "DEF"},
+        }]
+        with self.assertRaises(AmbiguousPayerError) as cm:
+            find_missing_fields(body)
+        self.assertIn("BillShipper", cm.exception.payer_keys)
+        self.assertIn("BillReceiver", cm.exception.payer_keys)
+
+    def test_three_payer_objects_raises_ambiguous_error(self) -> None:
+        """All three billing objects present also raises AmbiguousPayerError."""
+        body = make_complete_body()
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"] = [{
+            "Type": "01",
+            "BillShipper": {"AccountNumber": "A"},
+            "BillReceiver": {"AccountNumber": "B"},
+            "BillThirdParty": {"AccountNumber": "C"},
+        }]
+        with self.assertRaises(AmbiguousPayerError):
+            find_missing_fields(body)
+
     def test_returns_missing_field_instances(self) -> None:
         body = make_complete_body()
         del body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"]
@@ -939,6 +964,9 @@ Add to `ups_mcp/shipment_validator.py`:
 def _normalize_list_field(container: dict, key: str) -> None:
     """Normalize a field in container from dict -> [dict], preserving lists.
 
+    Non-dict list elements are coerced to {} to prevent confusing downstream
+    errors (e.g. a string element where _field_exists expects a dict).
+
     Mutates container in place.
     """
     if key not in container:
@@ -949,6 +977,8 @@ def _normalize_list_field(container: dict, key: str) -> None:
     elif isinstance(value, list):
         if not value:
             container[key] = [{}]
+        else:
+            container[key] = [el if isinstance(el, dict) else {} for el in value]
     else:
         container[key] = [{}]
 
@@ -1021,6 +1051,12 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
         .get("ShipmentCharge", [{}])
     )
     first_charge = first_charge[0] if first_charge else {}
+
+    # Detect ambiguous payer: multiple billing objects in the same charge
+    present_payers = [k for k in PAYMENT_PAYER_RULES if k in first_charge]
+    if len(present_payers) > 1:
+        raise AmbiguousPayerError(present_payers)
+
     payer_found = False
     for payer_key, rule in PAYMENT_PAYER_RULES.items():
         if payer_key in first_charge:
@@ -1368,6 +1404,37 @@ class CanonicalizeBodyTests(unittest.TestCase):
         result = canonicalize_body({})
         self.assertEqual(result, {})
 
+    def test_non_dict_list_elements_coerced_to_empty_dict(self) -> None:
+        body = {
+            "ShipmentRequest": {
+                "Shipment": {
+                    "Package": ["not_a_dict", 42, None],
+                }
+            }
+        }
+        result = canonicalize_body(body)
+        pkgs = result["ShipmentRequest"]["Shipment"]["Package"]
+        self.assertEqual(pkgs, [{}, {}, {}])
+
+    def test_non_dict_shipment_charge_elements_coerced(self) -> None:
+        body = {
+            "ShipmentRequest": {
+                "Shipment": {
+                    "PaymentInformation": {
+                        "ShipmentCharge": ["bad_element"],
+                    }
+                }
+            }
+        }
+        result = canonicalize_body(body)
+        charges = result["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"]
+        self.assertEqual(charges, [{}])
+
+    def test_non_list_non_dict_package_becomes_empty_list(self) -> None:
+        body = {"ShipmentRequest": {"Shipment": {"Package": "invalid"}}}
+        result = canonicalize_body(body)
+        self.assertEqual(result["ShipmentRequest"]["Shipment"]["Package"], [{}])
+
 
 class NormalizeElicitedValuesTests(unittest.TestCase):
     def test_trims_whitespace(self) -> None:
@@ -1601,6 +1668,16 @@ def normalize_elicited_values(flat_data: dict[str, str]) -> dict[str, str]:
             value = value.upper()
         result[key] = value
     return result
+
+
+class AmbiguousPayerError(Exception):
+    """Raised when multiple billing payer objects exist in the same ShipmentCharge."""
+    def __init__(self, payer_keys: list[str]):
+        self.payer_keys = payer_keys
+        super().__init__(
+            f"Ambiguous payer: multiple billing objects present ({', '.join(payer_keys)}). "
+            f"Only one of BillShipper, BillReceiver, BillThirdParty is allowed per charge."
+        )
 
 
 class RehydrationError(Exception):
@@ -1985,6 +2062,20 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["code"], "MALFORMED_REQUEST")
         self.assertEqual(payload["reason"], "malformed_structure")
 
+    async def test_ambiguous_payer_raises_structured_tool_error(self) -> None:
+        """Multiple billing objects in the same ShipmentCharge wraps as MALFORMED_REQUEST."""
+        body = make_complete_body()
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"] = [{
+            "Type": "01",
+            "BillShipper": {"AccountNumber": "ABC"},
+            "BillReceiver": {"AccountNumber": "DEF"},
+        }]
+        with self.assertRaises(ToolError) as cm:
+            await server.create_shipment(request_body=body)
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "MALFORMED_REQUEST")
+        self.assertEqual(payload["reason"], "ambiguous_payer")
+
     async def test_rehydration_error_raises_structured_tool_error(self) -> None:
         """When rehydrate hits a structural conflict, ToolError wraps it."""
         body = make_complete_body()
@@ -2108,6 +2199,7 @@ async def create_shipment(
         rehydrate,
         canonicalize_body,
         RehydrationError,
+        AmbiguousPayerError,
     )
 
     # Helper: canonicalize and send to UPS
@@ -2134,7 +2226,15 @@ async def create_shipment(
         }))
 
     # 2. Preflight: find missing required fields
-    missing = find_missing_fields(merged_body)
+    try:
+        missing = find_missing_fields(merged_body)
+    except AmbiguousPayerError as exc:
+        raise ToolError(json.dumps({
+            "code": "MALFORMED_REQUEST",
+            "message": str(exc),
+            "reason": "ambiguous_payer",
+            "missing": [],
+        }))
 
     # 3. Happy path — all fields present
     if not missing:
@@ -2312,6 +2412,14 @@ git commit -m "fix: update existing create_shipment tests for preflight validati
 | ShipmentCharge dict normalization broken — `_field_exists` runs on un-normalized body | P0 | Replaced fragmented normalization (`_ensure_package_list`, local charge normalization) with unified `canonicalize_body()` that normalizes both Package and ShipmentCharge to list form. `find_missing_fields` canonicalizes first, then all `_field_exists` calls operate on canonical body where `[0]` paths resolve correctly. |
 | Structural TypeError leaks before elicitation | P1 | Wrapped `apply_defaults()` call in server.py with `try/except TypeError` → structured `ToolError` with code `MALFORMED_REQUEST`. Test verifies. |
 | ShipmentCharge not canonicalized before UPS call | P1 | `_send_to_ups()` now calls `canonicalize_body()` (not just `_ensure_package_list`), normalizing both Package and ShipmentCharge. Test `test_shipment_charge_dict_canonicalized_to_list_before_ups_call` verifies. |
+
+### Round 5
+
+| Finding | Severity | Resolution |
+|---------|----------|------------|
+| Multiple payer objects in same ShipmentCharge silently picks first | P1 | Added `AmbiguousPayerError` exception. `find_missing_fields` detects when multiple billing objects (BillShipper, BillReceiver, BillThirdParty) are present in the same ShipmentCharge and raises it. Server wraps as `ToolError` with code `MALFORMED_REQUEST` and reason `ambiguous_payer`. Tests at validator and server levels. |
+| Non-dict list elements not hardened in `_normalize_list_field` | P2 | `_normalize_list_field` now coerces non-dict elements to `{}`. Non-list/non-dict values for the field are also replaced with `[{}]`. Tests verify all edge cases. |
+| Task 3 commit message references "billing account number (env)" but it's now conditional | P2 | Updated commit message to say "conditional billing account (env, only when no payer object present)". |
 
 ## Commit History (expected)
 

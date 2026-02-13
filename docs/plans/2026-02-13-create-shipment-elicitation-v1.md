@@ -213,9 +213,12 @@ All elicitation-related errors return JSON string with:
 
 | Code | Reason | When |
 |------|--------|------|
+| `MALFORMED_REQUEST` | `malformed_structure` | Request body has structural conflicts (e.g. string where dict expected) |
+| `MALFORMED_REQUEST` | `ambiguous_payer` | Multiple billing objects (BillShipper/BillReceiver/BillThirdParty) in same ShipmentCharge |
 | `ELICITATION_UNSUPPORTED` | `unsupported` | Client lacks form-mode elicitation |
 | `ELICITATION_DECLINED` | `declined` | User declined the elicitation form |
 | `ELICITATION_CANCELLED` | `cancelled` | User cancelled the elicitation form |
+| `ELICITATION_INVALID_RESPONSE` | `rehydration_error` | Elicited data conflicts with request structure |
 | `INCOMPLETE_SHIPMENT` | `still_missing` | Fields still missing after accepted elicitation |
 
 ## Tests
