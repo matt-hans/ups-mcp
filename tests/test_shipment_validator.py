@@ -544,8 +544,92 @@ class FindMissingFieldsCountryTests(unittest.TestCase):
         self.assertNotIn("shipper_postal_code", flat_keys)
 
 
-from ups_mcp.shipment_validator import build_elicitation_schema
+from ups_mcp.shipment_validator import _missing_from_rule, build_elicitation_schema
 from pydantic import BaseModel
+
+
+class MissingFromRuleTests(unittest.TestCase):
+    def test_propagates_type_metadata(self) -> None:
+        rule = FieldRule(
+            "a.b", "code", "Code",
+            enum_values=("01", "02"),
+            enum_titles=("One", "Two"),
+            default="01",
+            constraints=(("maxLength", 2),),
+        )
+        mf = _missing_from_rule(rule)
+        self.assertEqual(mf.enum_values, ("01", "02"))
+        self.assertEqual(mf.enum_titles, ("One", "Two"))
+        self.assertEqual(mf.default, "01")
+        self.assertEqual(mf.constraints, (("maxLength", 2),))
+
+    def test_overrides_apply(self) -> None:
+        rule = FieldRule("a.b", "code", "Code")
+        mf = _missing_from_rule(rule, dot_path="x.y", flat_key="new_key", prompt="New")
+        self.assertEqual(mf.dot_path, "x.y")
+        self.assertEqual(mf.flat_key, "new_key")
+        self.assertEqual(mf.prompt, "New")
+
+    def test_none_override_uses_rule_value(self) -> None:
+        rule = FieldRule("a.b", "code", "Code")
+        mf = _missing_from_rule(rule, dot_path=None, flat_key=None, prompt=None)
+        self.assertEqual(mf.dot_path, "a.b")
+        self.assertEqual(mf.flat_key, "code")
+        self.assertEqual(mf.prompt, "Code")
+
+
+class FindMissingFieldsTypeMetadataTests(unittest.TestCase):
+    """Integration: verify find_missing_fields propagates FieldRule type metadata."""
+
+    def test_service_code_carries_enum_values(self) -> None:
+        body = make_complete_body()
+        del body["ShipmentRequest"]["Shipment"]["Service"]
+        missing = find_missing_fields(body)
+        service = [mf for mf in missing if mf.flat_key == "service_code"]
+        self.assertEqual(len(service), 1)
+        self.assertIsNotNone(service[0].enum_values)
+        self.assertIn("03", service[0].enum_values)
+        self.assertIsNotNone(service[0].enum_titles)
+        self.assertEqual(service[0].default, "03")
+
+    def test_package_weight_carries_float_type(self) -> None:
+        body = make_complete_body()
+        del body["ShipmentRequest"]["Shipment"]["Package"][0]["PackageWeight"]["Weight"]
+        missing = find_missing_fields(body)
+        weight = [mf for mf in missing if mf.flat_key == "package_1_weight"]
+        self.assertEqual(len(weight), 1)
+        self.assertEqual(weight[0].type_hint, float)
+        self.assertIsNotNone(weight[0].constraints)
+
+    def test_country_code_carries_constraints(self) -> None:
+        body = make_complete_body()
+        del body["ShipmentRequest"]["Shipment"]["Shipper"]["Address"]["CountryCode"]
+        missing = find_missing_fields(body)
+        country = [mf for mf in missing if mf.flat_key == "shipper_country_code"]
+        self.assertEqual(len(country), 1)
+        constraint_keys = {k for k, v in country[0].constraints}
+        self.assertIn("maxLength", constraint_keys)
+        self.assertIn("pattern", constraint_keys)
+
+    def test_packaging_code_carries_enum_with_titles(self) -> None:
+        body = make_complete_body()
+        del body["ShipmentRequest"]["Shipment"]["Package"][0]["Packaging"]
+        missing = find_missing_fields(body)
+        packaging = [mf for mf in missing if mf.flat_key == "package_1_packaging_code"]
+        self.assertEqual(len(packaging), 1)
+        self.assertIsNotNone(packaging[0].enum_values)
+        self.assertIsNotNone(packaging[0].enum_titles)
+        self.assertEqual(len(packaging[0].enum_values), len(packaging[0].enum_titles))
+        self.assertEqual(packaging[0].default, "02")
+
+    def test_charge_type_carries_enum(self) -> None:
+        body = make_complete_body()
+        del body["ShipmentRequest"]["Shipment"]["PaymentInformation"]
+        missing = find_missing_fields(body)
+        charge = [mf for mf in missing if mf.flat_key == "payment_charge_type"]
+        self.assertEqual(len(charge), 1)
+        self.assertEqual(charge[0].enum_values, ("01", "02"))
+        self.assertEqual(charge[0].default, "01")
 
 
 class BuildElicitationSchemaTests(unittest.TestCase):
@@ -747,6 +831,90 @@ class ValidateElicitedValuesTests(unittest.TestCase):
         missing = [MissingField("a.b", "package_1_weight", "Custom Label")]
         errors = validate_elicited_values({"package_1_weight": "bad"}, missing)
         self.assertIn("Custom Label", errors[0])
+
+    def test_valid_enum_value_passes(self) -> None:
+        missing = [MissingField(
+            "a.b", "service_code", "UPS service type",
+            enum_values=("01", "02", "03"),
+        )]
+        errors = validate_elicited_values({"service_code": "03"}, missing)
+        self.assertEqual(errors, [])
+
+    def test_invalid_enum_value_fails(self) -> None:
+        missing = [MissingField(
+            "a.b", "service_code", "UPS service type",
+            enum_values=("01", "02", "03"),
+        )]
+        errors = validate_elicited_values({"service_code": "99"}, missing)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("must be one of", errors[0])
+        self.assertIn("01", errors[0])
+
+    def test_enum_field_without_metadata_skipped(self) -> None:
+        """Fields without enum_values in MissingField are not enum-validated."""
+        missing = [MissingField("a.b", "shipper_name", "Shipper name")]
+        errors = validate_elicited_values({"shipper_name": "anything"}, missing)
+        self.assertEqual(errors, [])
+
+    def test_valid_us_postal_code(self) -> None:
+        missing = [MissingField("a.b", "shipper_postal_code", "Postal code")]
+        errors = validate_elicited_values(
+            {"shipper_postal_code": "10001", "shipper_country_code": "US"}, missing,
+        )
+        self.assertEqual(errors, [])
+
+    def test_valid_us_postal_code_zip_plus_4(self) -> None:
+        missing = [MissingField("a.b", "shipper_postal_code", "Postal code")]
+        errors = validate_elicited_values(
+            {"shipper_postal_code": "10001-1234", "shipper_country_code": "US"}, missing,
+        )
+        self.assertEqual(errors, [])
+
+    def test_invalid_us_postal_code(self) -> None:
+        missing = [MissingField("a.b", "shipper_postal_code", "Postal code")]
+        errors = validate_elicited_values(
+            {"shipper_postal_code": "ABCDE", "shipper_country_code": "US"}, missing,
+        )
+        self.assertEqual(len(errors), 1)
+        self.assertIn("US postal code", errors[0])
+
+    def test_valid_ca_postal_code(self) -> None:
+        missing = [MissingField("a.b", "ship_to_postal_code", "Postal code")]
+        errors = validate_elicited_values(
+            {"ship_to_postal_code": "K1A 0B1", "ship_to_country_code": "CA"}, missing,
+        )
+        self.assertEqual(errors, [])
+
+    def test_valid_ca_postal_code_no_space(self) -> None:
+        missing = [MissingField("a.b", "ship_to_postal_code", "Postal code")]
+        errors = validate_elicited_values(
+            {"ship_to_postal_code": "K1A0B1", "ship_to_country_code": "CA"}, missing,
+        )
+        self.assertEqual(errors, [])
+
+    def test_invalid_ca_postal_code(self) -> None:
+        missing = [MissingField("a.b", "ship_to_postal_code", "Postal code")]
+        errors = validate_elicited_values(
+            {"ship_to_postal_code": "12345", "ship_to_country_code": "CA"}, missing,
+        )
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Canadian postal code", errors[0])
+
+    def test_postal_code_non_us_ca_not_validated(self) -> None:
+        """Postal codes for non-US/CA countries are not format-validated."""
+        missing = [MissingField("a.b", "shipper_postal_code", "Postal code")]
+        errors = validate_elicited_values(
+            {"shipper_postal_code": "SW1A 1AA", "shipper_country_code": "GB"}, missing,
+        )
+        self.assertEqual(errors, [])
+
+    def test_postal_code_without_country_not_validated(self) -> None:
+        """When no country code is in flat_data, postal code is not format-validated."""
+        missing = [MissingField("a.b", "shipper_postal_code", "Postal code")]
+        errors = validate_elicited_values(
+            {"shipper_postal_code": "anything"}, missing,
+        )
+        self.assertEqual(errors, [])
 
 
 from ups_mcp.shipment_validator import (

@@ -455,11 +455,14 @@ def _missing_from_rule(
 
     Optional overrides for dot_path/flat_key/prompt allow customization
     (e.g. per-package indexing) without losing the rule's type information.
+
+    Uses ``is not None`` rather than ``or`` to avoid silently falling back
+    to the rule's value when an empty string is passed as an override.
     """
     return MissingField(
-        dot_path=dot_path or rule.dot_path,
-        flat_key=flat_key or rule.flat_key,
-        prompt=prompt or rule.prompt,
+        dot_path=dot_path if dot_path is not None else rule.dot_path,
+        flat_key=flat_key if flat_key is not None else rule.flat_key,
+        prompt=prompt if prompt is not None else rule.prompt,
         type_hint=rule.type_hint,
         enum_values=rule.enum_values,
         enum_titles=rule.enum_titles,
@@ -659,6 +662,11 @@ _WEIGHT_VALUE_KEYS = re.compile(r".*_weight$")
 _TWO_ALPHA = re.compile(r"^[A-Z]{2}$")
 
 
+_POSTAL_CODE_US = re.compile(r"^\d{5}(-\d{4})?$")
+_POSTAL_CODE_CA = re.compile(r"^[A-Z]\d[A-Z] ?\d[A-Z]\d$")
+_POSTAL_CODE_KEYS = re.compile(r".*_postal_code$")
+
+
 def validate_elicited_values(
     flat_data: dict[str, str],
     missing: list[MissingField],
@@ -666,15 +674,25 @@ def validate_elicited_values(
     """Validate elicited values before rehydration.
 
     Returns a list of human-readable error messages (empty if all valid).
-    Only validates fields that are present in flat_data and have a matching
-    MissingField entry.
+    Checks:
+    - Weight fields: must be positive numbers
+    - Country/state codes: must be 2-letter uppercase alpha
+    - Postal codes: US (5 or 5+4 digit) and CA (A1A 1A1) format
+    - Enum fields: value must be in the MissingField's enum_values tuple
     """
-    prompt_by_key = {mf.flat_key: mf.prompt for mf in missing}
+    metadata_by_key = {mf.flat_key: mf for mf in missing}
     errors: list[str] = []
 
     for key, value in flat_data.items():
-        label = prompt_by_key.get(key, key)
+        mf = metadata_by_key.get(key)
+        label = mf.prompt if mf else key
 
+        # Enum validation from MissingField metadata
+        if mf and mf.enum_values and value not in mf.enum_values:
+            allowed = ", ".join(mf.enum_values)
+            errors.append(f"{label}: must be one of [{allowed}]")
+
+        # Weight: must be a positive number
         if _WEIGHT_VALUE_KEYS.match(key):
             try:
                 w = float(value)
@@ -683,11 +701,24 @@ def validate_elicited_values(
             except (ValueError, TypeError):
                 errors.append(f"{label}: must be a number")
 
+        # Country code: 2-letter uppercase alpha
         if _COUNTRY_CODE_KEYS.match(key) and not _TWO_ALPHA.match(value):
             errors.append(f"{label}: must be a 2-letter country code")
 
+        # State code: 2-letter uppercase alpha
         if _STATE_KEYS.match(key) and not _TWO_ALPHA.match(value):
             errors.append(f"{label}: must be a 2-letter state/province code")
+
+        # Postal code: format depends on associated country code
+        if _POSTAL_CODE_KEYS.match(key):
+            # Determine associated country: shipper_postal_code → shipper_country_code
+            prefix = key.rsplit("_postal_code", 1)[0]
+            country_key = f"{prefix}_country_code"
+            country = flat_data.get(country_key, "").upper()
+            if country == "US" and not _POSTAL_CODE_US.match(value):
+                errors.append(f"{label}: must be a valid US postal code (e.g. 10001 or 10001-1234)")
+            elif country == "CA" and not _POSTAL_CODE_CA.match(value):
+                errors.append(f"{label}: must be a valid Canadian postal code (e.g. K1A 0B1)")
 
     return errors
 
