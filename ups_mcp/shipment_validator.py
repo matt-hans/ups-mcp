@@ -9,7 +9,7 @@ from __future__ import annotations
 import copy
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, create_model
 
@@ -20,18 +20,36 @@ from pydantic import BaseModel, Field, create_model
 
 @dataclass(frozen=True)
 class MissingField:
-    """A required field that is absent from the request body."""
+    """A required field that is absent from the request body.
+
+    Carries optional type metadata so that ``build_elicitation_schema`` can
+    produce richer JSON Schema types (enums, numbers, defaults, constraints).
+    """
     dot_path: str   # e.g. "ShipmentRequest.Shipment.Shipper.Name"
     flat_key: str   # e.g. "shipper_name"
     prompt: str     # e.g. "Shipper name"
+    type_hint: type = str
+    enum_values: tuple[str, ...] | None = None
+    enum_titles: tuple[str, ...] | None = None
+    default: Any = None
+    constraints: tuple[tuple[str, Any], ...] | None = None
 
 
 @dataclass(frozen=True)
 class FieldRule:
-    """A rule for a required field — either a full dot-path or a sub-path for packages."""
+    """A rule for a required field — either a full dot-path or a sub-path for packages.
+
+    Optional type metadata drives richer elicitation schemas (enums, numbers,
+    defaults, constraints) instead of defaulting everything to str.
+    """
     dot_path: str
     flat_key: str
     prompt: str
+    type_hint: type = str
+    enum_values: tuple[str, ...] | None = None
+    enum_titles: tuple[str, ...] | None = None  # paired with enum_values for oneOf
+    default: Any = None
+    constraints: tuple[tuple[str, Any], ...] | None = None  # min, max, pattern, maxLength, etc.
 
 
 # ---------------------------------------------------------------------------
@@ -44,12 +62,30 @@ UNCONDITIONAL_RULES: list[FieldRule] = [
     FieldRule("ShipmentRequest.Shipment.Shipper.ShipperNumber", "shipper_number", "UPS account number"),
     FieldRule("ShipmentRequest.Shipment.Shipper.Address.AddressLine[0]", "shipper_address_line_1", "Shipper street address"),
     FieldRule("ShipmentRequest.Shipment.Shipper.Address.City", "shipper_city", "Shipper city"),
-    FieldRule("ShipmentRequest.Shipment.Shipper.Address.CountryCode", "shipper_country_code", "Shipper country code"),
+    FieldRule(
+        "ShipmentRequest.Shipment.Shipper.Address.CountryCode",
+        "shipper_country_code", "Shipper country code",
+        constraints=(("maxLength", 2), ("pattern", "^[A-Z]{2}$")),
+    ),
     FieldRule("ShipmentRequest.Shipment.ShipTo.Name", "ship_to_name", "Recipient name"),
     FieldRule("ShipmentRequest.Shipment.ShipTo.Address.AddressLine[0]", "ship_to_address_line_1", "Recipient street address"),
     FieldRule("ShipmentRequest.Shipment.ShipTo.Address.City", "ship_to_city", "Recipient city"),
-    FieldRule("ShipmentRequest.Shipment.ShipTo.Address.CountryCode", "ship_to_country_code", "Recipient country code"),
-    FieldRule("ShipmentRequest.Shipment.Service.Code", "service_code", "UPS service code (e.g. '03' for Ground)"),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipTo.Address.CountryCode",
+        "ship_to_country_code", "Recipient country code",
+        constraints=(("maxLength", 2), ("pattern", "^[A-Z]{2}$")),
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.Service.Code", "service_code",
+        "UPS service type",
+        enum_values=("01", "02", "03", "12", "13", "14", "59", "65"),
+        enum_titles=(
+            "Next Day Air", "2nd Day Air", "Ground", "3 Day Select",
+            "Next Day Air Saver", "Next Day Air Early", "2nd Day Air A.M.",
+            "UPS Saver",
+        ),
+        default="03",
+    ),
 ]
 
 
@@ -64,7 +100,10 @@ UNCONDITIONAL_RULES: list[FieldRule] = [
 PAYMENT_CHARGE_TYPE_RULE: FieldRule = FieldRule(
     "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].Type",
     "payment_charge_type",
-    "Shipment charge type (01=Transportation, 02=Duties and Taxes)",
+    "Shipment charge type",
+    enum_values=("01", "02"),
+    enum_titles=("Transportation", "Duties and Taxes"),
+    default="01",
 )
 
 # Maps billing object key -> FieldRule for the account number within that object.
@@ -93,9 +132,26 @@ PAYMENT_PAYER_RULES: dict[str, FieldRule] = {
 # ---------------------------------------------------------------------------
 
 PACKAGE_RULES: list[FieldRule] = [
-    FieldRule("Packaging.Code", "packaging_code", "Packaging type code"),
-    FieldRule("PackageWeight.UnitOfMeasurement.Code", "weight_unit", "Weight unit (LBS or KGS)"),
-    FieldRule("PackageWeight.Weight", "weight", "Package weight"),
+    FieldRule(
+        "Packaging.Code", "packaging_code", "Packaging type code",
+        enum_values=("02", "01", "03", "04", "21", "24", "25"),
+        enum_titles=(
+            "Customer Supplied Package", "UPS Letter", "Tube",
+            "PAK", "UPS Express Box", "UPS 25KG Box", "UPS 10KG Box",
+        ),
+        default="02",
+    ),
+    FieldRule(
+        "PackageWeight.UnitOfMeasurement.Code", "weight_unit",
+        "Weight unit",
+        enum_values=("LBS", "KGS"),
+        default="LBS",
+    ),
+    FieldRule(
+        "PackageWeight.Weight", "weight", "Package weight",
+        type_hint=float,
+        constraints=(("gt", 0),),
+    ),
 ]
 
 
@@ -110,7 +166,10 @@ PACKAGE_RULES: list[FieldRule] = [
 
 COUNTRY_CONDITIONAL_RULES: dict[tuple[str, ...], list[FieldRule]] = {
     ("US", "CA", "PR"): [
-        FieldRule("StateProvinceCode", "state", "State/province code"),
+        FieldRule(
+            "StateProvinceCode", "state", "State/province code",
+            constraints=(("maxLength", 2), ("pattern", "^[A-Z]{2}$")),
+        ),
         FieldRule("PostalCode", "postal_code", "Postal code"),
     ],
 }
@@ -386,6 +445,29 @@ def _get_packages(request_body: dict) -> list[dict]:
     return [{}]
 
 
+def _missing_from_rule(
+    rule: FieldRule,
+    dot_path: str | None = None,
+    flat_key: str | None = None,
+    prompt: str | None = None,
+) -> MissingField:
+    """Create a MissingField from a FieldRule, propagating type metadata.
+
+    Optional overrides for dot_path/flat_key/prompt allow customization
+    (e.g. per-package indexing) without losing the rule's type information.
+    """
+    return MissingField(
+        dot_path=dot_path or rule.dot_path,
+        flat_key=flat_key or rule.flat_key,
+        prompt=prompt or rule.prompt,
+        type_hint=rule.type_hint,
+        enum_values=rule.enum_values,
+        enum_titles=rule.enum_titles,
+        default=rule.default,
+        constraints=rule.constraints,
+    )
+
+
 def find_missing_fields(request_body: dict) -> list[MissingField]:
     """Check required fields and return those that are missing.
 
@@ -403,15 +485,11 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
     # Unconditional non-package fields
     for rule in UNCONDITIONAL_RULES:
         if not _field_exists(body, rule.dot_path):
-            missing.append(MissingField(rule.dot_path, rule.flat_key, rule.prompt))
+            missing.append(_missing_from_rule(rule))
 
     # Payment: charge type is always required
     if not _field_exists(body, PAYMENT_CHARGE_TYPE_RULE.dot_path):
-        missing.append(MissingField(
-            PAYMENT_CHARGE_TYPE_RULE.dot_path,
-            PAYMENT_CHARGE_TYPE_RULE.flat_key,
-            PAYMENT_CHARGE_TYPE_RULE.prompt,
-        ))
+        missing.append(_missing_from_rule(PAYMENT_CHARGE_TYPE_RULE))
 
     # Payment: payer account is conditional on which billing object is present.
     # Body is canonical so ShipmentCharge is always a list here.
@@ -434,15 +512,13 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
         if payer_key in first_charge:
             payer_found = True
             if not _field_exists(body, rule.dot_path):
-                missing.append(MissingField(rule.dot_path, rule.flat_key, rule.prompt))
+                missing.append(_missing_from_rule(rule))
             break
     if not payer_found:
         # No billing object present — require BillShipper.AccountNumber
         default_rule = PAYMENT_PAYER_RULES["BillShipper"]
         if not _field_exists(body, default_rule.dot_path):
-            missing.append(MissingField(
-                default_rule.dot_path, default_rule.flat_key, default_rule.prompt,
-            ))
+            missing.append(_missing_from_rule(default_rule))
 
     # Per-package fields — body is canonical so Package is always a list
     packages = _get_packages(body)
@@ -453,7 +529,9 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
             flat_key = f"package_{n}_{rule.flat_key}"
             prompt = f"Package {n}: {rule.prompt}" if len(packages) > 1 else rule.prompt
             if not _field_exists(pkg, rule.dot_path):
-                missing.append(MissingField(full_dot_path, flat_key, prompt))
+                missing.append(_missing_from_rule(
+                    rule, dot_path=full_dot_path, flat_key=flat_key, prompt=prompt,
+                ))
 
     # Country-conditional fields
     shipment = body.get("ShipmentRequest", {}).get("Shipment", {})
@@ -469,7 +547,9 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
                     flat_key = f"{prefix}_{rule.flat_key}"
                     prompt = f"{'Shipper' if role == 'Shipper' else 'Recipient'} {rule.prompt.lower()}"
                     if not _field_exists(address, rule.dot_path):
-                        missing.append(MissingField(full_dot_path, flat_key, prompt))
+                        missing.append(_missing_from_rule(
+                            rule, dot_path=full_dot_path, flat_key=flat_key, prompt=prompt,
+                        ))
 
     return missing
 
@@ -478,15 +558,65 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
 # Elicitation schema generation
 # ---------------------------------------------------------------------------
 
-def build_elicitation_schema(missing: list[MissingField]) -> type[BaseModel]:
-    """Create a dynamic flat Pydantic model with one str field per missing field.
+# Pydantic Field() natively supports these constraint keys.
+# Everything else goes into json_schema_extra for the JSON Schema output.
+_PYDANTIC_NATIVE_CONSTRAINTS: frozenset[str] = frozenset({
+    "gt", "ge", "lt", "le", "multiple_of", "strict",
+    "min_length", "max_length", "pattern",
+})
 
-    All fields are required str types with descriptions from the MissingField prompts.
+
+def build_elicitation_schema(missing: list[MissingField]) -> type[BaseModel]:
+    """Create a dynamic flat Pydantic model from missing field metadata.
+
+    Uses MissingField type information to produce richer schema types:
+    - ``enum_values`` with ``enum_titles`` → ``Literal`` (renders as oneOf)
+    - ``enum_values`` without titles → ``Literal`` (renders as enum)
+    - ``type_hint == float`` → ``float``
+    - ``type_hint == int`` → ``int``
+    - ``type_hint == bool`` → ``bool``
+    - default → ``str``
+
+    Defaults and constraints from the MissingField are forwarded to the
+    Pydantic ``Field``.
+
     This model is suitable for passing to ``ctx.elicit(schema=...)``.
     """
+
     field_definitions: dict[str, Any] = {}
     for mf in missing:
-        field_definitions[mf.flat_key] = (str, Field(description=mf.prompt))
+        field_kwargs: dict[str, Any] = {"description": mf.prompt}
+        if mf.default is not None:
+            field_kwargs["default"] = mf.default
+
+        if mf.constraints:
+            json_extras: dict[str, Any] = {}
+            for k, v in mf.constraints:
+                if k in _PYDANTIC_NATIVE_CONSTRAINTS:
+                    field_kwargs[k] = v
+                else:
+                    # JSON Schema keys like maxLength, minLength
+                    json_extras[k] = v
+            if json_extras:
+                field_kwargs["json_schema_extra"] = json_extras
+
+        if mf.enum_values:
+            field_type = Literal[mf.enum_values]  # type: ignore[valid-type]
+            # When titles are paired with enum values, inject oneOf with
+            # const+title into json_schema_extra so MCP clients can show
+            # human-readable labels for opaque codes.
+            if mf.enum_titles and len(mf.enum_titles) == len(mf.enum_values):
+                one_of = [
+                    {"const": val, "title": title}
+                    for val, title in zip(mf.enum_values, mf.enum_titles)
+                ]
+                extras = field_kwargs.get("json_schema_extra", {})
+                extras["oneOf"] = one_of
+                field_kwargs["json_schema_extra"] = extras
+        else:
+            field_type = mf.type_hint
+
+        field_definitions[mf.flat_key] = (field_type, Field(**field_kwargs))
     return create_model("MissingShipmentFields", **field_definitions)
 
 
@@ -522,6 +652,47 @@ def normalize_elicited_values(flat_data: dict[str, str]) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Post-elicitation semantic validation
+# ---------------------------------------------------------------------------
+
+_WEIGHT_VALUE_KEYS = re.compile(r".*_weight$")
+_TWO_ALPHA = re.compile(r"^[A-Z]{2}$")
+
+
+def validate_elicited_values(
+    flat_data: dict[str, str],
+    missing: list[MissingField],
+) -> list[str]:
+    """Validate elicited values before rehydration.
+
+    Returns a list of human-readable error messages (empty if all valid).
+    Only validates fields that are present in flat_data and have a matching
+    MissingField entry.
+    """
+    prompt_by_key = {mf.flat_key: mf.prompt for mf in missing}
+    errors: list[str] = []
+
+    for key, value in flat_data.items():
+        label = prompt_by_key.get(key, key)
+
+        if _WEIGHT_VALUE_KEYS.match(key):
+            try:
+                w = float(value)
+                if w <= 0:
+                    errors.append(f"{label}: must be a positive number")
+            except (ValueError, TypeError):
+                errors.append(f"{label}: must be a number")
+
+        if _COUNTRY_CODE_KEYS.match(key) and not _TWO_ALPHA.match(value):
+            errors.append(f"{label}: must be a 2-letter country code")
+
+        if _STATE_KEYS.match(key) and not _TWO_ALPHA.match(value):
+            errors.append(f"{label}: must be a 2-letter state/province code")
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
 # Rehydration
 # ---------------------------------------------------------------------------
 
@@ -554,7 +725,7 @@ def rehydrate(
     result = canonicalize_body(request_body)
 
     for flat_key, value in flat_data.items():
-        if not value:
+        if value is None or value == "":
             continue
         dot_path = flat_to_dot.get(flat_key)
         if dot_path is None:

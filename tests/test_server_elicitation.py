@@ -341,5 +341,39 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("prompt", first)
 
 
+    async def test_validation_errors_raise_structured_tool_error(self) -> None:
+        """Invalid elicited values (e.g. non-numeric weight) raise ELICITATION_INVALID_RESPONSE."""
+        body = make_complete_body()
+        del body["ShipmentRequest"]["Shipment"]["Package"][0]["PackageWeight"]["Weight"]
+
+        mock_data = MagicMock()
+        mock_data.model_dump.return_value = {"package_1_weight": "not_a_number"}
+        accepted = MagicMock()
+        accepted.action = "accept"
+        accepted.data = mock_data
+
+        ctx = self._make_ctx(form_supported=True, elicit_result=accepted)
+        with self.assertRaises(ToolError) as cm:
+            await server.create_shipment(request_body=body, ctx=ctx)
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "ELICITATION_INVALID_RESPONSE")
+        self.assertEqual(payload["reason"], "validation_errors")
+
+    async def test_elicitation_transport_failure_raises_structured_error(self) -> None:
+        """If ctx.elicit() raises an unexpected exception, wrap as ELICITATION_FAILED."""
+        body = make_complete_body()
+        del body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"]
+
+        ctx = self._make_ctx(form_supported=True)
+        ctx.elicit = AsyncMock(side_effect=RuntimeError("connection lost"))
+
+        with self.assertRaises(ToolError) as cm:
+            await server.create_shipment(request_body=body, ctx=ctx)
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "ELICITATION_FAILED")
+        self.assertEqual(payload["reason"], "transport_error")
+        self.assertIn("connection lost", payload["message"])
+
+
 if __name__ == "__main__":
     unittest.main()

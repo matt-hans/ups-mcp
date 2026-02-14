@@ -234,6 +234,7 @@ async def create_shipment(
         find_missing_fields,
         build_elicitation_schema,
         normalize_elicited_values,
+        validate_elicited_values,
         rehydrate,
         canonicalize_body,
         RehydrationError,
@@ -289,13 +290,31 @@ async def create_shipment(
     # 4. Check form-mode elicitation support
     if _check_form_elicitation(ctx):
         schema = build_elicitation_schema(missing)
-        result = await ctx.elicit(
-            message=f"Missing {len(missing)} required field(s) for shipment creation.",
-            schema=schema,
-        )
+        try:
+            result = await ctx.elicit(
+                message=f"Missing {len(missing)} required field(s) for shipment creation.",
+                schema=schema,
+            )
+        except ToolError:
+            raise  # re-raise ToolErrors as-is
+        except Exception as exc:
+            raise ToolError(json.dumps({
+                "code": "ELICITATION_FAILED",
+                "message": f"Elicitation request failed: {exc}",
+                "reason": "transport_error",
+                "missing": _missing_payload(missing),
+            }))
 
         if result.action == "accept":
             normalized = normalize_elicited_values(result.data.model_dump())
+            validation_errors = validate_elicited_values(normalized, missing)
+            if validation_errors:
+                raise ToolError(json.dumps({
+                    "code": "ELICITATION_INVALID_RESPONSE",
+                    "message": "; ".join(validation_errors),
+                    "reason": "validation_errors",
+                    "missing": _missing_payload(missing),
+                }))
             try:
                 merged_body = rehydrate(merged_body, normalized, missing)
             except RehydrationError as exc:

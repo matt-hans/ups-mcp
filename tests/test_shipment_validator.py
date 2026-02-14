@@ -559,14 +559,10 @@ class BuildElicitationSchemaTests(unittest.TestCase):
         field_names = set(schema.model_fields.keys())
         self.assertEqual(field_names, {"shipper_name", "service_code"})
 
-    def test_all_fields_are_str_type(self) -> None:
-        missing = [
-            MissingField("a.b", "shipper_name", "Shipper name"),
-            MissingField("c.d", "package_1_weight", "Package weight"),
-        ]
+    def test_plain_field_is_str_type(self) -> None:
+        missing = [MissingField("a.b", "shipper_name", "Shipper name")]
         schema = build_elicitation_schema(missing)
-        for field_info in schema.model_fields.values():
-            self.assertEqual(field_info.annotation, str)
+        self.assertEqual(schema.model_fields["shipper_name"].annotation, str)
 
     def test_field_descriptions_match_prompts(self) -> None:
         missing = [
@@ -582,6 +578,175 @@ class BuildElicitationSchemaTests(unittest.TestCase):
         schema = build_elicitation_schema([])
         self.assertTrue(issubclass(schema, BaseModel))
         self.assertEqual(len(schema.model_fields), 0)
+
+    def test_float_type_produces_number_schema(self) -> None:
+        missing = [
+            MissingField("a.b", "weight", "Package weight", type_hint=float),
+        ]
+        schema = build_elicitation_schema(missing)
+        self.assertEqual(schema.model_fields["weight"].annotation, float)
+        js = schema.model_json_schema()
+        self.assertEqual(js["properties"]["weight"]["type"], "number")
+
+    def test_enum_values_produce_literal_type(self) -> None:
+        missing = [
+            MissingField(
+                "a.b", "unit", "Weight unit",
+                enum_values=("LBS", "KGS"),
+            ),
+        ]
+        schema = build_elicitation_schema(missing)
+        js = schema.model_json_schema()
+        self.assertEqual(js["properties"]["unit"]["enum"], ["LBS", "KGS"])
+
+    def test_default_value_in_schema(self) -> None:
+        missing = [
+            MissingField(
+                "a.b", "unit", "Weight unit",
+                enum_values=("LBS", "KGS"), default="LBS",
+            ),
+        ]
+        schema = build_elicitation_schema(missing)
+        js = schema.model_json_schema()
+        self.assertEqual(js["properties"]["unit"]["default"], "LBS")
+        # Field with default should not be in required
+        self.assertNotIn("unit", js.get("required", []))
+
+    def test_constraints_in_schema(self) -> None:
+        missing = [
+            MissingField(
+                "a.b", "weight", "Package weight",
+                type_hint=float, constraints=(("gt", 0),),
+            ),
+        ]
+        schema = build_elicitation_schema(missing)
+        js = schema.model_json_schema()
+        self.assertGreater(
+            js["properties"]["weight"].get("exclusiveMinimum", -1), -1,
+        )
+
+    def test_json_schema_extra_constraints(self) -> None:
+        missing = [
+            MissingField(
+                "a.b", "code", "Country code",
+                constraints=(("maxLength", 2), ("pattern", "^[A-Z]{2}$")),
+            ),
+        ]
+        schema = build_elicitation_schema(missing)
+        js = schema.model_json_schema()
+        self.assertEqual(js["properties"]["code"]["maxLength"], 2)
+        self.assertEqual(js["properties"]["code"]["pattern"], "^[A-Z]{2}$")
+
+    def test_enum_titles_produce_one_of(self) -> None:
+        missing = [
+            MissingField(
+                "a.b", "unit", "Weight unit",
+                enum_values=("LBS", "KGS"),
+                enum_titles=("Pounds", "Kilograms"),
+            ),
+        ]
+        schema = build_elicitation_schema(missing)
+        js = schema.model_json_schema()
+        one_of = js["properties"]["unit"]["oneOf"]
+        self.assertEqual(len(one_of), 2)
+        self.assertEqual(one_of[0], {"const": "LBS", "title": "Pounds"})
+        self.assertEqual(one_of[1], {"const": "KGS", "title": "Kilograms"})
+
+    def test_enum_without_titles_has_no_one_of(self) -> None:
+        missing = [
+            MissingField(
+                "a.b", "unit", "Weight unit",
+                enum_values=("LBS", "KGS"),
+            ),
+        ]
+        schema = build_elicitation_schema(missing)
+        js = schema.model_json_schema()
+        self.assertNotIn("oneOf", js["properties"]["unit"])
+
+    def test_mismatched_titles_length_skips_one_of(self) -> None:
+        missing = [
+            MissingField(
+                "a.b", "unit", "Weight unit",
+                enum_values=("LBS", "KGS"),
+                enum_titles=("Pounds",),  # length mismatch
+            ),
+        ]
+        schema = build_elicitation_schema(missing)
+        js = schema.model_json_schema()
+        self.assertNotIn("oneOf", js["properties"]["unit"])
+
+
+from ups_mcp.shipment_validator import validate_elicited_values
+
+
+class ValidateElicitedValuesTests(unittest.TestCase):
+    def test_valid_weight_passes(self) -> None:
+        missing = [MissingField("a.b", "package_1_weight", "Package weight")]
+        errors = validate_elicited_values({"package_1_weight": "5.0"}, missing)
+        self.assertEqual(errors, [])
+
+    def test_non_numeric_weight_fails(self) -> None:
+        missing = [MissingField("a.b", "package_1_weight", "Package weight")]
+        errors = validate_elicited_values({"package_1_weight": "five"}, missing)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("must be a number", errors[0])
+
+    def test_zero_weight_fails(self) -> None:
+        missing = [MissingField("a.b", "package_1_weight", "Package weight")]
+        errors = validate_elicited_values({"package_1_weight": "0"}, missing)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("positive", errors[0])
+
+    def test_negative_weight_fails(self) -> None:
+        missing = [MissingField("a.b", "package_1_weight", "Package weight")]
+        errors = validate_elicited_values({"package_1_weight": "-1"}, missing)
+        self.assertIn("positive", errors[0])
+
+    def test_valid_country_code_passes(self) -> None:
+        missing = [MissingField("a.b", "shipper_country_code", "Country")]
+        errors = validate_elicited_values({"shipper_country_code": "US"}, missing)
+        self.assertEqual(errors, [])
+
+    def test_invalid_country_code_fails(self) -> None:
+        missing = [MissingField("a.b", "shipper_country_code", "Country")]
+        errors = validate_elicited_values({"shipper_country_code": "USA"}, missing)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("2-letter", errors[0])
+
+    def test_numeric_country_code_fails(self) -> None:
+        missing = [MissingField("a.b", "shipper_country_code", "Country")]
+        errors = validate_elicited_values({"shipper_country_code": "12"}, missing)
+        self.assertIn("2-letter", errors[0])
+
+    def test_valid_state_code_passes(self) -> None:
+        missing = [MissingField("a.b", "shipper_state", "State")]
+        errors = validate_elicited_values({"shipper_state": "NY"}, missing)
+        self.assertEqual(errors, [])
+
+    def test_invalid_state_code_fails(self) -> None:
+        missing = [MissingField("a.b", "shipper_state", "State")]
+        errors = validate_elicited_values({"shipper_state": "New York"}, missing)
+        self.assertIn("2-letter", errors[0])
+
+    def test_multiple_errors_accumulated(self) -> None:
+        missing = [
+            MissingField("a", "package_1_weight", "Weight"),
+            MissingField("b", "shipper_country_code", "Country"),
+        ]
+        errors = validate_elicited_values(
+            {"package_1_weight": "bad", "shipper_country_code": "XYZ"},
+            missing,
+        )
+        self.assertEqual(len(errors), 2)
+
+    def test_unknown_keys_ignored(self) -> None:
+        errors = validate_elicited_values({"shipper_name": "Acme"}, [])
+        self.assertEqual(errors, [])
+
+    def test_uses_prompt_as_label(self) -> None:
+        missing = [MissingField("a.b", "package_1_weight", "Custom Label")]
+        errors = validate_elicited_values({"package_1_weight": "bad"}, missing)
+        self.assertIn("Custom Label", errors[0])
 
 
 from ups_mcp.shipment_validator import (
@@ -772,6 +937,38 @@ class RehydrateTests(unittest.TestCase):
         self.assertEqual(
             result["ShipmentRequest"]["Shipment"]["Package"][1]["PackageWeight"]["Weight"],
             "10",
+        )
+
+    def test_zero_value_is_set(self) -> None:
+        """Falsy but meaningful values like 0 must not be dropped."""
+        body: dict = {"ShipmentRequest": {"Shipment": {"Shipper": {}}}}
+        missing = [
+            MissingField(
+                "ShipmentRequest.Shipment.Shipper.Name",
+                "shipper_name",
+                "Shipper name",
+            ),
+        ]
+        result = rehydrate(body, {"shipper_name": 0}, missing)
+        self.assertEqual(
+            result["ShipmentRequest"]["Shipment"]["Shipper"]["Name"],
+            0,
+        )
+
+    def test_false_value_is_set(self) -> None:
+        """Boolean False must not be dropped by the falsy guard."""
+        body: dict = {"ShipmentRequest": {"Shipment": {"Shipper": {}}}}
+        missing = [
+            MissingField(
+                "ShipmentRequest.Shipment.Shipper.Name",
+                "shipper_name",
+                "Shipper name",
+            ),
+        ]
+        result = rehydrate(body, {"shipper_name": False}, missing)
+        self.assertIs(
+            result["ShipmentRequest"]["Shipment"]["Shipper"]["Name"],
+            False,
         )
 
     def test_does_not_overwrite_existing(self) -> None:
