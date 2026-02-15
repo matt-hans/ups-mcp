@@ -18,6 +18,12 @@ TIME_IN_TRANSIT_OPERATION_ID = "TimeInTransit"
 
 LANDED_COST_OPERATION_ID = "LandedCost"
 LOCATOR_OPERATION_ID = "Locator"
+PICKUP_RATE_OPERATION_ID = "Pickup Rate"
+PICKUP_PENDING_STATUS_OPERATION_ID = "Pickup Pending Status"
+PICKUP_CANCEL_OPERATION_ID = "Pickup Cancel"
+PICKUP_CREATION_OPERATION_ID = "Pickup Creation"
+PICKUP_POLITICAL_DIVISIONS_OPERATION_ID = "Pickup Get Political Division1 List"
+PICKUP_SERVICE_CENTER_OPERATION_ID = "Pickup Get Service Center Facilities"
 PAPERLESS_UPLOAD_OPERATION_ID = "Upload"
 PAPERLESS_PUSH_OPERATION_ID = "PushToImageRepository"
 PAPERLESS_DELETE_OPERATION_ID = "Delete"
@@ -463,6 +469,237 @@ class ToolManager:
             operation_id=LOCATOR_OPERATION_ID,
             operation_name="find_locations",
             path_params={"version": "v3", "reqOption": req_option},
+            query_params=None, request_body=request_body,
+            trans_id=trans_id, transaction_src=transaction_src,
+        )
+
+    def rate_pickup(
+        self,
+        pickup_type: str,
+        address_line: str,
+        city: str,
+        state: str,
+        postal_code: str,
+        country_code: str,
+        pickup_date: str,
+        ready_time: str,
+        close_time: str,
+        service_date_option: str = "02",
+        residential_indicator: str = "Y",
+        service_code: str = "001",
+        container_code: str = "01",
+        quantity: int = 1,
+        destination_country_code: str = "US",
+        trans_id: str | None = None,
+        transaction_src: str = "ups-mcp",
+    ) -> dict[str, Any]:
+        request_body = {
+            "PickupRateRequest": {
+                "Request": self._build_transaction_ref(transaction_src),
+                "ServiceDateOption": service_date_option,
+                "AlternateAddressIndicator": "N",
+                "PickupAddress": {
+                    "AddressLine": address_line,
+                    "City": city,
+                    "StateProvince": state,
+                    "PostalCode": postal_code,
+                    "CountryCode": country_code,
+                    "ResidentialIndicator": residential_indicator,
+                },
+                "PickupDateInfo": {
+                    "PickupDate": pickup_date,
+                    "ReadyTime": ready_time,
+                    "CloseTime": close_time,
+                },
+                "PickupPiece": [{
+                    "ServiceCode": service_code,
+                    "Quantity": str(quantity),
+                    "DestinationCountryCode": destination_country_code,
+                    "ContainerCode": container_code,
+                }],
+            }
+        }
+        return self._execute_operation(
+            operation_id=PICKUP_RATE_OPERATION_ID,
+            operation_name="rate_pickup",
+            path_params={"version": "v2409", "pickuptype": pickup_type},
+            query_params=None, request_body=request_body,
+            trans_id=trans_id, transaction_src=transaction_src,
+        )
+
+    def schedule_pickup(
+        self,
+        pickup_date: str,
+        ready_time: str,
+        close_time: str,
+        address_line: str,
+        city: str,
+        state: str,
+        postal_code: str,
+        country_code: str,
+        contact_name: str,
+        phone_number: str,
+        residential_indicator: str = "N",
+        service_code: str = "001",
+        container_code: str = "01",
+        quantity: int = 1,
+        weight: float = 5.0,
+        weight_unit: str = "LBS",
+        payment_method: str = "01",
+        rate_pickup_indicator: str = "N",
+        account_number: str | None = None,
+        trans_id: str | None = None,
+        transaction_src: str = "ups-mcp",
+    ) -> dict[str, Any]:
+        if ready_time >= close_time:
+            raise ToolError(f"ready_time ({ready_time}) must be before close_time ({close_time})")
+
+        effective_account = self._resolve_account(account_number)
+
+        # Spec: payment_method '01' (pay by shipper account) requires account number
+        if payment_method == "01" and not effective_account:
+            raise ToolError(
+                "Account number is required when payment_method='01' (pay by shipper account). "
+                "Provide account_number argument or set UPS_ACCOUNT_NUMBER env var."
+            )
+
+        request_body = {
+            "PickupCreationRequest": {
+                "Request": self._build_transaction_ref(transaction_src),
+                "RatePickupIndicator": rate_pickup_indicator,
+                "AlternateAddressIndicator": "N",
+                "PaymentMethod": payment_method,
+                "Shipper": {
+                    "Account": {
+                        "AccountNumber": effective_account or "",
+                        "AccountCountryCode": country_code,
+                    },
+                },
+                "PickupDateInfo": {
+                    "CloseTime": close_time,
+                    "ReadyTime": ready_time,
+                    "PickupDate": pickup_date,
+                },
+                "PickupAddress": {
+                    "CompanyName": contact_name,
+                    "ContactName": contact_name,
+                    "AddressLine": address_line,
+                    "City": city,
+                    "StateProvince": state,
+                    "PostalCode": postal_code,
+                    "CountryCode": country_code,
+                    "ResidentialIndicator": residential_indicator,
+                    "Phone": {"Number": phone_number},
+                },
+                "PickupPiece": [{
+                    "ServiceCode": service_code,
+                    "Quantity": str(quantity),
+                    "DestinationCountryCode": country_code,
+                    "ContainerCode": container_code,
+                }],
+                "TotalWeight": {
+                    "Weight": str(weight),
+                    "UnitOfMeasurement": weight_unit,
+                },
+            }
+        }
+        return self._execute_operation(
+            operation_id=PICKUP_CREATION_OPERATION_ID,
+            operation_name="schedule_pickup",
+            path_params={"version": "v2409"},
+            query_params=None, request_body=request_body,
+            trans_id=trans_id, transaction_src=transaction_src,
+        )
+
+    def cancel_pickup(
+        self,
+        cancel_by: str,
+        prn: str | None = None,
+        trans_id: str | None = None,
+        transaction_src: str = "ups-mcp",
+    ) -> dict[str, Any]:
+        cancel_code = constants.PICKUP_CANCEL_OPTIONS.get(cancel_by)
+        if not cancel_code:
+            allowed = ", ".join(sorted(constants.PICKUP_CANCEL_OPTIONS.keys()))
+            raise ToolError(f"Invalid cancel_by '{cancel_by}'. Must be one of: {allowed}")
+
+        additional_headers: dict[str, str] | None = None
+        if cancel_by == "prn":
+            if not prn:
+                raise ToolError("prn is required when cancel_by='prn'")
+            additional_headers = {"Prn": prn}
+
+        return self._execute_operation(
+            operation_id=PICKUP_CANCEL_OPERATION_ID,
+            operation_name="cancel_pickup",
+            path_params={"version": "v2409", "CancelBy": cancel_code},
+            query_params=None, request_body=None,
+            trans_id=trans_id, transaction_src=transaction_src,
+            additional_headers=additional_headers,
+        )
+
+    def get_pickup_status(
+        self,
+        pickup_type: str,
+        account_number: str | None = None,
+        trans_id: str | None = None,
+        transaction_src: str = "ups-mcp",
+    ) -> dict[str, Any]:
+        effective_account = self._require_account(account_number, "AccountNumber")
+        return self._execute_operation(
+            operation_id=PICKUP_PENDING_STATUS_OPERATION_ID,
+            operation_name="get_pickup_status",
+            path_params={"version": "v2409", "pickuptype": pickup_type},
+            query_params=None, request_body=None,
+            trans_id=trans_id, transaction_src=transaction_src,
+            additional_headers={"AccountNumber": effective_account},
+        )
+
+    def get_political_divisions(
+        self,
+        country_code: str,
+        trans_id: str | None = None,
+        transaction_src: str = "ups-mcp",
+    ) -> dict[str, Any]:
+        return self._execute_operation(
+            operation_id=PICKUP_POLITICAL_DIVISIONS_OPERATION_ID,
+            operation_name="get_political_divisions",
+            path_params={"version": "v2409", "countrycode": country_code},
+            query_params=None, request_body=None,
+            trans_id=trans_id, transaction_src=transaction_src,
+        )
+
+    def get_service_center_facilities(
+        self,
+        city: str,
+        state: str,
+        postal_code: str,
+        country_code: str,
+        pickup_pieces: int = 1,
+        container_code: str = "01",
+        trans_id: str | None = None,
+        transaction_src: str = "ups-mcp",
+    ) -> dict[str, Any]:
+        request_body = {
+            "PickupGetServiceCenterFacilitiesRequest": {
+                "Request": self._build_transaction_ref(transaction_src),
+                "PickupPiece": {
+                    "ServiceCode": "001",
+                    "Quantity": str(pickup_pieces),
+                    "ContainerCode": container_code,
+                },
+                "DestinationAddress": {
+                    "City": city,
+                    "StateProvince": state,
+                    "PostalCode": postal_code,
+                    "CountryCode": country_code,
+                },
+            }
+        }
+        return self._execute_operation(
+            operation_id=PICKUP_SERVICE_CENTER_OPERATION_ID,
+            operation_name="get_service_center_facilities",
+            path_params={"version": "v2409"},
             query_params=None, request_body=request_body,
             trans_id=trans_id, transaction_src=transaction_src,
         )
