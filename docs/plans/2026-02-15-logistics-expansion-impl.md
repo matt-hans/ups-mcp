@@ -4,9 +4,9 @@
 
 **Goal:** Add 11 new MCP tools (Landed Cost, Paperless Documents, Locator, Pickup) to the UPS MCP server, expanding it from 7 to 18 tools.
 
-**Architecture:** New tools are organized in per-suite modules under `ups_mcp/tools/`. Shared builders eliminate repeated address/transaction scaffolding. `server.py` exposes `Literal`-typed parameters. `http_client.py` supports `additional_headers` with reserved-header protection. Contract tests validate payloads against OpenAPI-required fields.
+**Architecture:** All new tools are added to `tools.py` ToolManager with shared DRY builders (`_resolve_account`, `_require_account`, `_build_transaction_ref`). `server.py` exposes `Literal`-typed parameters. `http_client.py` supports `additional_headers` with case-insensitive reserved-header protection. Contract tests validate payloads against OpenAPI-required fields. Module split to `tools/` package is deferred to a follow-up milestone.
 
-**Tech Stack:** Python 3.11+, FastMCP, requests, PyYAML, unittest
+**Tech Stack:** Python 3.12+, FastMCP, requests, PyYAML, unittest
 
 **Design doc:** `docs/plans/2026-02-15-logistics-expansion-design.md`
 
@@ -75,6 +75,28 @@ def test_additional_headers_cannot_overwrite_reserved_headers(self, mock_request
     self.assertEqual(called_kwargs["headers"]["ShipperNumber"], "OK")
 
 @patch("ups_mcp.http_client.requests.request")
+def test_additional_headers_case_insensitive_reserved_protection(self, mock_request: Mock) -> None:
+    """Lowercase variants of reserved headers must also be blocked."""
+    mock_request.return_value = make_response(200, {"ok": True})
+
+    self.client.call_operation(
+        self.operation,
+        operation_name="create_shipment",
+        path_params={"version": "v2409"},
+        json_body={"ShipmentRequest": {}},
+        additional_headers={"authorization": "EVIL", "transid": "EVIL", "transactionsrc": "EVIL"},
+    )
+
+    called_kwargs = mock_request.call_args.kwargs
+    self.assertTrue(called_kwargs["headers"]["Authorization"].startswith("Bearer "))
+    self.assertNotEqual(called_kwargs["headers"]["transId"], "EVIL")
+    self.assertNotEqual(called_kwargs["headers"]["transactionSrc"], "EVIL")
+    # Verify the lowercase variants were NOT added as separate keys
+    self.assertNotIn("authorization", called_kwargs["headers"])
+    self.assertNotIn("transid", called_kwargs["headers"])
+    self.assertNotIn("transactionsrc", called_kwargs["headers"])
+
+@patch("ups_mcp.http_client.requests.request")
 def test_no_additional_headers_leaves_default_headers_unchanged(self, mock_request: Mock) -> None:
     mock_request.return_value = make_response(200, {"ok": True})
 
@@ -92,7 +114,7 @@ def test_no_additional_headers_leaves_default_headers_unchanged(self, mock_reque
 **Step 2: Run tests to verify they fail**
 
 Run: `python3 -m pytest tests/test_http_client.py -v`
-Expected: 4 new tests FAIL — `call_operation()` does not accept `additional_headers`
+Expected: 5 new tests FAIL — `call_operation()` does not accept `additional_headers`
 
 **Step 3: Implement additional_headers in http_client.py**
 
@@ -103,23 +125,24 @@ In `ups_mcp/http_client.py`, modify `call_operation`:
 
 ```python
 if additional_headers:
+    reserved = {k.lower() for k in headers}
     for k, v in additional_headers.items():
-        if v is not None and k not in headers:
+        if v is not None and k.lower() not in reserved:
             headers[k] = v
 ```
 
-The `k not in headers` check prevents overwriting `Authorization`, `transId`, and `transactionSrc`.
+The `k.lower() not in reserved` check prevents overwriting `Authorization`, `transId`, and `transactionSrc` even when case variants (e.g., `authorization`, `transid`) are passed.
 
 **Step 4: Run tests to verify they pass**
 
 Run: `python3 -m pytest tests/test_http_client.py -v`
-Expected: All tests PASS (existing + 4 new)
+Expected: All tests PASS (existing + 5 new)
 
 **Step 5: Commit**
 
 ```bash
 git add ups_mcp/http_client.py tests/test_http_client.py
-git commit -m "feat: add additional_headers support to UPSHTTPClient with reserved-header protection"
+git commit -m "feat: add additional_headers support to UPSHTTPClient with case-insensitive reserved-header protection"
 ```
 
 ---
@@ -415,6 +438,26 @@ class LandedCostToolTests(unittest.TestCase):
         body2 = self.fake.calls[1]["kwargs"]["json_body"]
         self.assertEqual(body2["LandedCostRequest"]["shipment"]["shipmentType"], "Gift")
 
+    def test_trans_id_is_auto_generated_in_payload(self) -> None:
+        """transID is required by spec and auto-generated as a UUID."""
+        self.manager.get_landed_cost_quote(
+            currency_code="USD", export_country_code="US", import_country_code="GB",
+            commodities=[{"price": 10, "quantity": 1}],
+        )
+        req = self.fake.calls[0]["kwargs"]["json_body"]["LandedCostRequest"]
+        self.assertIn("transID", req)
+        self.assertTrue(len(req["transID"]) > 0)
+
+    def test_shipment_id_is_auto_generated(self) -> None:
+        """shipment.id is required by spec and auto-generated."""
+        self.manager.get_landed_cost_quote(
+            currency_code="USD", export_country_code="US", import_country_code="GB",
+            commodities=[{"price": 10, "quantity": 1}],
+        )
+        shipment = self.fake.calls[0]["kwargs"]["json_body"]["LandedCostRequest"]["shipment"]
+        self.assertIn("id", shipment)
+        self.assertTrue(len(shipment["id"]) > 0)
+
     # --- Contract test: validates payload satisfies OpenAPI required fields ---
 
     def test_contract_payload_has_all_required_fields(self) -> None:
@@ -431,12 +474,15 @@ class LandedCostToolTests(unittest.TestCase):
         self.assertIn("LandedCostRequest", body)
         req = body["LandedCostRequest"]
 
-        # Required top-level fields
+        # Required top-level fields (spec: currencyCode, transID, alversion, shipment)
         self.assertIn("currencyCode", req)
+        self.assertIn("transID", req)
+        self.assertIn("alversion", req)
         self.assertIn("shipment", req)
 
-        # Required shipment fields
+        # Required shipment fields (spec: id, importCountryCode, exportCountryCode, shipmentItems)
         shipment = req["shipment"]
+        self.assertIn("id", shipment)
         self.assertIn("importCountryCode", shipment)
         self.assertIn("exportCountryCode", shipment)
         self.assertIn("shipmentItems", shipment)
@@ -460,9 +506,11 @@ Expected: FAIL — `ToolManager` has no attribute `get_landed_cost_quote`
 
 **Step 3: Implement get_landed_cost_quote in tools.py**
 
-Add constant after existing operation IDs:
+Add constants after existing operation IDs:
 
 ```python
+import uuid  # add to existing imports at top of file if not present
+
 LANDED_COST_OPERATION_ID = "LandedCost"
 ```
 
@@ -480,6 +528,8 @@ def get_landed_cost_quote(
     trans_id: str | None = None,
     transaction_src: str = "ups-mcp",
 ) -> dict[str, Any]:
+    import uuid as _uuid  # local to avoid top-level import churn
+
     effective_account = self._resolve_account(account_number)
 
     shipment_items = []
@@ -507,9 +557,11 @@ def get_landed_cost_quote(
     request_body = {
         "LandedCostRequest": {
             "currencyCode": currency_code,
+            "transID": str(_uuid.uuid4()),
             "allowPartialLandedCostResult": True,
             "alversion": 1,
             "shipment": {
+                "id": str(_uuid.uuid4()),
                 "importCountryCode": import_country_code,
                 "exportCountryCode": export_country_code,
                 "shipmentItems": shipment_items,
@@ -1152,6 +1204,20 @@ class SchedulePickupTests(unittest.TestCase):
         acct = body["PickupCreationRequest"]["Shipper"]["Account"]["AccountNumber"]
         self.assertEqual(acct, "ACCT123")
 
+    def test_payment_method_01_without_account_raises(self) -> None:
+        """Spec: if payment_method=01, ShipperAccountNumber must be provided."""
+        self.manager.account_number = None
+        with self.assertRaises(ToolError) as ctx:
+            self._call_default(payment_method="01")
+        self.assertIn("account", str(ctx.exception).lower())
+
+    def test_payment_method_00_without_account_succeeds(self) -> None:
+        """payment_method=00 (no payment needed) does not require account."""
+        self.manager.account_number = None
+        self._call_default(payment_method="00")
+        body = self.fake.calls[0]["kwargs"]["json_body"]
+        self.assertEqual(body["PickupCreationRequest"]["PaymentMethod"], "00")
+
 
 class CancelPickupTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1340,7 +1406,14 @@ def schedule_pickup(
     if ready_time >= close_time:
         raise ToolError(f"ready_time ({ready_time}) must be before close_time ({close_time})")
 
-    effective_account = self._resolve_account(account_number) or ""
+    effective_account = self._resolve_account(account_number)
+
+    # Spec: payment_method '01' (pay by shipper account) requires account number
+    if payment_method == "01" and not effective_account:
+        raise ToolError(
+            "Account number is required when payment_method='01' (pay by shipper account). "
+            "Provide account_number argument or set UPS_ACCOUNT_NUMBER env var."
+        )
 
     request_body = {
         "PickupCreationRequest": {
@@ -1350,7 +1423,7 @@ def schedule_pickup(
             "PaymentMethod": payment_method,
             "Shipper": {
                 "Account": {
-                    "AccountNumber": effective_account,
+                    "AccountNumber": effective_account or "",
                     "AccountCountryCode": country_code,
                 },
             },
@@ -1594,7 +1667,17 @@ git status
 
 ---
 
-## Changes Summary (vs v1 plan)
+## Changes Summary (v2 → v3)
+
+| Finding | Severity | Fix Applied |
+|---------|----------|-------------|
+| Landed Cost missing `transID` | P0 | Added `transID: str(uuid4())` to `LandedCostRequest` body; added `shipment.id` (also required); contract test now checks `transID`, `alversion`, and `shipment.id` |
+| `schedule_pickup` allows empty account with `payment_method='01'` | P0 | Added pre-flight validation: `ToolError` raised when `payment_method='01'` and no account resolved; tests for both failing and succeeding cases |
+| Header guard case-sensitive | Non-blocking | Changed to case-insensitive: `reserved = {k.lower() for k in headers}`; added test for lowercase variants (`authorization`, `transid`, `transactionsrc`) |
+| Module split inconsistency | Non-blocking | Architecture description now says "All new tools are added to `tools.py`... Module split deferred"; removed claim of per-suite modules |
+| Python version 3.11+ vs 3.12 | Non-blocking | Changed Tech Stack to Python 3.12+ matching `pyproject.toml` |
+
+### Previous Changes (v1 → v2)
 
 | Finding | Severity | Fix Applied |
 |---------|----------|-------------|
@@ -1603,10 +1686,10 @@ git status
 | #3 schedule_pickup wrong account nesting, missing RatePickupIndicator | P0 | Account now at `Shipper.Account.AccountNumber`; added `RatePickupIndicator`, `ResidentialIndicator`, `CompanyName`, `Phone.Number` |
 | #4 Locator version v2 vs v3 | P1 | Changed to `v3` per spec default |
 | #5 Tests only check call shape, not payload contract | P1 | Added contract tests per suite validating OpenAPI-required fields |
-| #6 Reserved headers can be overwritten | P1 | `k not in headers` guard in merge; test for reserved-header protection |
+| #6 Reserved headers can be overwritten | P1 | `k.lower() not in reserved` guard in merge; test for reserved-header protection |
 | #7 SRP: monolithic tools.py/server.py | P2 | Added shared builders (`_resolve_account`, `_require_account`, `_build_transaction_ref`) to ToolManager; full module split deferred to post-MVP |
 | #8 DRY: repeated scaffolding | P2 | Shared builders eliminate `TransactionReference` and account-resolution duplication |
 | #9 Literal typing inconsistency | P2 | All enum-like server.py params use `Literal` types |
 | #10 README not updated | P2 | Task 8 covers README (env vars, spec files, 18-tool inventory, stale envelope docs) |
 
-**Note on P2 #7 (module split):** The full `tools.py → tools/` package split was considered but deferred. The shared builders address the immediate DRY concern. A module split can happen in a follow-up milestone after the 11 tools are working and tested, avoiding unnecessary churn during initial implementation. The ToolManager stays in one file for now but uses shared helpers to keep method bodies concise.
+**Note on module split:** The full `tools.py → tools/` package split was considered but deferred. The shared builders address the immediate DRY concern. A module split can happen in a follow-up milestone after the 11 tools are working and tested, avoiding unnecessary churn during initial implementation. The ToolManager stays in one file for now but uses shared helpers to keep method bodies concise.

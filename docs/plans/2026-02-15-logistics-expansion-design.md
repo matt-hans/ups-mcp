@@ -35,7 +35,7 @@ DEFAULT_SPEC_FILES = (
 
 **2. `http_client.py` — Add `additional_headers` parameter**
 
-Add `additional_headers: dict[str, str] | None = None` to `call_operation()`. Merge into request headers after standard Auth/transId/transactionSrc headers. Filter out `None` values. **Reserved headers (`Authorization`, `transId`, `transactionSrc`) are protected and cannot be overwritten** — merge skips any key already present in the base headers.
+Add `additional_headers: dict[str, str] | None = None` to `call_operation()`. Merge into request headers after standard Auth/transId/transactionSrc headers. Filter out `None` values. **Reserved headers (`Authorization`, `transId`, `transactionSrc`) are protected and cannot be overwritten** — merge uses case-insensitive comparison to skip any key matching a reserved header.
 
 ```python
 def call_operation(
@@ -57,8 +57,9 @@ def call_operation(
         "transactionSrc": request_transaction_src,
     }
     if additional_headers:
+        reserved = {k.lower() for k in headers}
         for k, v in additional_headers.items():
-            if v is not None and k not in headers:
+            if v is not None and k.lower() not in reserved:
                 headers[k] = v
 ```
 
@@ -118,6 +119,7 @@ PICKUP_CANCEL_OPTIONS = {
 - **Headers:** `AccountNumber` (optional, from env fallback)
 - **Parameters:** `currency_code`, `export_country_code`, `import_country_code`, `commodities: list[dict]`, `shipment_type`
 - **Payload construction:** ToolManager iterates commodity list, distributes top-level currency/country into each item, builds `LandedCostRequest` structure
+- **Required by spec:** `transID` (auto-generated UUID), `alversion` (integer, default 1), `shipment.id` (auto-generated UUID). Both `transID` and `shipment.id` are generated internally — the caller does not need to provide them.
 - **Commodity dict keys:** `hs_code`, `price` (required), `quantity` (required), `description`, `weight`, `weight_unit`, `uom`
 
 ### Paperless Document Suite (3 tools)
@@ -162,7 +164,9 @@ PICKUP_CANCEL_OPTIONS = {
 - **Operation ID:** `Pickup Creation` (POST `/pickupcreation/{version}/pickup`)
 - **Parameters:** `pickup_date`, `ready_time`, `close_time`, address fields, `contact_name`, `phone_number`, `residential_indicator`, service/container/quantity/weight fields, `payment_method`, `rate_pickup_indicator`, `account_number`
 - **Required by spec:** `RatePickupIndicator` ('Y'/'N'), `Shipper.Account.AccountNumber` (nested, not top-level), `PickupAddress.ResidentialIndicator`, `PickupAddress.CompanyName`, `PickupAddress.Phone.Number`
-- **Pre-flight validation:** Validate `ready_time < close_time` before sending to UPS
+- **Pre-flight validation:**
+  - Validate `ready_time < close_time` before sending to UPS
+  - When `payment_method='01'` (pay by shipper account), account number must be available (via explicit arg or `UPS_ACCOUNT_NUMBER` env var). Raises `ToolError` if missing — prevents sending invalid requests to UPS.
 
 #### `cancel_pickup`
 - **Operation ID:** `Pickup Cancel` (DELETE `/shipments/{version}/pickup/{CancelBy}`)
@@ -237,26 +241,22 @@ PICKUP_CANCEL_OPTIONS = {
 
 ## Module Organization
 
-To maintain SRP as the server grows from 7 to 18 tools:
-- **`ups_mcp/tools/`** — Split ToolManager into per-suite modules with a shared base
-  - `_base.py`: `_execute_operation`, `_resolve_account`, `_build_address`, `_build_transaction_ref` helpers
-  - `core.py`: Existing 7 tools (track, validate, rate, ship, void, label, transit)
-  - `landed_cost.py`: `get_landed_cost_quote`
-  - `paperless.py`: `upload_paperless_document`, `push_document_to_shipment`, `delete_paperless_document`
-  - `locator.py`: `find_locations`
-  - `pickup.py`: 6 pickup methods
-  - `__init__.py`: Re-exports `ToolManager` composed from all suites
-- **`ups_mcp/server.py`** — Stays as single file but uses tool suite modules (methods live in ToolManager, server only wires `@mcp.tool` to ToolManager calls)
+All 11 new tools are added to `ups_mcp/tools.py` within the existing `ToolManager` class. Shared DRY builders (`_resolve_account`, `_require_account`, `_build_transaction_ref`) keep method bodies concise.
+
+**Future consideration:** If the file exceeds ~600 lines after all tools are added, a follow-up milestone can split into `ups_mcp/tools/` package:
+- `_base.py`: shared helpers + `_execute_operation`
+- `core.py`, `landed_cost.py`, `paperless.py`, `locator.py`, `pickup.py`: per-suite methods
+- `__init__.py`: re-exports composed `ToolManager`
+
+This split is deferred to avoid unnecessary churn during initial implementation.
 
 ## Implementation Order
 
-1. **Infrastructure** (registry, http_client, tools init, server init, constants, shared builders)
-2. **Module split** (tools.py → tools/ package with _base.py + core.py)
-3. **Landed Cost** (1 tool + unit tests + contract tests)
-4. **Paperless Documents** (3 tools + unit tests + contract tests)
-5. **Locator** (1 tool + unit tests + contract tests)
-6. **Pickup** (6 tools + unit tests + contract tests)
-7. **Server endpoints** (all 11 @mcp.tool definitions with Literal types)
-8. **Existing test updates** (registry, package data, http_client)
-9. **README + docs** (env vars, spec files, tool inventory)
-10. **Full regression**
+1. **Infrastructure** (registry, http_client with case-insensitive header guard, tools init, server init, constants, shared builders)
+2. **Landed Cost** (1 tool + unit tests + contract tests — including `transID` and `shipment.id`)
+3. **Paperless Documents** (3 tools + unit tests + contract tests)
+4. **Locator** (1 tool + unit tests + contract tests — version v3)
+5. **Pickup** (6 tools + unit tests + contract tests — including `payment_method='01'` account validation)
+6. **Server endpoints** (all 11 @mcp.tool definitions with Literal types)
+7. **README + docs** (env vars, spec files, tool inventory)
+8. **Full regression**
