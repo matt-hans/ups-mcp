@@ -29,6 +29,7 @@ class UPSHTTPClient:
         json_body: dict[str, Any] | None = None,
         trans_id: str | None = None,
         transaction_src: str | None = None,
+        additional_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         request_trans_id = trans_id or str(uuid.uuid4())
         request_transaction_src = transaction_src or "ups-mcp"
@@ -52,6 +53,11 @@ class UPSHTTPClient:
                 "transId": request_trans_id,
                 "transactionSrc": request_transaction_src,
             }
+            if additional_headers:
+                reserved = {k.lower() for k in headers}
+                for k, v in additional_headers.items():
+                    if v is not None and k.lower() not in reserved:
+                        headers[k] = v
             response = requests.request(
                 method=operation.method,
                 url=url,
