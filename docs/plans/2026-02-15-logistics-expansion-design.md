@@ -28,14 +28,14 @@ DEFAULT_SPEC_FILES = (
     "TimeInTransit.yaml",
     "LandedCost.yaml",
     "Paperless.yaml",
-    "Locater.yaml",
+    "Locator.yaml",
     "Pickup.yaml",
 )
 ```
 
 **2. `http_client.py` — Add `additional_headers` parameter**
 
-Add `additional_headers: dict[str, str] | None = None` to `call_operation()`. Merge into request headers after standard Auth/transId/transactionSrc headers. Filter out `None` values.
+Add `additional_headers: dict[str, str] | None = None` to `call_operation()`. Merge into request headers after standard Auth/transId/transactionSrc headers. Filter out `None` values. **Reserved headers (`Authorization`, `transId`, `transactionSrc`) are protected and cannot be overwritten** — merge skips any key already present in the base headers.
 
 ```python
 def call_operation(
@@ -57,7 +57,9 @@ def call_operation(
         "transactionSrc": request_transaction_src,
     }
     if additional_headers:
-        headers.update({k: v for k, v in additional_headers.items() if v is not None})
+        for k, v in additional_headers.items():
+            if v is not None and k not in headers:
+                headers[k] = v
 ```
 
 **3. `tools.py` — Add `account_number` to ToolManager**
@@ -153,11 +155,13 @@ PICKUP_CANCEL_OPTIONS = {
 
 #### `rate_pickup`
 - **Operation ID:** `Pickup Rate` (POST `/shipments/{version}/pickup/{pickuptype}`)
-- **Parameters:** `pickup_type: Literal["oncall","smart","both"]`, address fields, `pickup_date`, `service_code`, `container_code`, `quantity`, `destination_country_code`
+- **Parameters:** `pickup_type: Literal["oncall","smart","both"]`, address fields, `pickup_date`, `ready_time`, `close_time`, `service_date_option`, `residential_indicator`, `service_code`, `container_code`, `quantity`, `destination_country_code`
+- **Required by spec:** `ServiceDateOption` ('01'=Same-Day, '02'=Future-Day, '03'=Specific-Day), `PickupAddress.ResidentialIndicator` ('Y'/'N'), `PickupDateInfo` with `ReadyTime`/`CloseTime`/`PickupDate` (required when `ServiceDateOption='03'`, always included for safety)
 
 #### `schedule_pickup`
 - **Operation ID:** `Pickup Creation` (POST `/pickupcreation/{version}/pickup`)
-- **Parameters:** `pickup_date`, `ready_time`, `close_time`, address fields, `contact_name`, `phone_number`, service/container/quantity/weight fields, `payment_method`, `account_number`
+- **Parameters:** `pickup_date`, `ready_time`, `close_time`, address fields, `contact_name`, `phone_number`, `residential_indicator`, service/container/quantity/weight fields, `payment_method`, `rate_pickup_indicator`, `account_number`
+- **Required by spec:** `RatePickupIndicator` ('Y'/'N'), `Shipper.Account.AccountNumber` (nested, not top-level), `PickupAddress.ResidentialIndicator`, `PickupAddress.CompanyName`, `PickupAddress.Phone.Number`
 - **Pre-flight validation:** Validate `ready_time < close_time` before sending to UPS
 
 #### `cancel_pickup`
@@ -204,26 +208,55 @@ PICKUP_CANCEL_OPTIONS = {
 | `test_server_new_tools.py` | FakeToolManager for all 11 new server endpoints |
 
 ### Test Patterns
-- FakeHTTPClient capturing pattern (same as test_legacy_tools.py)
+- FakeHTTPClient capturing pattern (same as test_legacy_tools.py) for unit tests
+- **Contract tests**: Validate generated payloads contain all OpenAPI-required fields per spec
 - Verify correct operation_id, path_params, additional_headers
 - Validate ToolError for invalid inputs
-- No live API calls
+- No live API calls in unit/contract tests
+
+### New Test Files
+
+| File | Coverage |
+|------|----------|
+| `test_landed_cost_tools.py` | Payload construction, commodity validation, header injection, contract |
+| `test_paperless_tools.py` | Upload/push/delete payloads, ShipperNumber header, format validation, contract |
+| `test_locator_tools.py` | reqOption mapping, body construction, invalid location_type, contract |
+| `test_pickup_tools.py` | All 6 pickup ops: payloads, time validation, cancel_by mapping, contract |
+| `test_server_new_tools.py` | FakeToolManager for all 11 new server endpoints |
 
 ### Existing Test Updates
 - `test_openapi_registry.py`: Expect 7 spec files (currently 3)
 - `test_package_data.py`: Verify new specs accessible as package resources
-- `test_http_client.py`: Test additional_headers merge behavior
+- `test_http_client.py`: Test additional_headers merge behavior + reserved header protection
 
 ### E2E Updates
 - `superpowers_debug.py`: Add sections for each new tool against CIE
 
+### Documentation Updates
+- `README.md`: Update env var docs (add `UPS_ACCOUNT_NUMBER`), spec file list, tool inventory (all 18 tools)
+
+## Module Organization
+
+To maintain SRP as the server grows from 7 to 18 tools:
+- **`ups_mcp/tools/`** — Split ToolManager into per-suite modules with a shared base
+  - `_base.py`: `_execute_operation`, `_resolve_account`, `_build_address`, `_build_transaction_ref` helpers
+  - `core.py`: Existing 7 tools (track, validate, rate, ship, void, label, transit)
+  - `landed_cost.py`: `get_landed_cost_quote`
+  - `paperless.py`: `upload_paperless_document`, `push_document_to_shipment`, `delete_paperless_document`
+  - `locator.py`: `find_locations`
+  - `pickup.py`: 6 pickup methods
+  - `__init__.py`: Re-exports `ToolManager` composed from all suites
+- **`ups_mcp/server.py`** — Stays as single file but uses tool suite modules (methods live in ToolManager, server only wires `@mcp.tool` to ToolManager calls)
+
 ## Implementation Order
 
-1. **Infrastructure** (registry, http_client, tools init, server init, constants)
-2. **Landed Cost** (1 tool + tests)
-3. **Paperless Documents** (3 tools + tests)
-4. **Locator** (1 tool + tests)
-5. **Pickup** (6 tools + tests)
-6. **Server endpoints** (all 11 @mcp.tool definitions)
-7. **Existing test updates** (registry, package data, http_client)
-8. **E2E diagnostic** (superpowers_debug.py)
+1. **Infrastructure** (registry, http_client, tools init, server init, constants, shared builders)
+2. **Module split** (tools.py → tools/ package with _base.py + core.py)
+3. **Landed Cost** (1 tool + unit tests + contract tests)
+4. **Paperless Documents** (3 tools + unit tests + contract tests)
+5. **Locator** (1 tool + unit tests + contract tests)
+6. **Pickup** (6 tools + unit tests + contract tests)
+7. **Server endpoints** (all 11 @mcp.tool definitions with Literal types)
+8. **Existing test updates** (registry, package data, http_client)
+9. **README + docs** (env vars, spec files, tool inventory)
+10. **Full regression**
