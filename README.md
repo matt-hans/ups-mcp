@@ -14,7 +14,7 @@ Users can integrate with the MCP server to allow AI agents to facilitate trackin
 - ```CLIENT_SECRET``` - UPS Client Secret
 - ```ENVIRONMENT``` - Whether to point to Test (CIE) or Production (Accepted values: test, production)
 - ```UPS_ACCOUNT_NUMBER``` - UPS Account/Shipper Number (used for Paperless, Landed Cost, and Pickup tools). Optional — can also be provided per-call.
-- ```UPS_MCP_SPECS_DIR``` - Optional absolute path to a directory containing OpenAPI spec overrides. Required files: `Rating.yaml`, `Shipping.yaml`, `TimeInTransit.yaml`. Optional files (bundled defaults used if absent): `LandedCost.yaml`, `Paperless.yaml`, `Locator.yaml`, `Pickup.yaml`. If set, this override is used before bundled package specs.
+- ```UPS_MCP_SPECS_DIR``` - Optional absolute path to a directory containing OpenAPI spec overrides. Required files: `Rating.yaml`, `Shipping.yaml`, `TimeInTransit.yaml`. Optional files: `LandedCost.yaml`, `Paperless.yaml`, `Locator.yaml`, `Pickup.yaml` — if absent, the corresponding tools are unavailable. If set, this override is used instead of bundled package specs.
 
 **Note**: Your API credentials are sensitive. Do not commit them to version control. We recommend managing secrets securely using GitHub Secrets, a vault, or a password manager.
 
