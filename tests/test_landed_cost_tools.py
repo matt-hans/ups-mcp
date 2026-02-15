@@ -78,7 +78,7 @@ class LandedCostToolTests(unittest.TestCase):
                 {"hs_code": "6205.30", "price": 50, "quantity": 5, "weight": 2.5, "weight_unit": "KGS"},
             ],
         )
-        items = self.fake.calls[0]["kwargs"]["json_body"]["LandedCostRequest"]["shipment"]["shipmentItems"]
+        items = self.fake.calls[0]["kwargs"]["json_body"]["shipment"]["shipmentItems"]
         self.assertEqual(len(items), 2)
         self.assertEqual(items[0]["commodityId"], "1")
         self.assertEqual(items[1]["commodityId"], "2")
@@ -108,14 +108,14 @@ class LandedCostToolTests(unittest.TestCase):
             commodities=[{"price": 10, "quantity": 1}],
         )
         body1 = self.fake.calls[0]["kwargs"]["json_body"]
-        self.assertEqual(body1["LandedCostRequest"]["shipment"]["shipmentType"], "Sale")
+        self.assertEqual(body1["shipment"]["shipmentType"], "Sale")
 
         self.manager.get_landed_cost_quote(
             currency_code="USD", export_country_code="US", import_country_code="GB",
             commodities=[{"price": 10, "quantity": 1}], shipment_type="Gift",
         )
         body2 = self.fake.calls[1]["kwargs"]["json_body"]
-        self.assertEqual(body2["LandedCostRequest"]["shipment"]["shipmentType"], "Gift")
+        self.assertEqual(body2["shipment"]["shipmentType"], "Gift")
 
     def test_trans_id_is_auto_generated_in_payload(self) -> None:
         """transID is required by spec and auto-generated as a UUID."""
@@ -123,7 +123,7 @@ class LandedCostToolTests(unittest.TestCase):
             currency_code="USD", export_country_code="US", import_country_code="GB",
             commodities=[{"price": 10, "quantity": 1}],
         )
-        req = self.fake.calls[0]["kwargs"]["json_body"]["LandedCostRequest"]
+        req = self.fake.calls[0]["kwargs"]["json_body"]
         self.assertIn("transID", req)
         self.assertTrue(len(req["transID"]) > 0)
 
@@ -133,7 +133,7 @@ class LandedCostToolTests(unittest.TestCase):
             currency_code="USD", export_country_code="US", import_country_code="GB",
             commodities=[{"price": 10, "quantity": 1}],
         )
-        shipment = self.fake.calls[0]["kwargs"]["json_body"]["LandedCostRequest"]["shipment"]
+        shipment = self.fake.calls[0]["kwargs"]["json_body"]["shipment"]
         self.assertIn("id", shipment)
         self.assertTrue(len(shipment["id"]) > 0)
 
@@ -149,10 +149,7 @@ class LandedCostToolTests(unittest.TestCase):
         )
         body = self.fake.calls[0]["kwargs"]["json_body"]
 
-        # Top-level wrapper
-        self.assertIn("LandedCostRequest", body)
-        req = body["LandedCostRequest"]
-
+        req = body
         # Required top-level fields (spec: currencyCode, transID, alversion, shipment)
         self.assertIn("currencyCode", req)
         self.assertIn("transID", req)

@@ -315,19 +315,17 @@ class ToolManager:
             shipment_items.append(ups_item)
 
         request_body = {
-            "LandedCostRequest": {
-                "currencyCode": currency_code,
-                "transID": str(uuid.uuid4()),
-                "allowPartialLandedCostResult": True,
-                "alversion": 1,
-                "shipment": {
-                    "id": str(uuid.uuid4()),
-                    "importCountryCode": import_country_code,
-                    "exportCountryCode": export_country_code,
-                    "shipmentItems": shipment_items,
-                    "shipmentType": shipment_type,
-                },
-            }
+            "currencyCode": currency_code,
+            "transID": str(uuid.uuid4()),
+            "allowPartialLandedCostResult": True,
+            "alversion": 1,
+            "shipment": {
+                "id": str(uuid.uuid4()),
+                "importCountryCode": import_country_code,
+                "exportCountryCode": export_country_code,
+                "shipmentItems": shipment_items,
+                "shipmentType": shipment_type,
+            },
         }
 
         return self._execute_operation(
@@ -626,7 +624,10 @@ class ToolManager:
             raise ToolError(f"Invalid cancel_by '{cancel_by}'. Must be one of: {allowed}")
 
         additional_headers: dict[str, str] | None = None
-        if cancel_by == "prn":
+        if cancel_by == "account":
+            effective_account = self._require_account(header_name="AccountNumber")
+            additional_headers = {"AccountNumber": effective_account}
+        elif cancel_by == "prn":
             if not prn:
                 raise ToolError("prn is required when cancel_by='prn'")
             additional_headers = {"Prn": prn}
@@ -678,7 +679,7 @@ class ToolManager:
         postal_code: str,
         country_code: str,
         pickup_pieces: int = 1,
-        container_code: str = "01",
+        container_code: str = "03",
         trans_id: str | None = None,
         transaction_src: str = "ups-mcp",
     ) -> dict[str, Any]:
@@ -686,7 +687,7 @@ class ToolManager:
             "PickupGetServiceCenterFacilitiesRequest": {
                 "Request": self._build_transaction_ref(transaction_src),
                 "PickupPiece": {
-                    "ServiceCode": "001",
+                    "ServiceCode": "096",
                     "Quantity": str(pickup_pieces),
                     "ContainerCode": container_code,
                 },

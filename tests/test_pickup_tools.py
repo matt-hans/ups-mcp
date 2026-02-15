@@ -166,7 +166,14 @@ class CancelPickupTests(unittest.TestCase):
 
     def test_cancel_by_account_maps_to_01(self) -> None:
         self.manager.cancel_pickup(cancel_by="account")
-        self.assertEqual(self.fake.calls[0]["kwargs"]["path_params"]["CancelBy"], "01")
+        call = self.fake.calls[0]
+        self.assertEqual(call["kwargs"]["path_params"]["CancelBy"], "01")
+        self.assertEqual(call["kwargs"]["additional_headers"]["AccountNumber"], "ACCT123")
+
+    def test_cancel_by_account_without_account_raises(self) -> None:
+        self.manager.account_number = None
+        with self.assertRaises(ToolError):
+            self.manager.cancel_pickup(cancel_by="account")
 
     def test_cancel_by_prn_maps_to_02_and_injects_header(self) -> None:
         self.manager.cancel_pickup(cancel_by="prn", prn="PRN123456789")

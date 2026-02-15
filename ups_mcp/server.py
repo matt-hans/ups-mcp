@@ -856,7 +856,7 @@ async def get_service_center_facilities(
     postal_code: str,
     country_code: str,
     pickup_pieces: int = 1,
-    container_code: str = "01",
+    container_code: str = "03",
     trans_id: str = "",
     transaction_src: str = "ups-mcp",
 ) -> dict[str, Any]:
@@ -869,7 +869,7 @@ async def get_service_center_facilities(
         postal_code (str): Postal/ZIP code. Required.
         country_code (str): ISO country code. Required.
         pickup_pieces (int): Number of pieces. Default 1.
-        container_code (str): Container type. Default 01.
+        container_code (str): Container type. Default 03.
         trans_id (str): Optional request id.
         transaction_src (str): Optional caller source name. Default 'ups-mcp'.
 

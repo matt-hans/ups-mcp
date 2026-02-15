@@ -206,7 +206,7 @@ Here are sample config files for popular integrations. Different MCP Clients may
   - Args:
     - `city`, `state`, `postal_code`, `country_code` (str, required)
     - `pickup_pieces` (int, optional, default `1`)
-    - `container_code` (str, optional, default `01`)
+    - `container_code` (str, optional, default `03`)
 
 ### Response Format
 
