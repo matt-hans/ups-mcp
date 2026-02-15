@@ -10,6 +10,11 @@ from ups_mcp.shipment_validator import (
     COUNTRY_CONDITIONAL_RULES,
     BUILT_IN_DEFAULTS,
     ENV_DEFAULTS,
+    INTERNATIONAL_DESCRIPTION_RULE,
+    INTERNATIONAL_SHIPPER_CONTACT_RULES,
+    SHIP_TO_CONTACT_RULES,
+    INVOICE_LINE_TOTAL_RULES,
+    EU_COUNTRIES,
 )
 
 
@@ -79,6 +84,19 @@ class DataStructureTests(unittest.TestCase):
             "ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[0].BillShipper.AccountNumber",
             ENV_DEFAULTS,
         )
+
+    def test_service_code_enum_includes_international(self) -> None:
+        service_rule = [r for r in UNCONDITIONAL_RULES if r.flat_key == "service_code"][0]
+        for code in ("07", "08", "11", "17", "54", "72", "74"):
+            self.assertIn(code, service_rule.enum_values)
+
+    def test_service_code_enum_titles_paired(self) -> None:
+        service_rule = [r for r in UNCONDITIONAL_RULES if r.flat_key == "service_code"][0]
+        self.assertEqual(len(service_rule.enum_values), len(service_rule.enum_titles))
+
+    def test_service_code_no_default(self) -> None:
+        service_rule = [r for r in UNCONDITIONAL_RULES if r.flat_key == "service_code"][0]
+        self.assertIsNone(service_rule.default)
 
 
 from ups_mcp.shipment_validator import _field_exists, _set_field
@@ -544,6 +562,224 @@ class FindMissingFieldsCountryTests(unittest.TestCase):
         self.assertNotIn("shipper_postal_code", flat_keys)
 
 
+class FindMissingFieldsInternationalTests(unittest.TestCase):
+    """International baseline validation: contacts, description, InvoiceLineTotal."""
+
+    # --- Effective origin ---
+
+    def test_ship_from_precedence(self) -> None:
+        """ShipFrom=CA, Shipper=US, ShipTo=CA → domestic (CA→CA), no intl fields."""
+        body = make_complete_body(shipper_country="US", ship_to_country="CA")
+        body["ShipmentRequest"]["Shipment"]["ShipFrom"] = {
+            "Address": {"CountryCode": "CA"},
+        }
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("shipper_attention_name", flat_keys)
+        self.assertNotIn("shipment_description", flat_keys)
+
+    def test_shipper_fallback(self) -> None:
+        """No ShipFrom, Shipper=US, ShipTo=GB → international fields flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("shipper_attention_name", flat_keys)
+
+    def test_missing_country_skips_intl(self) -> None:
+        """No ShipTo country → ship_to_country_code flagged, no intl rules."""
+        body = make_complete_body(shipper_country="US")
+        del body["ShipmentRequest"]["Shipment"]["ShipTo"]["Address"]["CountryCode"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("ship_to_country_code", flat_keys)
+        self.assertNotIn("shipper_attention_name", flat_keys)
+
+    # --- Shipper contact rules ---
+
+    def test_intl_flags_shipper_contacts(self) -> None:
+        body = make_complete_body(shipper_country="US", ship_to_country="GB")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("shipper_attention_name", flat_keys)
+        self.assertIn("shipper_phone", flat_keys)
+
+    def test_domestic_skips_shipper_contacts(self) -> None:
+        body = make_complete_body(shipper_country="US", ship_to_country="US")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("shipper_attention_name", flat_keys)
+        self.assertNotIn("shipper_phone", flat_keys)
+
+    # --- ShipTo contact rules ---
+
+    def test_intl_flags_ship_to_contacts(self) -> None:
+        body = make_complete_body(shipper_country="US", ship_to_country="GB")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("ship_to_attention_name", flat_keys)
+        self.assertIn("ship_to_phone", flat_keys)
+
+    def test_domestic_service_14_flags_ship_to_contacts(self) -> None:
+        body = make_complete_body(shipper_country="US", ship_to_country="US")
+        body["ShipmentRequest"]["Shipment"]["Service"]["Code"] = "14"
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("ship_to_attention_name", flat_keys)
+        self.assertIn("ship_to_phone", flat_keys)
+
+    def test_domestic_non_14_skips_ship_to_contacts(self) -> None:
+        body = make_complete_body(shipper_country="US", ship_to_country="US")
+        body["ShipmentRequest"]["Shipment"]["Service"]["Code"] = "03"
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("ship_to_attention_name", flat_keys)
+        self.assertNotIn("ship_to_phone", flat_keys)
+
+    def test_contacts_present_not_flagged(self) -> None:
+        body = make_complete_body(shipper_country="US", ship_to_country="GB")
+        body["ShipmentRequest"]["Shipment"]["Shipper"]["AttentionName"] = "John"
+        body["ShipmentRequest"]["Shipment"]["Shipper"]["Phone"] = {"Number": "5551234567"}
+        body["ShipmentRequest"]["Shipment"]["ShipTo"]["AttentionName"] = "Jane"
+        body["ShipmentRequest"]["Shipment"]["ShipTo"]["Phone"] = {"Number": "4401234567"}
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("shipper_attention_name", flat_keys)
+        self.assertNotIn("shipper_phone", flat_keys)
+        self.assertNotIn("ship_to_attention_name", flat_keys)
+        self.assertNotIn("ship_to_phone", flat_keys)
+
+    # --- Description ---
+
+    def test_intl_missing_description(self) -> None:
+        body = make_complete_body(shipper_country="US", ship_to_country="GB")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("shipment_description", flat_keys)
+
+    def test_intl_with_description_passes(self) -> None:
+        body = make_complete_body(shipper_country="US", ship_to_country="GB")
+        body["ShipmentRequest"]["Shipment"]["Description"] = "Electronics"
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("shipment_description", flat_keys)
+
+    def test_domestic_no_description(self) -> None:
+        body = make_complete_body(shipper_country="US", ship_to_country="US")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("shipment_description", flat_keys)
+
+    def test_ups_letter_all_packages_exempts(self) -> None:
+        body = make_complete_body(shipper_country="US", ship_to_country="GB")
+        body["ShipmentRequest"]["Shipment"]["Package"] = [
+            {"Packaging": {"Code": "01"}, "PackageWeight": {"UnitOfMeasurement": {"Code": "LBS"}, "Weight": "1"}},
+        ]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("shipment_description", flat_keys)
+
+    def test_mixed_packages_requires_description(self) -> None:
+        body = make_complete_body(shipper_country="US", ship_to_country="GB")
+        body["ShipmentRequest"]["Shipment"]["Package"] = [
+            {"Packaging": {"Code": "01"}, "PackageWeight": {"UnitOfMeasurement": {"Code": "LBS"}, "Weight": "1"}},
+            {"Packaging": {"Code": "02"}, "PackageWeight": {"UnitOfMeasurement": {"Code": "LBS"}, "Weight": "5"}},
+        ]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("shipment_description", flat_keys)
+
+    def test_eu_to_eu_standard_exempts(self) -> None:
+        body = make_complete_body(shipper_country="DE", ship_to_country="FR")
+        body["ShipmentRequest"]["Shipment"]["Service"]["Code"] = "11"
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("shipment_description", flat_keys)
+
+    def test_eu_to_eu_non_standard_requires(self) -> None:
+        body = make_complete_body(shipper_country="DE", ship_to_country="FR")
+        body["ShipmentRequest"]["Shipment"]["Service"]["Code"] = "07"
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("shipment_description", flat_keys)
+
+    # --- InvoiceLineTotal ---
+
+    def test_us_to_ca_requires_invoice(self) -> None:
+        body = make_complete_body(shipper_country="US", ship_to_country="CA")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("invoice_currency_code", flat_keys)
+        self.assertIn("invoice_monetary_value", flat_keys)
+
+    def test_us_to_pr_requires_invoice(self) -> None:
+        body = make_complete_body(shipper_country="US", ship_to_country="PR")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("invoice_currency_code", flat_keys)
+        self.assertIn("invoice_monetary_value", flat_keys)
+
+    def test_us_to_gb_no_invoice(self) -> None:
+        body = make_complete_body(shipper_country="US", ship_to_country="GB")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("invoice_currency_code", flat_keys)
+        self.assertNotIn("invoice_monetary_value", flat_keys)
+
+    def test_return_us_to_ca_no_invoice(self) -> None:
+        body = make_complete_body(shipper_country="US", ship_to_country="CA")
+        body["ShipmentRequest"]["Shipment"]["ReturnService"] = {"Code": "8"}
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("invoice_currency_code", flat_keys)
+        self.assertNotIn("invoice_monetary_value", flat_keys)
+
+    def test_malformed_return_service_still_guards(self) -> None:
+        """Key present with malformed value = return intent, no invoice required."""
+        body = make_complete_body(shipper_country="US", ship_to_country="CA")
+        body["ShipmentRequest"]["Shipment"]["ReturnService"] = "malformed"
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("invoice_currency_code", flat_keys)
+        self.assertNotIn("invoice_monetary_value", flat_keys)
+
+    def test_empty_dict_return_service_still_guards(self) -> None:
+        """Key present with empty dict = return intent, no invoice required."""
+        body = make_complete_body(shipper_country="US", ship_to_country="CA")
+        body["ShipmentRequest"]["Shipment"]["ReturnService"] = {}
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("invoice_currency_code", flat_keys)
+        self.assertNotIn("invoice_monetary_value", flat_keys)
+
+    def test_return_service_none_treated_as_forward(self) -> None:
+        """ReturnService: None = forward shipment, invoice required."""
+        body = make_complete_body(shipper_country="US", ship_to_country="CA")
+        body["ShipmentRequest"]["Shipment"]["ReturnService"] = None
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("invoice_currency_code", flat_keys)
+        self.assertIn("invoice_monetary_value", flat_keys)
+
+    # --- Metadata ---
+
+    def test_description_max_length(self) -> None:
+        self.assertIn(("maxLength", 50), INTERNATIONAL_DESCRIPTION_RULE.constraints)
+
+    def test_invoice_currency_pattern(self) -> None:
+        rule = INVOICE_LINE_TOTAL_RULES[0]
+        self.assertIn(("pattern", "^[A-Z]{3}$"), rule.constraints)
+
+    def test_invoice_monetary_value_pattern(self) -> None:
+        rule = INVOICE_LINE_TOTAL_RULES[1]
+        self.assertIn(("pattern", r"^\d+(\.\d{1,2})?$"), rule.constraints)
+        self.assertIn(("maxLength", 11), rule.constraints)
+
+    def test_phone_max_length(self) -> None:
+        for rules in (INTERNATIONAL_SHIPPER_CONTACT_RULES, SHIP_TO_CONTACT_RULES):
+            phone_rule = [r for r in rules if "phone" in r.flat_key][0]
+            self.assertIn(("maxLength", 15), phone_rule.constraints)
+
+
 from ups_mcp.shipment_validator import _missing_from_rule, build_elicitation_schema
 from pydantic import BaseModel
 
@@ -590,7 +826,7 @@ class FindMissingFieldsTypeMetadataTests(unittest.TestCase):
         self.assertIsNotNone(service[0].enum_values)
         self.assertIn("03", service[0].enum_values)
         self.assertIsNotNone(service[0].enum_titles)
-        self.assertEqual(service[0].default, "03")
+        self.assertIsNone(service[0].default)
 
     def test_package_weight_carries_float_type(self) -> None:
         body = make_complete_body()
@@ -854,6 +1090,16 @@ class ValidateElicitedValuesTests(unittest.TestCase):
         """Fields without enum_values in MissingField are not enum-validated."""
         missing = [MissingField("a.b", "shipper_name", "Shipper name")]
         errors = validate_elicited_values({"shipper_name": "anything"}, missing)
+        self.assertEqual(errors, [])
+
+    def test_international_service_code_validates(self) -> None:
+        """International service code '07' passes enum validation."""
+        service_rule = [r for r in UNCONDITIONAL_RULES if r.flat_key == "service_code"][0]
+        missing = [MissingField(
+            service_rule.dot_path, service_rule.flat_key, service_rule.prompt,
+            enum_values=service_rule.enum_values,
+        )]
+        errors = validate_elicited_values({"service_code": "07"}, missing)
         self.assertEqual(errors, [])
 
     def test_valid_us_postal_code(self) -> None:

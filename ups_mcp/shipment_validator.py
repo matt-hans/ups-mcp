@@ -78,13 +78,17 @@ UNCONDITIONAL_RULES: list[FieldRule] = [
     FieldRule(
         "ShipmentRequest.Shipment.Service.Code", "service_code",
         "UPS service type",
-        enum_values=("01", "02", "03", "12", "13", "14", "59", "65"),
-        enum_titles=(
-            "Next Day Air", "2nd Day Air", "Ground", "3 Day Select",
-            "Next Day Air Saver", "Next Day Air Early", "2nd Day Air A.M.",
-            "UPS Saver",
+        enum_values=(
+            "01", "02", "03", "07", "08", "11", "12", "13", "14",
+            "17", "54", "59", "65", "72", "74",
         ),
-        default="03",
+        enum_titles=(
+            "Next Day Air", "2nd Day Air", "Ground",
+            "Express", "Expedited", "UPS Standard",
+            "3 Day Select", "Next Day Air Saver", "Next Day Air Early",
+            "Worldwide Economy DDU", "Express Plus", "2nd Day Air A.M.",
+            "UPS Saver", "Worldwide Economy DDP", "UPS Express 12:00",
+        ),
     ),
 ]
 
@@ -173,6 +177,69 @@ COUNTRY_CONDITIONAL_RULES: dict[tuple[str, ...], list[FieldRule]] = {
         FieldRule("PostalCode", "postal_code", "Postal code"),
     ],
 }
+
+
+# ---------------------------------------------------------------------------
+# International validation constants
+# ---------------------------------------------------------------------------
+
+EU_COUNTRIES: frozenset[str] = frozenset({
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR",
+    "DE", "GR", "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL",
+    "PL", "PT", "RO", "SK", "SI", "ES", "SE",
+})
+
+INTERNATIONAL_DESCRIPTION_RULE: FieldRule = FieldRule(
+    "ShipmentRequest.Shipment.Description",
+    "shipment_description",
+    "Description of goods (required for international)",
+    constraints=(("maxLength", 50),),
+)
+
+INTERNATIONAL_SHIPPER_CONTACT_RULES: list[FieldRule] = [
+    FieldRule(
+        "ShipmentRequest.Shipment.Shipper.AttentionName",
+        "shipper_attention_name",
+        "Shipper attention name",
+        constraints=(("maxLength", 35),),
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.Shipper.Phone.Number",
+        "shipper_phone",
+        "Shipper phone number",
+        constraints=(("maxLength", 15),),
+    ),
+]
+
+SHIP_TO_CONTACT_RULES: list[FieldRule] = [
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipTo.AttentionName",
+        "ship_to_attention_name",
+        "Recipient attention name",
+        constraints=(("maxLength", 35),),
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipTo.Phone.Number",
+        "ship_to_phone",
+        "Recipient phone number",
+        constraints=(("maxLength", 15),),
+    ),
+]
+
+INVOICE_LINE_TOTAL_RULES: list[FieldRule] = [
+    FieldRule(
+        "ShipmentRequest.Shipment.InvoiceLineTotal.CurrencyCode",
+        "invoice_currency_code",
+        "Invoice currency code (e.g. USD)",
+        constraints=(("maxLength", 3), ("pattern", "^[A-Z]{3}$")),
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.InvoiceLineTotal.MonetaryValue",
+        "invoice_monetary_value",
+        "Invoice total monetary value",
+        constraints=(("maxLength", 11), ("pattern", r"^\d+(\.\d{1,2})?$")),
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +620,81 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
                         missing.append(_missing_from_rule(
                             rule, dot_path=full_dot_path, flat_key=flat_key, prompt=prompt,
                         ))
+
+    # ----- International validation -----
+
+    # Determine effective origin: ShipFrom takes precedence over Shipper (spec line 5238)
+    # Guard against non-dict nodes (e.g. Shipper="not_a_dict") to avoid AttributeError.
+    def _safe_country(obj: Any) -> str:
+        if not isinstance(obj, dict):
+            return ""
+        addr = obj.get("Address", {})
+        if not isinstance(addr, dict):
+            return ""
+        return str(addr.get("CountryCode", "")).strip().upper()
+
+    ship_from_country = _safe_country(shipment.get("ShipFrom"))
+    effective_origin = ship_from_country or _safe_country(shipment.get("Shipper"))
+    ship_to_country = _safe_country(shipment.get("ShipTo"))
+    _service = shipment.get("Service", {})
+    service_code = str(
+        (_service.get("Code", "")) if isinstance(_service, dict) else ""
+    ).strip()
+    is_international = (
+        effective_origin and ship_to_country
+        and effective_origin != ship_to_country
+    )
+
+    # Shipper contact rules (international only)
+    if is_international:
+        for rule in INTERNATIONAL_SHIPPER_CONTACT_RULES:
+            if not _field_exists(body, rule.dot_path):
+                missing.append(_missing_from_rule(rule))
+
+    # ShipTo contact rules (international OR service "14")
+    if is_international or service_code == "14":
+        for rule in SHIP_TO_CONTACT_RULES:
+            if not _field_exists(body, rule.dot_path):
+                missing.append(_missing_from_rule(rule))
+
+    # Shipment Description with UPS Letter and EU+Standard exemptions
+    if is_international:
+        packages = _get_packages(body)
+        all_ups_letter = all(
+            str(pkg.get("Packaging", {}).get("Code", "")).strip() == "01"
+            for pkg in packages
+        ) if packages else False
+        eu_to_eu_standard = (
+            effective_origin in EU_COUNTRIES
+            and ship_to_country in EU_COUNTRIES
+            and service_code == "11"
+        )
+        if (
+            not all_ups_letter
+            and not eu_to_eu_standard
+            and not _field_exists(body, INTERNATIONAL_DESCRIPTION_RULE.dot_path)
+        ):
+            missing.append(_missing_from_rule(INTERNATIONAL_DESCRIPTION_RULE))
+
+    # InvoiceLineTotal for forward US→CA/PR (with return-shipment guard)
+    # Key-presence check: if ReturnService key exists with any non-None value,
+    # treat as return intent. Catches {Code:"8"}, {}, "malformed", [etc].
+    # Intentional: non-None malformed values (e.g. "", "x", []) suppress
+    # InvoiceLineTotal prompts to avoid false-positive forward requirements
+    # on attempted returns with bad payloads. UPS API will still reject the
+    # malformed ReturnService itself.
+    # TODO: tighten to isinstance(dict) + Code check once InternationalForms
+    # adds stricter shape validation (PR 2). Current permissive guard is the
+    # safer baseline for forward/return classification.
+    is_return = shipment.get("ReturnService") is not None
+    if (
+        effective_origin == "US"
+        and ship_to_country in ("CA", "PR")
+        and not is_return
+    ):
+        for rule in INVOICE_LINE_TOTAL_RULES:
+            if not _field_exists(body, rule.dot_path):
+                missing.append(_missing_from_rule(rule))
 
     return missing
 
