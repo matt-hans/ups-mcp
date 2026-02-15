@@ -13,7 +13,8 @@ Users can integrate with the MCP server to allow AI agents to facilitate trackin
 - ```CLIENT_ID``` - UPS Client ID
 - ```CLIENT_SECRET``` - UPS Client Secret
 - ```ENVIRONMENT``` - Whether to point to Test (CIE) or Production (Accepted values: test, production)
-- ```UPS_MCP_SPECS_DIR``` - Optional absolute path to a directory containing `Rating.yaml`, `Shipping.yaml`, and `TimeInTransit.yaml`. If set, this override is used before bundled package specs.
+- ```UPS_ACCOUNT_NUMBER``` - UPS Account/Shipper Number (used for Paperless, Landed Cost, and Pickup tools). Optional — can also be provided per-call.
+- ```UPS_MCP_SPECS_DIR``` - Optional absolute path to a directory containing `Rating.yaml`, `Shipping.yaml`, `TimeInTransit.yaml`, `LandedCost.yaml`, `Paperless.yaml`, `Locator.yaml`, and `Pickup.yaml`. If set, this override is used before bundled package specs.
 
 **Note**: Your API credentials are sensitive. Do not commit them to version control. We recommend managing secrets securely using GitHub Secrets, a vault, or a password manager.
 
@@ -78,9 +79,9 @@ Here are sample config files for popular integrations. Different MCP Clients may
     - returnPOD (bool): a boolean to indicate whether a proof of delivery is required, default is false. Not required
 
     Returns:
-    - dict: Structured response envelope with keys `ok`, `status_code`, `data`, `error`, etc.
+    - dict: Raw UPS Track API response.
 - ```validate_address```: Validate an address using the UPS Address Validation API for the U.S. or Puerto Rico
-    
+
     Args:
      - addressLine1 (str): The primary address details including the house or building number and the street name, e.g. 123 Main St. Required.
      - addressLine2 (str): Additional information like apartment or suite numbers, e.g. Apt 4B. Not required.
@@ -92,7 +93,7 @@ Here are sample config files for popular integrations. Different MCP Clients may
     - countryCode (str): The country code, e.g. US. Required.
 
     Returns:
-    - dict: Structured response envelope with keys `ok`, `status_code`, `data`, `error`, etc.
+    - dict: Raw UPS Address Validation response.
 
 - `rate_shipment`: Rate or shop a shipment via `POST /rating/{version}/{requestoption}`
   - Args:
@@ -133,34 +134,85 @@ Here are sample config files for popular integrations. Different MCP Clients may
     - `trans_id` (str, optional)
     - `transaction_src` (str, optional, default `ups-mcp`)
 
-### Structured Response Envelope
+- `get_landed_cost_quote`: Get landed cost quote for international shipments via `POST /landedcost/v1/quotes`
+  - Args:
+    - `currency_code` (str, required): ISO currency code (e.g. USD, EUR)
+    - `export_country_code` (str, required): ISO country code of origin
+    - `import_country_code` (str, required): ISO country code of destination
+    - `commodities` (list[dict], required): List of commodity dicts with `price`, `quantity`, and optional `hs_code`, `description`, `weight`, `weight_unit`
+    - `shipment_type` (str, optional, default `Sale`)
+    - `account_number` (str, optional): Falls back to `UPS_ACCOUNT_NUMBER`
 
-All tools return this shape:
+- `upload_paperless_document`: Upload a paperless document via `POST /paperlessdocuments/v2/upload`
+  - Args:
+    - `file_content_base64` (str, required): Base64-encoded file content
+    - `file_name` (str, required): Original file name
+    - `file_format` (str, required): One of `pdf`, `doc`, `docx`, `xls`, `xlsx`, `txt`, `rtf`, `tif`, `jpg`
+    - `document_type` (str, required): UPS document type code (e.g. `002` for invoice)
+    - `shipper_number` (str, optional): Falls back to `UPS_ACCOUNT_NUMBER`
 
-```json
-{
-  "ok": true,
-  "operation": "create_shipment",
-  "status_code": 200,
-  "trans_id": "f8b2f32d-5cde-4474-bbe3-bec6900f4ab8",
-  "request": {
-    "method": "POST",
-    "path": "/shipments/v2409/ship",
-    "query": {
-      "additionaladdressvalidation": "city"
-    }
-  },
-  "data": {},
-  "error": null
-}
-```
+- `push_document_to_shipment`: Push an uploaded document to a shipment via `POST /paperlessdocuments/v2/image`
+  - Args:
+    - `document_id` (str, required): Document ID from a prior upload
+    - `shipment_identifier` (str, required): UPS tracking number (1Z...)
+    - `shipment_type` (str, optional, default `1`): `1` for forward, `2` for return
+    - `shipper_number` (str, optional): Falls back to `UPS_ACCOUNT_NUMBER`
 
-For failed calls:
-- `ok` is `false`
-- `data` is `null`
-- `error` contains `code`, `message`, and `details`
+- `delete_paperless_document`: Delete a paperless document via `DELETE /paperlessdocuments/v2/delete`
+  - Args:
+    - `document_id` (str, required)
+    - `shipper_number` (str, optional): Falls back to `UPS_ACCOUNT_NUMBER`
+
+- `find_locations`: Find UPS locations near an address via `POST /locations/v3/search/availabilities/{reqOption}`
+  - Args:
+    - `location_type` (str, required): `access_point`, `retail`, `general`, or `services`
+    - `address_line` (str, required), `city` (str, required), `state` (str, required), `postal_code` (str, required), `country_code` (str, required)
+    - `radius` (float, optional, default `15.0`)
+    - `unit_of_measure` (str, optional, default `MI`): `MI` or `KM`
+
+- `rate_pickup`: Get pickup rate estimate via `POST /pickups/v2409/rating/{pickuptype}`
+  - Args:
+    - `pickup_type` (str, required): `oncall`, `smart`, or `both`
+    - `address_line`, `city`, `state`, `postal_code`, `country_code` (str, required)
+    - `pickup_date` (str, required): YYYYMMDD format
+    - `ready_time` (str, required): HHMM 24hr format
+    - `close_time` (str, required): HHMM 24hr format
+    - `service_date_option` (str, optional, default `02`)
+    - `residential_indicator` (str, optional, default `Y`): `Y` or `N`
+
+- `schedule_pickup`: Schedule a pickup via `POST /pickups/v2409/pickup`
+  - Args:
+    - `pickup_date`, `ready_time`, `close_time` (str, required)
+    - `address_line`, `city`, `state`, `postal_code`, `country_code` (str, required)
+    - `contact_name` (str, required), `phone_number` (str, required)
+    - `payment_method` (str, optional, default `01`): `01` = shipper account, `00` = no payment
+    - `account_number` (str, optional): Falls back to `UPS_ACCOUNT_NUMBER`. Required when `payment_method=01`.
+
+- `cancel_pickup`: Cancel a scheduled pickup via `DELETE /pickups/v2409/cancel/{CancelBy}`
+  - Args:
+    - `cancel_by` (str, required): `account` or `prn`
+    - `prn` (str): Required when `cancel_by=prn`
+
+- `get_pickup_status`: Get pending pickup status via `GET /pickups/v2409/pending/{pickuptype}`
+  - Args:
+    - `pickup_type` (str, required): `oncall`, `smart`, or `both`
+    - `account_number` (str, optional): Falls back to `UPS_ACCOUNT_NUMBER`
+
+- `get_political_divisions`: Get states/provinces for a country via `GET /pickups/v2409/politicaldivision/{countrycode}`
+  - Args:
+    - `country_code` (str, required): ISO country code
+
+- `get_service_center_facilities`: Get UPS service center facilities via `POST /pickups/v2409/servicecenter`
+  - Args:
+    - `city`, `state`, `postal_code`, `country_code` (str, required)
+    - `pickup_pieces` (int, optional, default `1`)
+    - `container_code` (str, optional, default `01`)
+
+### Response Format
+
+All tools return raw UPS API response dicts on success. On failure, tools raise `ToolError` with a JSON payload containing `status_code`, `code`, `message`, and `details`.
 
 ### Notes
 
 - Deprecated endpoints defined in the OpenAPI specs are intentionally not exposed as MCP tools.
-- Request bodies for spec-backed tools are validated against OpenAPI schemas before calling UPS.
+- OpenAPI specs are used for operation discovery and path routing only — not for request/response schema validation.
