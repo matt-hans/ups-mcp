@@ -17,6 +17,9 @@ LABEL_RECOVERY_OPERATION_ID = "LabelRecovery"
 TIME_IN_TRANSIT_OPERATION_ID = "TimeInTransit"
 
 LANDED_COST_OPERATION_ID = "LandedCost"
+PAPERLESS_UPLOAD_OPERATION_ID = "Upload"
+PAPERLESS_PUSH_OPERATION_ID = "PushToImageRepository"
+PAPERLESS_DELETE_OPERATION_ID = "Delete"
 
 RATE_REQUEST_OPTIONS = {
     "rate": "Rate",
@@ -329,6 +332,90 @@ class ToolManager:
             trans_id=trans_id,
             transaction_src=transaction_src,
             additional_headers={"AccountNumber": effective_account} if effective_account else None,
+        )
+
+    def upload_paperless_document(
+        self,
+        file_content_base64: str,
+        file_name: str,
+        file_format: str,
+        document_type: str,
+        shipper_number: str | None = None,
+        trans_id: str | None = None,
+        transaction_src: str = "ups-mcp",
+    ) -> dict[str, Any]:
+        effective_shipper = self._require_account(shipper_number, "ShipperNumber")
+        normalized_format = file_format.lower()
+        if normalized_format not in constants.PAPERLESS_VALID_FORMATS:
+            raise ToolError(
+                f"Invalid file_format '{file_format}'. "
+                f"Supported: {', '.join(sorted(constants.PAPERLESS_VALID_FORMATS))}"
+            )
+
+        request_body = {
+            "UploadRequest": {
+                "Request": self._build_transaction_ref(transaction_src),
+                "ShipperNumber": effective_shipper,
+                "UserCreatedForm": [{
+                    "UserCreatedFormFileName": file_name,
+                    "UserCreatedFormFileFormat": normalized_format,
+                    "UserCreatedFormDocumentType": document_type,
+                    "UserCreatedFormFile": file_content_base64,
+                }],
+            }
+        }
+        return self._execute_operation(
+            operation_id=PAPERLESS_UPLOAD_OPERATION_ID,
+            operation_name="upload_paperless_document",
+            path_params={"version": "v2"},
+            query_params=None, request_body=request_body,
+            trans_id=trans_id, transaction_src=transaction_src,
+            additional_headers={"ShipperNumber": effective_shipper},
+        )
+
+    def push_document_to_shipment(
+        self,
+        document_id: str,
+        shipment_identifier: str,
+        shipment_type: str = "1",
+        shipper_number: str | None = None,
+        trans_id: str | None = None,
+        transaction_src: str = "ups-mcp",
+    ) -> dict[str, Any]:
+        effective_shipper = self._require_account(shipper_number, "ShipperNumber")
+        request_body = {
+            "PushToImageRepositoryRequest": {
+                "Request": self._build_transaction_ref(transaction_src),
+                "ShipperNumber": effective_shipper,
+                "FormsHistoryDocumentID": {"DocumentID": [document_id]},
+                "ShipmentIdentifier": shipment_identifier,
+                "ShipmentType": shipment_type,
+            }
+        }
+        return self._execute_operation(
+            operation_id=PAPERLESS_PUSH_OPERATION_ID,
+            operation_name="push_document_to_shipment",
+            path_params={"version": "v2"},
+            query_params=None, request_body=request_body,
+            trans_id=trans_id, transaction_src=transaction_src,
+            additional_headers={"ShipperNumber": effective_shipper},
+        )
+
+    def delete_paperless_document(
+        self,
+        document_id: str,
+        shipper_number: str | None = None,
+        trans_id: str | None = None,
+        transaction_src: str = "ups-mcp",
+    ) -> dict[str, Any]:
+        effective_shipper = self._require_account(shipper_number, "ShipperNumber")
+        return self._execute_operation(
+            operation_id=PAPERLESS_DELETE_OPERATION_ID,
+            operation_name="delete_paperless_document",
+            path_params={"version": "v2"},
+            query_params=None, request_body=None,
+            trans_id=trans_id, transaction_src=transaction_src,
+            additional_headers={"ShipperNumber": effective_shipper, "DocumentId": document_id},
         )
 
     def _execute_operation(
