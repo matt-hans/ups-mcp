@@ -506,11 +506,11 @@ Expected: FAIL — `ToolManager` has no attribute `get_landed_cost_quote`
 
 **Step 3: Implement get_landed_cost_quote in tools.py**
 
-Add constants after existing operation IDs:
+Add `import uuid` to the top-level imports in `tools.py` (stdlib, already used in `http_client.py`).
+
+Add constant after existing operation IDs:
 
 ```python
-import uuid  # add to existing imports at top of file if not present
-
 LANDED_COST_OPERATION_ID = "LandedCost"
 ```
 
@@ -528,8 +528,6 @@ def get_landed_cost_quote(
     trans_id: str | None = None,
     transaction_src: str = "ups-mcp",
 ) -> dict[str, Any]:
-    import uuid as _uuid  # local to avoid top-level import churn
-
     effective_account = self._resolve_account(account_number)
 
     shipment_items = []
@@ -557,11 +555,11 @@ def get_landed_cost_quote(
     request_body = {
         "LandedCostRequest": {
             "currencyCode": currency_code,
-            "transID": str(_uuid.uuid4()),
+            "transID": str(uuid.uuid4()),
             "allowPartialLandedCostResult": True,
             "alversion": 1,
             "shipment": {
-                "id": str(_uuid.uuid4()),
+                "id": str(uuid.uuid4()),
                 "importCountryCode": import_country_code,
                 "exportCountryCode": export_country_code,
                 "shipmentItems": shipment_items,
