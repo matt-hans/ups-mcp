@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from mcp.server.fastmcp.exceptions import ToolError
@@ -14,6 +15,8 @@ SHIPMENT_OPERATION_ID = "Shipment"
 VOID_SHIPMENT_OPERATION_ID = "VoidShipment"
 LABEL_RECOVERY_OPERATION_ID = "LabelRecovery"
 TIME_IN_TRANSIT_OPERATION_ID = "TimeInTransit"
+
+LANDED_COST_OPERATION_ID = "LandedCost"
 
 RATE_REQUEST_OPTIONS = {
     "rate": "Rate",
@@ -264,6 +267,68 @@ class ToolManager:
             request_body=request_body,
             trans_id=trans_id,
             transaction_src=transaction_src,
+        )
+
+    def get_landed_cost_quote(
+        self,
+        currency_code: str,
+        export_country_code: str,
+        import_country_code: str,
+        commodities: list[dict[str, Any]],
+        shipment_type: str = "Sale",
+        account_number: str | None = None,
+        trans_id: str | None = None,
+        transaction_src: str = "ups-mcp",
+    ) -> dict[str, Any]:
+        effective_account = self._resolve_account(account_number)
+
+        shipment_items = []
+        for idx, item in enumerate(commodities):
+            if "price" not in item:
+                raise ToolError(f"Commodity at index {idx} missing required key 'price'")
+            if "quantity" not in item:
+                raise ToolError(f"Commodity at index {idx} missing required key 'quantity'")
+
+            ups_item: dict[str, Any] = {
+                "commodityId": str(idx + 1),
+                "priceEach": str(item["price"]),
+                "quantity": int(item["quantity"]),
+                "commodityCurrencyCode": currency_code,
+                "originCountryCode": export_country_code,
+                "UOM": item.get("uom", "EA"),
+                "hsCode": item.get("hs_code", ""),
+                "description": item.get("description", ""),
+            }
+            if "weight" in item and "weight_unit" in item:
+                ups_item["grossWeight"] = str(item["weight"])
+                ups_item["grossWeightUnit"] = item["weight_unit"]
+            shipment_items.append(ups_item)
+
+        request_body = {
+            "LandedCostRequest": {
+                "currencyCode": currency_code,
+                "transID": str(uuid.uuid4()),
+                "allowPartialLandedCostResult": True,
+                "alversion": 1,
+                "shipment": {
+                    "id": str(uuid.uuid4()),
+                    "importCountryCode": import_country_code,
+                    "exportCountryCode": export_country_code,
+                    "shipmentItems": shipment_items,
+                    "shipmentType": shipment_type,
+                },
+            }
+        }
+
+        return self._execute_operation(
+            operation_id=LANDED_COST_OPERATION_ID,
+            operation_name="get_landed_cost_quote",
+            path_params={"version": "v1"},
+            query_params=None,
+            request_body=request_body,
+            trans_id=trans_id,
+            transaction_src=transaction_src,
+            additional_headers={"AccountNumber": effective_account} if effective_account else None,
         )
 
     def _execute_operation(
