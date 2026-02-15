@@ -17,6 +17,7 @@ LABEL_RECOVERY_OPERATION_ID = "LabelRecovery"
 TIME_IN_TRANSIT_OPERATION_ID = "TimeInTransit"
 
 LANDED_COST_OPERATION_ID = "LandedCost"
+LOCATOR_OPERATION_ID = "Locator"
 PAPERLESS_UPLOAD_OPERATION_ID = "Upload"
 PAPERLESS_PUSH_OPERATION_ID = "PushToImageRepository"
 PAPERLESS_DELETE_OPERATION_ID = "Delete"
@@ -416,6 +417,54 @@ class ToolManager:
             query_params=None, request_body=None,
             trans_id=trans_id, transaction_src=transaction_src,
             additional_headers={"ShipperNumber": effective_shipper, "DocumentId": document_id},
+        )
+
+    def find_locations(
+        self,
+        location_type: str,
+        address_line: str,
+        city: str,
+        state: str,
+        postal_code: str,
+        country_code: str,
+        radius: float = 15.0,
+        unit_of_measure: str = "MI",
+        trans_id: str | None = None,
+        transaction_src: str = "ups-mcp",
+    ) -> dict[str, Any]:
+        req_option = constants.LOCATOR_OPTIONS.get(location_type)
+        if not req_option:
+            allowed = ", ".join(sorted(constants.LOCATOR_OPTIONS.keys()))
+            raise ToolError(f"Invalid location_type '{location_type}'. Must be one of: {allowed}")
+
+        search_criteria: dict[str, Any] = {"SearchRadius": str(radius)}
+        if req_option == "64":
+            search_criteria["AccessPointSearch"] = {"AccessPointStatus": "01"}
+
+        request_body = {
+            "LocatorRequest": {
+                "Request": {"RequestAction": "Locator"},
+                "OriginAddress": {
+                    "AddressKeyFormat": {
+                        "AddressLine": address_line,
+                        "PoliticalDivision2": city,
+                        "PoliticalDivision1": state,
+                        "PostcodePrimaryLow": postal_code,
+                        "CountryCode": country_code,
+                    }
+                },
+                "Translate": {"Locale": "en_US"},
+                "UnitOfMeasurement": {"Code": unit_of_measure},
+                "LocationSearchCriteria": search_criteria,
+            }
+        }
+
+        return self._execute_operation(
+            operation_id=LOCATOR_OPERATION_ID,
+            operation_name="find_locations",
+            path_params={"version": "v3", "reqOption": req_option},
+            query_params=None, request_body=request_body,
+            trans_id=trans_id, transaction_src=transaction_src,
         )
 
     def _execute_operation(
