@@ -27,9 +27,17 @@ class OpenAPIRegistryTests(unittest.TestCase):
 
         self.assertEqual(
             operation_ids,
-            {"Rate", "Shipment", "VoidShipment", "LabelRecovery", "TimeInTransit"},
+            {
+                "Rate", "Shipment", "VoidShipment", "LabelRecovery", "TimeInTransit",
+                "LandedCost",
+                "Upload", "PushToImageRepository", "Delete",
+                "Locator",
+                "Pickup Rate", "Pickup Pending Status", "Pickup Cancel",
+                "Pickup Creation", "Pickup Get Political Division1 List",
+                "Pickup Get Service Center Facilities",
+            },
         )
-        self.assertEqual(len(operations), 5)
+        self.assertEqual(len(operations), 16)
         self.assertTrue(all(not operation.deprecated for operation in operations))
 
     def test_deprecated_operations_exist_but_are_filtered_in_bundled_specs(self) -> None:
@@ -52,7 +60,15 @@ class OpenAPIRegistryTests(unittest.TestCase):
         self.assertEqual(registry.get_operation("Rate").summary, "Override Rate")
         self.assertEqual(
             {operation.operation_id for operation in registry.list_operations(include_deprecated=False)},
-            {"Rate", "Shipment", "VoidShipment", "LabelRecovery", "TimeInTransit"},
+            {
+                "Rate", "Shipment", "VoidShipment", "LabelRecovery", "TimeInTransit",
+                "LandedCost",
+                "Upload", "PushToImageRepository", "Delete",
+                "Locator",
+                "Pickup Rate", "Pickup Pending Status", "Pickup Cancel",
+                "Pickup Creation", "Pickup Get Political Division1 List",
+                "Pickup Get Service Center Facilities",
+            },
         )
 
     def test_incomplete_override_specs_dir_raises_actionable_error(self) -> None:
@@ -175,6 +191,193 @@ class OpenAPIRegistryTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+        (output_dir / "LandedCost.yaml").write_text(
+            textwrap.dedent(
+                """
+                openapi: 3.0.1
+                info:
+                  title: LandedCost
+                  version: 1.0.0
+                paths:
+                  /landedcost/{version}/quotes:
+                    post:
+                      operationId: LandedCost
+                      summary: Landed cost quote
+                      parameters:
+                        - in: path
+                          name: version
+                          required: true
+                          schema:
+                            type: string
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (output_dir / "Paperless.yaml").write_text(
+            textwrap.dedent(
+                """
+                openapi: 3.0.1
+                info:
+                  title: Paperless
+                  version: 1.0.0
+                paths:
+                  /paperlessdocuments/{version}/upload:
+                    post:
+                      operationId: Upload
+                      summary: Upload document
+                      parameters:
+                        - in: path
+                          name: version
+                          required: true
+                          schema:
+                            type: string
+                  /paperlessdocuments/{version}/image:
+                    post:
+                      operationId: PushToImageRepository
+                      summary: Push to image repository
+                      parameters:
+                        - in: path
+                          name: version
+                          required: true
+                          schema:
+                            type: string
+                  /paperlessdocuments/{version}/delete:
+                    delete:
+                      operationId: Delete
+                      summary: Delete document
+                      parameters:
+                        - in: path
+                          name: version
+                          required: true
+                          schema:
+                            type: string
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (output_dir / "Locator.yaml").write_text(
+            textwrap.dedent(
+                """
+                openapi: 3.0.1
+                info:
+                  title: Locator
+                  version: 1.0.0
+                paths:
+                  /locations/{version}/search/availabilities/{reqOption}:
+                    post:
+                      operationId: Locator
+                      summary: Find locations
+                      parameters:
+                        - in: path
+                          name: version
+                          required: true
+                          schema:
+                            type: string
+                        - in: path
+                          name: reqOption
+                          required: true
+                          schema:
+                            type: string
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (output_dir / "Pickup.yaml").write_text(
+            textwrap.dedent(
+                """
+                openapi: 3.0.1
+                info:
+                  title: Pickup
+                  version: 1.0.0
+                paths:
+                  /pickups/{version}/rating/{pickuptype}:
+                    post:
+                      operationId: Pickup Rate
+                      summary: Rate pickup
+                      parameters:
+                        - in: path
+                          name: version
+                          required: true
+                          schema:
+                            type: string
+                        - in: path
+                          name: pickuptype
+                          required: true
+                          schema:
+                            type: string
+                  /pickups/{version}/pending/{pickuptype}:
+                    get:
+                      operationId: Pickup Pending Status
+                      summary: Pickup pending status
+                      parameters:
+                        - in: path
+                          name: version
+                          required: true
+                          schema:
+                            type: string
+                        - in: path
+                          name: pickuptype
+                          required: true
+                          schema:
+                            type: string
+                  /pickups/{version}/cancel/{CancelBy}:
+                    delete:
+                      operationId: Pickup Cancel
+                      summary: Cancel pickup
+                      parameters:
+                        - in: path
+                          name: version
+                          required: true
+                          schema:
+                            type: string
+                        - in: path
+                          name: CancelBy
+                          required: true
+                          schema:
+                            type: string
+                  /pickups/{version}/pickup:
+                    post:
+                      operationId: Pickup Creation
+                      summary: Create pickup
+                      parameters:
+                        - in: path
+                          name: version
+                          required: true
+                          schema:
+                            type: string
+                  /pickups/{version}/politicaldivision/{countrycode}:
+                    get:
+                      operationId: Pickup Get Political Division1 List
+                      summary: Get political divisions
+                      parameters:
+                        - in: path
+                          name: version
+                          required: true
+                          schema:
+                            type: string
+                        - in: path
+                          name: countrycode
+                          required: true
+                          schema:
+                            type: string
+                  /pickups/{version}/servicecenter:
+                    post:
+                      operationId: Pickup Get Service Center Facilities
+                      summary: Get service center facilities
+                      parameters:
+                        - in: path
+                          name: version
+                          required: true
+                          schema:
+                            type: string
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
 
 
 if __name__ == "__main__":

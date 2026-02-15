@@ -10,7 +10,15 @@ import os
 import yaml
 
 HTTP_METHODS = {"get", "post", "put", "delete", "patch", "head", "options"}
-DEFAULT_SPEC_FILES = ("Rating.yaml", "Shipping.yaml", "TimeInTransit.yaml")
+DEFAULT_SPEC_FILES = (
+    "Rating.yaml",
+    "Shipping.yaml",
+    "TimeInTransit.yaml",
+    "LandedCost.yaml",
+    "Paperless.yaml",
+    "Locator.yaml",
+    "Pickup.yaml",
+)
 
 
 class OpenAPISpecLoadError(RuntimeError):

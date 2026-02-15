@@ -4,6 +4,7 @@ from typing import Any
 
 from mcp.server.fastmcp.exceptions import ToolError
 
+from . import constants
 from .authorization import OAuthManager
 from .http_client import UPSHTTPClient
 from .openapi_registry import OpenAPIRegistry, OperationSpec, load_default_registry
@@ -54,9 +55,11 @@ class ToolManager:
         base_url: str,
         client_id: str | None,
         client_secret: str | None,
+        account_number: str | None = None,
         registry: OpenAPIRegistry | None = None,
     ) -> None:
         self.base_url = base_url
+        self.account_number = account_number
         self.token_manager = OAuthManager(
             token_url=f"{self.base_url}/security/v1/oauth/token",
             client_id=client_id,
@@ -64,6 +67,22 @@ class ToolManager:
         )
         self.registry = registry or load_default_registry()
         self.http_client = UPSHTTPClient(base_url=self.base_url, oauth_manager=self.token_manager)
+
+    def _resolve_account(self, explicit: str | None = None) -> str | None:
+        """Resolve account number: explicit arg > self.account_number > None."""
+        return explicit or self.account_number
+
+    def _require_account(self, explicit: str | None = None, header_name: str = "AccountNumber") -> str:
+        """Resolve account number or raise ToolError if unavailable."""
+        resolved = self._resolve_account(explicit)
+        if not resolved:
+            raise ToolError(f"{header_name} is required via argument or UPS_ACCOUNT_NUMBER env var")
+        return resolved
+
+    @staticmethod
+    def _build_transaction_ref(context: str = "ups-mcp") -> dict[str, Any]:
+        """Build the standard TransactionReference object."""
+        return {"TransactionReference": {"CustomerContext": context}}
 
     def track_package(
         self,
@@ -257,6 +276,7 @@ class ToolManager:
         request_body: dict[str, Any] | None,
         trans_id: str | None,
         transaction_src: str,
+        additional_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         try:
             operation = self.registry.get_operation(operation_id)
@@ -279,4 +299,5 @@ class ToolManager:
             json_body=request_body,
             trans_id=trans_id,
             transaction_src=transaction_src,
+            additional_headers=additional_headers,
         )

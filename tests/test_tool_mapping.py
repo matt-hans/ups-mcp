@@ -56,6 +56,23 @@ class ToolMappingTests(unittest.TestCase):
         self.assertEqual(first_query, "1Z999AA10123456784")
         self.assertEqual(second_query, ["1Z999AA10123456784", "1Z999AA10123456785"])
 
+    def test_tool_manager_stores_account_number(self) -> None:
+        manager = ToolManager(
+            base_url="https://example.test",
+            client_id="cid",
+            client_secret="csec",
+            account_number="ABC999",
+        )
+        self.assertEqual(manager.account_number, "ABC999")
+
+    def test_tool_manager_account_number_defaults_to_none(self) -> None:
+        manager = ToolManager(
+            base_url="https://example.test",
+            client_id="cid",
+            client_secret="csec",
+        )
+        self.assertIsNone(manager.account_number)
+
     def test_invalid_rate_requestoption_raises_tool_error(self) -> None:
         with self.assertRaises(ToolError) as ctx:
             self.manager.rate_shipment(
