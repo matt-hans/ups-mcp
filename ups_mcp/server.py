@@ -570,7 +570,7 @@ async def delete_paperless_document(
     transaction_src: str = "ups-mcp",
 ) -> dict[str, Any]:
     """
-    Delete a previously uploaded paperless document (`DELETE /paperlessdocuments/v2/delete`).
+    Delete a previously uploaded paperless document (`DELETE /paperlessdocuments/{version}/DocumentId/ShipperNumber`).
 
     Args:
         document_id (str): Document ID to delete. Required.
@@ -653,7 +653,7 @@ async def rate_pickup(
     transaction_src: str = "ups-mcp",
 ) -> dict[str, Any]:
     """
-    Get pickup rate estimate (`POST /pickups/v2409/rating/{pickuptype}`).
+    Get pickup rate estimate (`POST /shipments/{version}/pickup/{pickuptype}`).
 
     Args:
         pickup_type (str): oncall, smart, or both. Required.
@@ -722,7 +722,7 @@ async def schedule_pickup(
     transaction_src: str = "ups-mcp",
 ) -> dict[str, Any]:
     """
-    Schedule a pickup (`POST /pickups/v2409/pickup`).
+    Schedule a pickup (`POST /pickupcreation/{version}/pickup`).
 
     Args:
         pickup_date (str): Date in YYYYMMDD format. Required.
@@ -782,7 +782,7 @@ async def cancel_pickup(
     transaction_src: str = "ups-mcp",
 ) -> dict[str, Any]:
     """
-    Cancel a scheduled pickup (`DELETE /pickups/v2409/cancel/{CancelBy}`).
+    Cancel a scheduled pickup (`DELETE /shipments/{version}/pickup/{CancelBy}`).
 
     Args:
         cancel_by (str): Cancel method — 'account' (by account) or 'prn' (by PRN). Required.
@@ -808,7 +808,7 @@ async def get_pickup_status(
     transaction_src: str = "ups-mcp",
 ) -> dict[str, Any]:
     """
-    Get pending pickup status (`GET /pickups/v2409/pending/{pickuptype}`).
+    Get pending pickup status (`GET /shipments/{version}/pickup/{pickuptype}`).
 
     Args:
         pickup_type (str): oncall, smart, or both. Required.
@@ -833,7 +833,7 @@ async def get_political_divisions(
     transaction_src: str = "ups-mcp",
 ) -> dict[str, Any]:
     """
-    Get political divisions (states/provinces) for a country (`GET /pickups/v2409/politicaldivision/{countrycode}`).
+    Get political divisions (states/provinces) for a country (`GET /pickup/{version}/countries/{countrycode}`).
 
     Args:
         country_code (str): ISO country code (e.g. US, CA, GB). Required.
@@ -861,7 +861,7 @@ async def get_service_center_facilities(
     transaction_src: str = "ups-mcp",
 ) -> dict[str, Any]:
     """
-    Get UPS service center facilities (`POST /pickups/v2409/servicecenter`).
+    Get UPS service center facilities (`POST /pickup/{version}/servicecenterlocations`).
 
     Args:
         city (str): City name. Required.

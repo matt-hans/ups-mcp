@@ -10,15 +10,18 @@ import os
 import yaml
 
 HTTP_METHODS = {"get", "post", "put", "delete", "patch", "head", "options"}
-DEFAULT_SPEC_FILES = (
+REQUIRED_SPEC_FILES = (
     "Rating.yaml",
     "Shipping.yaml",
     "TimeInTransit.yaml",
+)
+OPTIONAL_SPEC_FILES = (
     "LandedCost.yaml",
     "Paperless.yaml",
     "Locator.yaml",
     "Pickup.yaml",
 )
+DEFAULT_SPEC_FILES = REQUIRED_SPEC_FILES + OPTIONAL_SPEC_FILES
 
 
 class OpenAPISpecLoadError(RuntimeError):
@@ -26,13 +29,13 @@ class OpenAPISpecLoadError(RuntimeError):
         missing = tuple(sorted(missing_files))
         self.source = source
         self.missing_files = missing
-        required = ", ".join(DEFAULT_SPEC_FILES)
+        required = ", ".join(REQUIRED_SPEC_FILES)
         missing_csv = ", ".join(missing)
         super().__init__(
             "OpenAPI specs are unavailable. "
             f"Missing from {source}: {missing_csv}. "
             "Reinstall ups-mcp with bundled specs or set UPS_MCP_SPECS_DIR "
-            f"to a directory containing: {required}."
+            f"to a directory containing at minimum: {required}."
         )
 
 
@@ -167,38 +170,40 @@ def default_spec_paths(specs_dir: Path | None = None) -> list[Path]:
 
 
 def _load_spec_texts_from_dir(specs_dir: Path) -> list[tuple[str, str]]:
-    missing_files: list[str] = []
+    missing_required: list[str] = []
     loaded_specs: list[tuple[str, str]] = []
     for file_name in DEFAULT_SPEC_FILES:
         spec_path = specs_dir / file_name
         if not spec_path.is_file():
-            missing_files.append(file_name)
+            if file_name in REQUIRED_SPEC_FILES:
+                missing_required.append(file_name)
             continue
         loaded_specs.append((file_name, spec_path.read_text(encoding="utf-8")))
 
-    if missing_files:
+    if missing_required:
         raise OpenAPISpecLoadError(
             source=f"UPS_MCP_SPECS_DIR={specs_dir}",
-            missing_files=missing_files,
+            missing_files=missing_required,
         )
     return loaded_specs
 
 
 def _load_spec_texts_from_package() -> list[tuple[str, str]]:
     specs_dir = resources.files("ups_mcp").joinpath("specs")
-    missing_files: list[str] = []
+    missing_required: list[str] = []
     loaded_specs: list[tuple[str, str]] = []
     for file_name in DEFAULT_SPEC_FILES:
         spec_resource = specs_dir.joinpath(file_name)
         if not spec_resource.is_file():
-            missing_files.append(file_name)
+            if file_name in REQUIRED_SPEC_FILES:
+                missing_required.append(file_name)
             continue
         loaded_specs.append((file_name, spec_resource.read_text(encoding="utf-8")))
 
-    if missing_files:
+    if missing_required:
         raise OpenAPISpecLoadError(
             source="bundled package resources (ups_mcp/specs)",
-            missing_files=missing_files,
+            missing_files=missing_required,
         )
     return loaded_specs
 

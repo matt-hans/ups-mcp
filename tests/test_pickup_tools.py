@@ -152,6 +152,7 @@ class SchedulePickupTests(unittest.TestCase):
         self._call_default(payment_method="00")
         body = self.fake.calls[0]["kwargs"]["json_body"]
         self.assertEqual(body["PickupCreationRequest"]["PaymentMethod"], "00")
+        self.assertNotIn("Shipper", body["PickupCreationRequest"])
 
 
 class CancelPickupTests(unittest.TestCase):

@@ -563,46 +563,48 @@ class ToolManager:
                 "Provide account_number argument or set UPS_ACCOUNT_NUMBER env var."
             )
 
-        request_body = {
-            "PickupCreationRequest": {
-                "Request": self._build_transaction_ref(transaction_src),
-                "RatePickupIndicator": rate_pickup_indicator,
-                "AlternateAddressIndicator": "N",
-                "PaymentMethod": payment_method,
-                "Shipper": {
-                    "Account": {
-                        "AccountNumber": effective_account or "",
-                        "AccountCountryCode": country_code,
-                    },
-                },
-                "PickupDateInfo": {
-                    "CloseTime": close_time,
-                    "ReadyTime": ready_time,
-                    "PickupDate": pickup_date,
-                },
-                "PickupAddress": {
-                    "CompanyName": contact_name,
-                    "ContactName": contact_name,
-                    "AddressLine": address_line,
-                    "City": city,
-                    "StateProvince": state,
-                    "PostalCode": postal_code,
-                    "CountryCode": country_code,
-                    "ResidentialIndicator": residential_indicator,
-                    "Phone": {"Number": phone_number},
-                },
-                "PickupPiece": [{
-                    "ServiceCode": service_code,
-                    "Quantity": str(quantity),
-                    "DestinationCountryCode": country_code,
-                    "ContainerCode": container_code,
-                }],
-                "TotalWeight": {
-                    "Weight": str(weight),
-                    "UnitOfMeasurement": weight_unit,
+        creation_request: dict[str, Any] = {
+            "Request": self._build_transaction_ref(transaction_src),
+            "RatePickupIndicator": rate_pickup_indicator,
+            "AlternateAddressIndicator": "N",
+            "PaymentMethod": payment_method,
+        }
+        if effective_account:
+            creation_request["Shipper"] = {
+                "Account": {
+                    "AccountNumber": effective_account,
+                    "AccountCountryCode": country_code,
                 },
             }
+
+        creation_request["PickupDateInfo"] = {
+            "CloseTime": close_time,
+            "ReadyTime": ready_time,
+            "PickupDate": pickup_date,
         }
+        creation_request["PickupAddress"] = {
+            "CompanyName": contact_name,
+            "ContactName": contact_name,
+            "AddressLine": address_line,
+            "City": city,
+            "StateProvince": state,
+            "PostalCode": postal_code,
+            "CountryCode": country_code,
+            "ResidentialIndicator": residential_indicator,
+            "Phone": {"Number": phone_number},
+        }
+        creation_request["PickupPiece"] = [{
+            "ServiceCode": service_code,
+            "Quantity": str(quantity),
+            "DestinationCountryCode": country_code,
+            "ContainerCode": container_code,
+        }]
+        creation_request["TotalWeight"] = {
+            "Weight": str(weight),
+            "UnitOfMeasurement": weight_unit,
+        }
+
+        request_body = {"PickupCreationRequest": creation_request}
         return self._execute_operation(
             operation_id=PICKUP_CREATION_OPERATION_ID,
             operation_name="schedule_pickup",

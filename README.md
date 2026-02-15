@@ -14,7 +14,7 @@ Users can integrate with the MCP server to allow AI agents to facilitate trackin
 - ```CLIENT_SECRET``` - UPS Client Secret
 - ```ENVIRONMENT``` - Whether to point to Test (CIE) or Production (Accepted values: test, production)
 - ```UPS_ACCOUNT_NUMBER``` - UPS Account/Shipper Number (used for Paperless, Landed Cost, and Pickup tools). Optional — can also be provided per-call.
-- ```UPS_MCP_SPECS_DIR``` - Optional absolute path to a directory containing `Rating.yaml`, `Shipping.yaml`, `TimeInTransit.yaml`, `LandedCost.yaml`, `Paperless.yaml`, `Locator.yaml`, and `Pickup.yaml`. If set, this override is used before bundled package specs.
+- ```UPS_MCP_SPECS_DIR``` - Optional absolute path to a directory containing OpenAPI spec overrides. Required files: `Rating.yaml`, `Shipping.yaml`, `TimeInTransit.yaml`. Optional files (bundled defaults used if absent): `LandedCost.yaml`, `Paperless.yaml`, `Locator.yaml`, `Pickup.yaml`. If set, this override is used before bundled package specs.
 
 **Note**: Your API credentials are sensitive. Do not commit them to version control. We recommend managing secrets securely using GitHub Secrets, a vault, or a password manager.
 
@@ -158,7 +158,7 @@ Here are sample config files for popular integrations. Different MCP Clients may
     - `shipment_type` (str, optional, default `1`): `1` for forward, `2` for return
     - `shipper_number` (str, optional): Falls back to `UPS_ACCOUNT_NUMBER`
 
-- `delete_paperless_document`: Delete a paperless document via `DELETE /paperlessdocuments/v2/delete`
+- `delete_paperless_document`: Delete a paperless document via `DELETE /paperlessdocuments/{version}/DocumentId/ShipperNumber`
   - Args:
     - `document_id` (str, required)
     - `shipper_number` (str, optional): Falls back to `UPS_ACCOUNT_NUMBER`
@@ -170,7 +170,7 @@ Here are sample config files for popular integrations. Different MCP Clients may
     - `radius` (float, optional, default `15.0`)
     - `unit_of_measure` (str, optional, default `MI`): `MI` or `KM`
 
-- `rate_pickup`: Get pickup rate estimate via `POST /pickups/v2409/rating/{pickuptype}`
+- `rate_pickup`: Get pickup rate estimate via `POST /shipments/{version}/pickup/{pickuptype}`
   - Args:
     - `pickup_type` (str, required): `oncall`, `smart`, or `both`
     - `address_line`, `city`, `state`, `postal_code`, `country_code` (str, required)
@@ -180,7 +180,7 @@ Here are sample config files for popular integrations. Different MCP Clients may
     - `service_date_option` (str, optional, default `02`)
     - `residential_indicator` (str, optional, default `Y`): `Y` or `N`
 
-- `schedule_pickup`: Schedule a pickup via `POST /pickups/v2409/pickup`
+- `schedule_pickup`: Schedule a pickup via `POST /pickupcreation/{version}/pickup`
   - Args:
     - `pickup_date`, `ready_time`, `close_time` (str, required)
     - `address_line`, `city`, `state`, `postal_code`, `country_code` (str, required)
@@ -188,21 +188,21 @@ Here are sample config files for popular integrations. Different MCP Clients may
     - `payment_method` (str, optional, default `01`): `01` = shipper account, `00` = no payment
     - `account_number` (str, optional): Falls back to `UPS_ACCOUNT_NUMBER`. Required when `payment_method=01`.
 
-- `cancel_pickup`: Cancel a scheduled pickup via `DELETE /pickups/v2409/cancel/{CancelBy}`
+- `cancel_pickup`: Cancel a scheduled pickup via `DELETE /shipments/{version}/pickup/{CancelBy}`
   - Args:
     - `cancel_by` (str, required): `account` or `prn`
     - `prn` (str): Required when `cancel_by=prn`
 
-- `get_pickup_status`: Get pending pickup status via `GET /pickups/v2409/pending/{pickuptype}`
+- `get_pickup_status`: Get pending pickup status via `GET /shipments/{version}/pickup/{pickuptype}`
   - Args:
     - `pickup_type` (str, required): `oncall`, `smart`, or `both`
     - `account_number` (str, optional): Falls back to `UPS_ACCOUNT_NUMBER`
 
-- `get_political_divisions`: Get states/provinces for a country via `GET /pickups/v2409/politicaldivision/{countrycode}`
+- `get_political_divisions`: Get states/provinces for a country via `GET /pickup/{version}/countries/{countrycode}`
   - Args:
     - `country_code` (str, required): ISO country code
 
-- `get_service_center_facilities`: Get UPS service center facilities via `POST /pickups/v2409/servicecenter`
+- `get_service_center_facilities`: Get UPS service center facilities via `POST /pickup/{version}/servicecenterlocations`
   - Args:
     - `city`, `state`, `postal_code`, `country_code` (str, required)
     - `pickup_pieces` (int, optional, default `1`)
