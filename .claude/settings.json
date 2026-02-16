@@ -18,7 +18,9 @@
   "enabledPlugins": {
     "context7@claude-plugins-official": true,
     "pyright-lsp@claude-plugins-official": true,
-    "superpowers@claude-plugins-official": true
+    "superpowers@claude-plugins-official": true,
+    "pr-review-toolkit@claude-plugins-official": true,
+    "claude-md-management@claude-plugins-official": true
   },
   "includeCoAuthoredBy": false
 }

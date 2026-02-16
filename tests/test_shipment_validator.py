@@ -1,8 +1,7 @@
 import unittest
 
+from ups_mcp.elicitation import MissingField, FieldRule
 from ups_mcp.shipment_validator import (
-    MissingField,
-    FieldRule,
     UNCONDITIONAL_RULES,
     PACKAGE_RULES,
     PAYMENT_CHARGE_TYPE_RULE,
@@ -99,7 +98,7 @@ class DataStructureTests(unittest.TestCase):
         self.assertIsNone(service_rule.default)
 
 
-from ups_mcp.shipment_validator import _field_exists, _set_field
+from ups_mcp.elicitation import _field_exists, _set_field
 
 
 class FieldExistsTests(unittest.TestCase):
@@ -313,7 +312,7 @@ class ApplyDefaultsTests(unittest.TestCase):
         self.assertEqual(body, original)
 
 
-from ups_mcp.shipment_validator import find_missing_fields, MissingField, AmbiguousPayerError
+from ups_mcp.shipment_validator import find_missing_fields, AmbiguousPayerError
 
 
 class FindMissingFieldsUnconditionalTests(unittest.TestCase):
@@ -780,7 +779,7 @@ class FindMissingFieldsInternationalTests(unittest.TestCase):
             self.assertIn(("maxLength", 15), phone_rule.constraints)
 
 
-from ups_mcp.shipment_validator import _missing_from_rule, build_elicitation_schema
+from ups_mcp.elicitation import _missing_from_rule, build_elicitation_schema
 from pydantic import BaseModel
 
 
@@ -996,7 +995,7 @@ class BuildElicitationSchemaTests(unittest.TestCase):
         self.assertNotIn("oneOf", js["properties"]["unit"])
 
 
-from ups_mcp.shipment_validator import validate_elicited_values
+from ups_mcp.elicitation import validate_elicited_values
 
 
 class ValidateElicitedValuesTests(unittest.TestCase):
@@ -1163,12 +1162,8 @@ class ValidateElicitedValuesTests(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
-from ups_mcp.shipment_validator import (
-    normalize_elicited_values,
-    rehydrate,
-    canonicalize_body,
-    RehydrationError,
-)
+from ups_mcp.elicitation import normalize_elicited_values, rehydrate, RehydrationError
+from ups_mcp.shipment_validator import canonicalize_body
 
 
 class CanonicalizeBodyTests(unittest.TestCase):
@@ -1468,7 +1463,11 @@ class RehydrateTests(unittest.TestCase):
         self.assertEqual(cm.exception.flat_key, "shipper_city")
 
     def test_normalizes_package_dict_to_list_during_rehydration(self) -> None:
-        """If Package was a dict, rehydrate should still work via list normalization."""
+        """If Package was a dict, callers should canonicalize before rehydrating.
+
+        rehydrate() is generic and does not canonicalize internally.
+        This test verifies the canonical-then-rehydrate workflow.
+        """
         body: dict = {
             "ShipmentRequest": {"Shipment": {"Package": {"Packaging": {"Code": "02"}}}}
         }
@@ -1479,7 +1478,8 @@ class RehydrateTests(unittest.TestCase):
                 "Package weight",
             ),
         ]
-        result = rehydrate(body, {"package_1_weight": "5"}, missing)
+        canonical = canonicalize_body(body)
+        result = rehydrate(canonical, {"package_1_weight": "5"}, missing)
         pkg = result["ShipmentRequest"]["Shipment"]["Package"]
         self.assertIsInstance(pkg, list)
         self.assertEqual(pkg[0]["PackageWeight"]["Weight"], "5")

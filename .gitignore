@@ -196,3 +196,6 @@ cython_debug/
 
 # Worktrees
 .worktrees/
+
+# Repomix
+repomix-output.xml

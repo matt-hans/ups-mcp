@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-UPS MCP Server — a Model Context Protocol server exposing 7 tools for UPS shipping/logistics APIs (tracking, address validation, rating, shipping, voiding, label recovery, time-in-transit).
+UPS MCP Server — a Model Context Protocol server exposing 18 tools for UPS shipping/logistics APIs (tracking, address validation, rating, shipping, voiding, label recovery, time-in-transit, landed cost, paperless documents, locator, pickup).
 
 ## Commands
 
@@ -30,9 +30,12 @@ No linter or formatter is configured.
 ## Architecture
 
 ```
-server.py (FastMCP, 7 async @mcp.tool endpoints)
+server.py (FastMCP, 18 async @mcp.tool endpoints)
     ↓
 tools.py (ToolManager — orchestration, parameter validation, operation routing)
+    ↓
+shipment_validator.py (preflight validation + elicitation schema generation for create_shipment)
+constants.py (CIE/production URLs, locator/pickup/paperless constants)
     ↓
 http_client.py (UPSHTTPClient — path rendering, HTTP execution, error parsing)
     ↓
@@ -41,11 +44,12 @@ authorization.py (OAuthManager — thread-safe OAuth2 client_credentials with to
 openapi_registry.py (OpenAPIRegistry — loads specs, extracts OperationSpec metadata)
 ```
 
-**Two tool categories:**
+**Three tool categories:**
 - **Legacy tools** (`track_package`, `validate_address`): hardcoded `OperationSpec` constants in `tools.py`, custom parameter assembly
-- **Spec-backed tools** (`rate_shipment`, `create_shipment`, `void_shipment`, `recover_label`, `get_time_in_transit`): operation looked up from `OpenAPIRegistry` by `operation_id`, path params resolved from spec defaults + caller overrides
+- **Original spec-backed tools** (`rate_shipment`, `create_shipment`, `void_shipment`, `recover_label`, `get_time_in_transit`): looked up from `OpenAPIRegistry` by `operation_id`
+- **New spec-backed tools** (`get_landed_cost_quote`, `upload_paperless_document`, `push_document_to_shipment`, `delete_paperless_document`, `find_locations`, `rate_pickup`, `schedule_pickup`, `cancel_pickup`, `get_pickup_status`, `get_political_divisions`, `get_service_center_facilities`): same pattern, specs in LandedCost.yaml, Paperless.yaml, Locator.yaml, Pickup.yaml
 
-**OpenAPI specs** (`ups_mcp/specs/*.yaml`) are used only for operation discovery and path routing — not for request/response schema validation. Schema validation was intentionally removed because UPS API schemas are stricter than what UPS actually accepts.
+**OpenAPI specs** (`ups_mcp/specs/*.yaml` — 7 files: Rating, Shipping, TimeInTransit, LandedCost, Locator, Paperless, Pickup) are used only for operation discovery and path routing — not for request/response schema validation. Schema validation was intentionally removed because UPS API schemas are stricter than what UPS actually accepts.
 
 **Spec loading priority:** `UPS_MCP_SPECS_DIR` env var → bundled package resources (`ups_mcp/specs/`)
 
@@ -53,11 +57,17 @@ openapi_registry.py (OpenAPIRegistry — loads specs, extracts OperationSpec met
 
 ## Environment
 
-- `.env`: `CLIENT_ID`, `CLIENT_SECRET`, `ENVIRONMENT` (test|production), optional `UPS_MCP_SPECS_DIR`
+- `.env`: `CLIENT_ID`, `CLIENT_SECRET`, `UPS_ACCOUNT_NUMBER`, `ENVIRONMENT` (test|production), optional `UPS_MCP_SPECS_DIR`
 - `ENVIRONMENT=test` (default) → CIE base URL `https://wwwcie.ups.com`
 - `ENVIRONMENT=production` → `https://onlinetools.ups.com`
 - All API calls go through `/api` prefix: `{base_url}/api{rendered_path}`
 - OAuth token endpoint: `{base_url}/security/v1/oauth/token`
+
+## Git & PRs
+
+- **Fork:** `matt-hans/ups-mcp` (origin). **Upstream:** `UPS-API/ups-mcp`.
+- **NEVER open pull requests on the upstream `UPS-API/ups-mcp` repository.** Always create PRs on the fork `matt-hans/ups-mcp`.
+- Use `gh pr create --repo matt-hans/ups-mcp` when creating PRs.
 
 ## Testing Patterns
 

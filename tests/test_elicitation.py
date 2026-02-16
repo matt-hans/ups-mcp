@@ -1,0 +1,390 @@
+"""Tests for the generic elicitation infrastructure module."""
+
+import json
+import unittest
+from unittest.mock import AsyncMock, MagicMock
+
+from mcp.server.fastmcp import Context
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import (
+    ClientCapabilities,
+    ElicitationCapability,
+    FormElicitationCapability,
+    UrlElicitationCapability,
+    InitializeRequestParams,
+    Implementation,
+)
+
+from ups_mcp.elicitation import (
+    FieldRule,
+    MissingField,
+    check_form_elicitation,
+    elicit_and_rehydrate,
+    build_elicitation_schema,
+    rehydrate,
+    RehydrationError,
+    _field_exists,
+    _set_field,
+    _missing_from_rule,
+)
+
+
+# ---------------------------------------------------------------------------
+# check_form_elicitation tests
+# ---------------------------------------------------------------------------
+
+class CheckFormElicitationTests(unittest.TestCase):
+    def _make_ctx(
+        self,
+        elicitation: ElicitationCapability | None = None,
+    ) -> MagicMock:
+        ctx = MagicMock()
+        caps = ClientCapabilities(elicitation=elicitation)
+        params = InitializeRequestParams(
+            protocolVersion="2025-03-26",
+            capabilities=caps,
+            clientInfo=Implementation(name="test", version="1.0"),
+        )
+        ctx.request_context.session._client_params = params
+        ctx.request_context.session.client_params = params
+        return ctx
+
+    def test_none_ctx_returns_false(self) -> None:
+        self.assertFalse(check_form_elicitation(None))
+
+    def test_no_elicitation_capability_returns_false(self) -> None:
+        ctx = self._make_ctx(elicitation=None)
+        self.assertFalse(check_form_elicitation(ctx))
+
+    def test_form_capability_returns_true(self) -> None:
+        ctx = self._make_ctx(
+            elicitation=ElicitationCapability(form=FormElicitationCapability())
+        )
+        self.assertTrue(check_form_elicitation(ctx))
+
+    def test_empty_elicitation_object_returns_true(self) -> None:
+        ctx = self._make_ctx(elicitation=ElicitationCapability())
+        self.assertTrue(check_form_elicitation(ctx))
+
+    def test_url_only_returns_false(self) -> None:
+        ctx = self._make_ctx(
+            elicitation=ElicitationCapability(url=UrlElicitationCapability())
+        )
+        self.assertFalse(check_form_elicitation(ctx))
+
+    def test_both_form_and_url_returns_true(self) -> None:
+        ctx = self._make_ctx(
+            elicitation=ElicitationCapability(
+                form=FormElicitationCapability(),
+                url=UrlElicitationCapability(),
+            )
+        )
+        self.assertTrue(check_form_elicitation(ctx))
+
+    def test_attribute_error_returns_false(self) -> None:
+        ctx = MagicMock()
+        ctx.request_context.session.client_params = None
+        self.assertFalse(check_form_elicitation(ctx))
+
+
+# ---------------------------------------------------------------------------
+# elicit_and_rehydrate tests
+# ---------------------------------------------------------------------------
+
+def _make_form_ctx(elicit_result=None, elicit_side_effect=None):
+    """Build a mock Context with form elicitation support."""
+    ctx = MagicMock()
+    caps = ClientCapabilities(
+        elicitation=ElicitationCapability(form=FormElicitationCapability())
+    )
+    params = InitializeRequestParams(
+        protocolVersion="2025-03-26",
+        capabilities=caps,
+        clientInfo=Implementation(name="test", version="1.0"),
+    )
+    ctx.request_context.session.client_params = params
+    if elicit_side_effect is not None:
+        ctx.elicit = AsyncMock(side_effect=elicit_side_effect)
+    elif elicit_result is not None:
+        ctx.elicit = AsyncMock(return_value=elicit_result)
+    return ctx
+
+
+def _make_no_form_ctx():
+    """Build a mock Context without form elicitation support."""
+    ctx = MagicMock()
+    caps = ClientCapabilities(elicitation=None)
+    params = InitializeRequestParams(
+        protocolVersion="2025-03-26",
+        capabilities=caps,
+        clientInfo=Implementation(name="test", version="1.0"),
+    )
+    ctx.request_context.session.client_params = params
+    return ctx
+
+
+def _simple_missing():
+    """Return a single MissingField for testing."""
+    return [MissingField(
+        "Root.Name", "name", "Name",
+    )]
+
+
+def _make_accepted(data_dict):
+    """Make a mock elicitation result with action=accept."""
+    mock_data = MagicMock()
+    mock_data.model_dump.return_value = data_dict
+    result = MagicMock()
+    result.action = "accept"
+    result.data = mock_data
+    return result
+
+
+class ElicitAndRehydrateTests(unittest.IsolatedAsyncioTestCase):
+
+    async def test_no_form_support_raises_unsupported(self) -> None:
+        ctx = _make_no_form_ctx()
+        missing = _simple_missing()
+        with self.assertRaises(ToolError) as cm:
+            await elicit_and_rehydrate(
+                ctx, {"Root": {}}, missing,
+                find_missing_fn=lambda b: [],
+                tool_label="test",
+            )
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "ELICITATION_UNSUPPORTED")
+
+    async def test_none_ctx_raises_unsupported(self) -> None:
+        missing = _simple_missing()
+        with self.assertRaises(ToolError) as cm:
+            await elicit_and_rehydrate(
+                None, {"Root": {}}, missing,
+                find_missing_fn=lambda b: [],
+                tool_label="test",
+            )
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "ELICITATION_UNSUPPORTED")
+
+    async def test_accept_rehydrates_and_returns(self) -> None:
+        accepted = _make_accepted({"name": "Test Corp"})
+        ctx = _make_form_ctx(elicit_result=accepted)
+        missing = _simple_missing()
+        body = {"Root": {}}
+
+        result = await elicit_and_rehydrate(
+            ctx, body, missing,
+            find_missing_fn=lambda b: [],
+            tool_label="test",
+        )
+        self.assertEqual(result["Root"]["Name"], "Test Corp")
+        ctx.elicit.assert_called_once()
+
+    async def test_decline_raises_declined(self) -> None:
+        declined = MagicMock()
+        declined.action = "decline"
+        ctx = _make_form_ctx(elicit_result=declined)
+
+        with self.assertRaises(ToolError) as cm:
+            await elicit_and_rehydrate(
+                ctx, {"Root": {}}, _simple_missing(),
+                find_missing_fn=lambda b: [],
+                tool_label="test",
+            )
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "ELICITATION_DECLINED")
+
+    async def test_cancel_raises_cancelled(self) -> None:
+        cancelled = MagicMock()
+        cancelled.action = "cancel"
+        ctx = _make_form_ctx(elicit_result=cancelled)
+
+        with self.assertRaises(ToolError) as cm:
+            await elicit_and_rehydrate(
+                ctx, {"Root": {}}, _simple_missing(),
+                find_missing_fn=lambda b: [],
+                tool_label="test",
+            )
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "ELICITATION_CANCELLED")
+
+    async def test_transport_error_raises_elicitation_failed(self) -> None:
+        ctx = _make_form_ctx(elicit_side_effect=RuntimeError("connection lost"))
+
+        with self.assertRaises(ToolError) as cm:
+            await elicit_and_rehydrate(
+                ctx, {"Root": {}}, _simple_missing(),
+                find_missing_fn=lambda b: [],
+                tool_label="test",
+            )
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "ELICITATION_FAILED")
+        self.assertIn("connection lost", payload["message"])
+
+    async def test_tool_error_from_elicit_reraises(self) -> None:
+        """ToolError from ctx.elicit() should be re-raised as-is."""
+        original_error = ToolError("original error")
+        ctx = _make_form_ctx(elicit_side_effect=original_error)
+
+        with self.assertRaises(ToolError) as cm:
+            await elicit_and_rehydrate(
+                ctx, {"Root": {}}, _simple_missing(),
+                find_missing_fn=lambda b: [],
+                tool_label="test",
+            )
+        self.assertEqual(str(cm.exception), "original error")
+
+    async def test_still_missing_raises_incomplete(self) -> None:
+        """If fields are still missing after rehydration, raise INCOMPLETE_SHIPMENT."""
+        accepted = _make_accepted({"name": "Test"})
+        ctx = _make_form_ctx(elicit_result=accepted)
+        missing = _simple_missing()
+
+        # find_missing_fn always returns something
+        still_missing = [MissingField("Root.Other", "other", "Other field")]
+
+        with self.assertRaises(ToolError) as cm:
+            await elicit_and_rehydrate(
+                ctx, {"Root": {}}, missing,
+                find_missing_fn=lambda b: still_missing,
+                tool_label="test",
+            )
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "INCOMPLETE_SHIPMENT")
+
+    async def test_validation_errors_raise_invalid_response(self) -> None:
+        """Invalid elicited values raise ELICITATION_INVALID_RESPONSE."""
+        # Use a weight field with non-numeric value
+        missing = [MissingField("Root.Weight", "package_1_weight", "Package weight")]
+        accepted = _make_accepted({"package_1_weight": "not_a_number"})
+        ctx = _make_form_ctx(elicit_result=accepted)
+
+        with self.assertRaises(ToolError) as cm:
+            await elicit_and_rehydrate(
+                ctx, {"Root": {}}, missing,
+                find_missing_fn=lambda b: [],
+                tool_label="test",
+            )
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "ELICITATION_INVALID_RESPONSE")
+        self.assertEqual(payload["reason"], "validation_errors")
+
+    async def test_rehydration_error_raises_invalid_response(self) -> None:
+        """Structural conflict during rehydration raises ELICITATION_INVALID_RESPONSE."""
+        missing = [MissingField("Root.Sub.Name", "name", "Name")]
+        accepted = _make_accepted({"name": "Test"})
+        ctx = _make_form_ctx(elicit_result=accepted)
+        # Root.Sub is a string, not a dict — rehydration will fail
+        body = {"Root": {"Sub": "not_a_dict"}}
+
+        with self.assertRaises(ToolError) as cm:
+            await elicit_and_rehydrate(
+                ctx, body, missing,
+                find_missing_fn=lambda b: [],
+                tool_label="test",
+            )
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "ELICITATION_INVALID_RESPONSE")
+        self.assertEqual(payload["reason"], "rehydration_error")
+
+    async def test_canonicalize_fn_called_before_rehydrate(self) -> None:
+        """When canonicalize_fn is provided, it's called on body before rehydration."""
+        calls = []
+
+        def mock_canonicalize(body):
+            calls.append("canonicalize")
+            # Add a marker to verify it was called
+            result = dict(body)
+            result["_canonicalized"] = True
+            return result
+
+        accepted = _make_accepted({"name": "Test"})
+        ctx = _make_form_ctx(elicit_result=accepted)
+        missing = _simple_missing()
+
+        result = await elicit_and_rehydrate(
+            ctx, {"Root": {}}, missing,
+            find_missing_fn=lambda b: [],
+            tool_label="test",
+            canonicalize_fn=mock_canonicalize,
+        )
+        self.assertEqual(calls, ["canonicalize"])
+        self.assertTrue(result.get("_canonicalized"))
+
+    async def test_canonicalize_fn_none_works(self) -> None:
+        """When canonicalize_fn is None, body is used as-is for rehydration."""
+        accepted = _make_accepted({"name": "Test"})
+        ctx = _make_form_ctx(elicit_result=accepted)
+        missing = _simple_missing()
+
+        result = await elicit_and_rehydrate(
+            ctx, {"Root": {}}, missing,
+            find_missing_fn=lambda b: [],
+            tool_label="test",
+            canonicalize_fn=None,
+        )
+        self.assertEqual(result["Root"]["Name"], "Test")
+
+    async def test_does_not_mutate_input_body(self) -> None:
+        """The original body dict should not be mutated."""
+        accepted = _make_accepted({"name": "Test"})
+        ctx = _make_form_ctx(elicit_result=accepted)
+        missing = _simple_missing()
+        body = {"Root": {}}
+
+        await elicit_and_rehydrate(
+            ctx, body, missing,
+            find_missing_fn=lambda b: [],
+            tool_label="test",
+        )
+        self.assertEqual(body, {"Root": {}})
+
+    async def test_tool_label_in_elicit_message(self) -> None:
+        """The tool_label should appear in the elicitation message."""
+        accepted = _make_accepted({"name": "Test"})
+        ctx = _make_form_ctx(elicit_result=accepted)
+        missing = _simple_missing()
+
+        await elicit_and_rehydrate(
+            ctx, {"Root": {}}, missing,
+            find_missing_fn=lambda b: [],
+            tool_label="rate request",
+        )
+        call_kwargs = ctx.elicit.call_args
+        self.assertIn("rate request", call_kwargs.kwargs.get("message", call_kwargs.args[0] if call_kwargs.args else ""))
+
+    async def test_missing_payload_structure(self) -> None:
+        """Error payloads should contain structured missing field info."""
+        ctx = _make_no_form_ctx()
+        missing = [
+            MissingField("A.B", "field_a", "Field A"),
+            MissingField("C.D", "field_c", "Field C"),
+        ]
+        with self.assertRaises(ToolError) as cm:
+            await elicit_and_rehydrate(
+                ctx, {}, missing,
+                find_missing_fn=lambda b: [],
+                tool_label="test",
+            )
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(len(payload["missing"]), 2)
+        self.assertEqual(payload["missing"][0]["dot_path"], "A.B")
+        self.assertEqual(payload["missing"][0]["flat_key"], "field_a")
+        self.assertEqual(payload["missing"][0]["prompt"], "Field A")
+
+
+# ---------------------------------------------------------------------------
+# build_elicitation_schema model_name parameter test
+# ---------------------------------------------------------------------------
+
+class BuildElicitationSchemaModelNameTests(unittest.TestCase):
+    def test_default_model_name(self) -> None:
+        schema = build_elicitation_schema([])
+        self.assertEqual(schema.__name__, "MissingFields")
+
+    def test_custom_model_name(self) -> None:
+        schema = build_elicitation_schema([], model_name="MissingRateFields")
+        self.assertEqual(schema.__name__, "MissingRateFields")
+
+
+if __name__ == "__main__":
+    unittest.main()

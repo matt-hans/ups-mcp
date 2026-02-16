@@ -45,28 +45,6 @@ def _require_tool_manager() -> tools.ToolManager:
     return tool_manager
 
 
-def _check_form_elicitation(ctx: Context | None) -> bool:
-    """Check if the connected client supports form-mode elicitation."""
-    if ctx is None:
-        return False
-    try:
-        params = ctx.request_context.session.client_params
-        if params is None:
-            return False
-        caps = params.capabilities
-        if caps.elicitation is None:
-            return False
-        # Form supported if .form is explicitly present
-        if caps.elicitation.form is not None:
-            return True
-        # Backward compat: empty elicitation object (neither form nor url set)
-        if caps.elicitation.url is None:
-            return True
-        # Only url is set — form not supported
-        return False
-    except AttributeError:
-        return False
-
 
 @mcp.tool()
 async def track_package(
@@ -167,34 +145,93 @@ async def rate_shipment(
     additionalinfo: str = "",
     trans_id: str = "",
     transaction_src: str = "ups-mcp",
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """
     Rate or shop a shipment using UPS Rating API (`POST /rating/{version}/{requestoption}`).
+
+    If required fields are missing and the client supports form-mode elicitation,
+    the server will prompt for the missing information. Otherwise, a structured
+    ToolError is raised listing the missing fields.
+
+    When requestoption is "Shop" or "Shoptimeintransit", Service.Code is not
+    required — UPS returns rates for all available services.
 
     Args:
         requestoption (str): One of Rate, Shop, Ratetimeintransit, Shoptimeintransit.
         request_body (dict): JSON object matching `RATERequestWrapper`.
             Minimum practical shape:
-            - RateRequest.Request
-            - RateRequest.Shipment.Shipper (Name, Address, often ShipperNumber)
-            - RateRequest.Shipment.ShipTo (Address)
-            - RateRequest.Shipment.Package (PackagingType, Dimensions, PackageWeight)
+            - RateRequest.Shipment.Shipper (Name, ShipperNumber, Address)
+            - RateRequest.Shipment.ShipTo (Name, Address)
+            - RateRequest.Shipment.Service (Code) — not required for Shop mode
+            - RateRequest.Shipment.Package (Packaging, PackageWeight)
+            - RateRequest.Shipment.PaymentInformation (ShipmentCharge)
         version (str): API version. Default `v2409`.
         additionalinfo (str): Optional query param. Supports `timeintransit`.
         trans_id (str): Optional request id.
         transaction_src (str): Optional caller source name. Default `ups-mcp`.
+        ctx: MCP Context (injected by FastMCP, not provided by callers).
 
     Returns:
         dict[str, Any]: Raw UPS API response payload. On error, raises ToolError.
     """
-    return _require_tool_manager().rate_shipment(
-        requestoption=requestoption,
-        request_body=request_body,
-        version=version,
-        additionalinfo=additionalinfo or None,
-        trans_id=trans_id or None,
-        transaction_src=transaction_src,
+    from .rating_validator import (
+        apply_rate_defaults,
+        find_missing_rate_fields,
+        canonicalize_rate_body,
     )
+    from .elicitation import elicit_and_rehydrate
+    from .shipment_validator import AmbiguousPayerError
+
+    # Helper: canonicalize and send to UPS
+    def _send_to_ups(body):
+        canonical = canonicalize_rate_body(body)
+        return _require_tool_manager().rate_shipment(
+            requestoption=requestoption,
+            request_body=canonical,
+            version=version,
+            additionalinfo=additionalinfo or None,
+            trans_id=trans_id or None,
+            transaction_src=transaction_src,
+        )
+
+    # 1. Canonicalize then apply 3-tier defaults
+    env_config = {"UPS_ACCOUNT_NUMBER": os.getenv("UPS_ACCOUNT_NUMBER", "")}
+    try:
+        canonical_input = canonicalize_rate_body(request_body)
+        merged_body = apply_rate_defaults(canonical_input, env_config)
+    except TypeError as exc:
+        raise ToolError(json.dumps({
+            "code": "MALFORMED_REQUEST",
+            "message": f"Request body has structural conflicts: {exc}",
+            "reason": "malformed_structure",
+            "missing": [],
+        }))
+
+    # 2. Preflight: find missing required fields
+    try:
+        find_fn = lambda body: find_missing_rate_fields(body, requestoption)
+        missing = find_fn(merged_body)
+    except AmbiguousPayerError as exc:
+        raise ToolError(json.dumps({
+            "code": "MALFORMED_REQUEST",
+            "message": str(exc),
+            "reason": "ambiguous_payer",
+            "missing": [],
+        }))
+
+    # 3. Happy path — all fields present
+    if not missing:
+        return _send_to_ups(merged_body)
+
+    # 4. Elicitation flow
+    merged_body = await elicit_and_rehydrate(
+        ctx, merged_body, missing,
+        find_missing_fn=find_fn,
+        tool_label="rate request",
+        canonicalize_fn=canonicalize_rate_body,
+    )
+    return _send_to_ups(merged_body)
 
 @mcp.tool()
 async def create_shipment(
@@ -233,14 +270,10 @@ async def create_shipment(
     from .shipment_validator import (
         apply_defaults,
         find_missing_fields,
-        build_elicitation_schema,
-        normalize_elicited_values,
-        validate_elicited_values,
-        rehydrate,
         canonicalize_body,
-        RehydrationError,
         AmbiguousPayerError,
     )
+    from .elicitation import elicit_and_rehydrate
 
     # Helper: canonicalize and send to UPS
     def _send_to_ups(body):
@@ -281,83 +314,14 @@ async def create_shipment(
     if not missing:
         return _send_to_ups(merged_body)
 
-    # Helper: build structured missing payload
-    def _missing_payload(fields):
-        return [
-            {"dot_path": mf.dot_path, "flat_key": mf.flat_key, "prompt": mf.prompt}
-            for mf in fields
-        ]
-
-    # 4. Check form-mode elicitation support
-    if _check_form_elicitation(ctx):
-        schema = build_elicitation_schema(missing)
-        try:
-            result = await ctx.elicit(
-                message=f"Missing {len(missing)} required field(s) for shipment creation.",
-                schema=schema,
-            )
-        except ToolError:
-            raise  # re-raise ToolErrors as-is
-        except Exception as exc:
-            raise ToolError(json.dumps({
-                "code": "ELICITATION_FAILED",
-                "message": f"Elicitation request failed: {exc}",
-                "reason": "transport_error",
-                "missing": _missing_payload(missing),
-            }))
-
-        if result.action == "accept":
-            normalized = normalize_elicited_values(result.data.model_dump())
-            validation_errors = validate_elicited_values(normalized, missing)
-            if validation_errors:
-                raise ToolError(json.dumps({
-                    "code": "ELICITATION_INVALID_RESPONSE",
-                    "message": "; ".join(validation_errors),
-                    "reason": "validation_errors",
-                    "missing": _missing_payload(missing),
-                }))
-            try:
-                merged_body = rehydrate(merged_body, normalized, missing)
-            except RehydrationError as exc:
-                raise ToolError(json.dumps({
-                    "code": "ELICITATION_INVALID_RESPONSE",
-                    "message": f"Elicited data conflicts with request structure: {exc}",
-                    "reason": "rehydration_error",
-                    "missing": _missing_payload(missing),
-                }))
-            still_missing = find_missing_fields(merged_body)
-            if still_missing:
-                raise ToolError(json.dumps({
-                    "code": "INCOMPLETE_SHIPMENT",
-                    "message": "Still missing required fields after elicitation",
-                    "reason": "still_missing",
-                    "missing": _missing_payload(still_missing),
-                }))
-            return _send_to_ups(merged_body)
-
-        elif result.action == "decline":
-            raise ToolError(json.dumps({
-                "code": "ELICITATION_DECLINED",
-                "message": "User declined to provide missing shipment fields",
-                "reason": "declined",
-                "missing": _missing_payload(missing),
-            }))
-
-        else:  # cancel
-            raise ToolError(json.dumps({
-                "code": "ELICITATION_CANCELLED",
-                "message": "User cancelled shipment field elicitation",
-                "reason": "cancelled",
-                "missing": _missing_payload(missing),
-            }))
-
-    # 5. No form elicitation — structured ToolError for agent fallback
-    raise ToolError(json.dumps({
-        "code": "ELICITATION_UNSUPPORTED",
-        "message": f"Missing {len(missing)} required field(s) and client does not support form elicitation",
-        "reason": "unsupported",
-        "missing": _missing_payload(missing),
-    }))
+    # 4. Elicitation flow (checks support, builds schema, validates, rehydrates)
+    merged_body = await elicit_and_rehydrate(
+        ctx, merged_body, missing,
+        find_missing_fn=find_missing_fields,
+        tool_label="shipment creation",
+        canonicalize_fn=canonicalize_body,
+    )
+    return _send_to_ups(merged_body)
 
 @mcp.tool()
 async def void_shipment(

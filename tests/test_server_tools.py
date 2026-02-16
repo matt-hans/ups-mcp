@@ -61,9 +61,10 @@ class ServerToolsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("XAVResponse", validation_response)
 
     async def test_new_tools_return_raw_ups_response(self) -> None:
+        from tests.rating_fixtures import make_complete_rate_body
         rate_response = await server.rate_shipment(
             requestoption="Rate",
-            request_body={"RateRequest": {}},
+            request_body=make_complete_rate_body(),
         )
         time_response = await server.get_time_in_transit(
             request_body={"originCountryCode": "US", "destinationCountryCode": "US"},
