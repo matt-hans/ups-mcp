@@ -433,6 +433,7 @@ class ToolManager:
         country_code: str,
         radius: float = 15.0,
         unit_of_measure: str = "MI",
+        max_results: int = 10,
         trans_id: str | None = None,
         transaction_src: str = "ups-mcp",
     ) -> dict[str, Any]:
@@ -441,9 +442,15 @@ class ToolManager:
             allowed = ", ".join(sorted(constants.LOCATOR_OPTIONS.keys()))
             raise ToolError(f"Invalid location_type '{location_type}'. Must be one of: {allowed}")
 
-        search_criteria: dict[str, Any] = {"SearchRadius": str(radius)}
+        search_criteria: dict[str, Any] = {
+            "SearchRadius": str(radius),
+            "MaximumListSize": str(max_results),
+        }
         if req_option == "64":
-            search_criteria["AccessPointSearch"] = {"AccessPointStatus": "01"}
+            search_criteria["AccessPointSearch"] = {
+                "AccessPointStatus": "01",
+                "ExactMatchIndicator": "",
+            }
 
         request_body = {
             "LocatorRequest": {

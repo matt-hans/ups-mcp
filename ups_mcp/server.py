@@ -564,6 +564,7 @@ async def find_locations(
     country_code: str,
     radius: float = 15.0,
     unit_of_measure: Literal["MI", "KM"] = "MI",
+    max_results: int = 10,
     trans_id: str = "",
     transaction_src: str = "ups-mcp",
 ) -> dict[str, Any]:
@@ -579,6 +580,7 @@ async def find_locations(
         country_code (str): ISO country code (e.g. US). Required.
         radius (float): Search radius. Default 15.0.
         unit_of_measure (str): MI (miles) or KM (kilometers). Default MI.
+        max_results (int): Maximum number of locations to return (1-50). Default 10.
         trans_id (str): Optional request id.
         transaction_src (str): Optional caller source name. Default 'ups-mcp'.
 
@@ -594,6 +596,7 @@ async def find_locations(
         country_code=country_code,
         radius=radius,
         unit_of_measure=unit_of_measure,
+        max_results=max_results,
         trans_id=trans_id or None,
         transaction_src=transaction_src,
     )

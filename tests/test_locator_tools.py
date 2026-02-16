@@ -83,6 +83,30 @@ class FindLocationsTests(unittest.TestCase):
         self.assertIn("OriginAddress", req)
         self.assertIn("Translate", req)
 
+    def test_default_max_results(self) -> None:
+        """Default MaximumListSize should be '10'."""
+        self._call_default()
+        criteria = self.fake.calls[0]["kwargs"]["json_body"]["LocatorRequest"]["LocationSearchCriteria"]
+        self.assertEqual(criteria["MaximumListSize"], "10")
+
+    def test_custom_max_results(self) -> None:
+        """Passing max_results=25 should set MaximumListSize to '25'."""
+        self._call_default(max_results=25)
+        criteria = self.fake.calls[0]["kwargs"]["json_body"]["LocatorRequest"]["LocationSearchCriteria"]
+        self.assertEqual(criteria["MaximumListSize"], "25")
+
+    def test_access_point_includes_exact_match_indicator(self) -> None:
+        """Access point searches should include ExactMatchIndicator."""
+        self._call_default(location_type="access_point")
+        criteria = self.fake.calls[0]["kwargs"]["json_body"]["LocatorRequest"]["LocationSearchCriteria"]
+        self.assertIn("ExactMatchIndicator", criteria["AccessPointSearch"])
+
+    def test_non_access_point_omits_exact_match_indicator(self) -> None:
+        """Non-access-point searches should not have AccessPointSearch at all."""
+        self._call_default(location_type="retail")
+        criteria = self.fake.calls[0]["kwargs"]["json_body"]["LocatorRequest"]["LocationSearchCriteria"]
+        self.assertNotIn("AccessPointSearch", criteria)
+
 
 if __name__ == "__main__":
     unittest.main()
