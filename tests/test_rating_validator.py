@@ -13,6 +13,7 @@ from ups_mcp.rating_validator import (
     find_missing_rate_fields,
     apply_rate_defaults,
     canonicalize_rate_body,
+    remap_packaging_for_rating,
 )
 from ups_mcp.shipment_validator import AmbiguousPayerError
 from ups_mcp.elicitation import FieldRule, MissingField
@@ -424,6 +425,70 @@ class TypeMetadataTests(unittest.TestCase):
         constraint_keys = {k for k, v in country[0].constraints}
         self.assertIn("maxLength", constraint_keys)
         self.assertIn("pattern", constraint_keys)
+
+
+# ---------------------------------------------------------------------------
+# remap_packaging_for_rating tests
+# ---------------------------------------------------------------------------
+
+class RemapPackagingForRatingTests(unittest.TestCase):
+    def test_single_package_renames_packaging_to_packaging_type(self) -> None:
+        body = make_complete_rate_body()
+        result = remap_packaging_for_rating(body)
+        pkg = result["RateRequest"]["Shipment"]["Package"][0]
+        self.assertIn("PackagingType", pkg)
+        self.assertNotIn("Packaging", pkg)
+        self.assertEqual(pkg["PackagingType"], {"Code": "02"})
+
+    def test_multi_package_renames_all(self) -> None:
+        body = make_complete_rate_body(num_packages=3)
+        result = remap_packaging_for_rating(body)
+        for pkg in result["RateRequest"]["Shipment"]["Package"]:
+            self.assertIn("PackagingType", pkg)
+            self.assertNotIn("Packaging", pkg)
+
+    def test_no_op_when_packaging_absent(self) -> None:
+        body = make_complete_rate_body()
+        del body["RateRequest"]["Shipment"]["Package"][0]["Packaging"]
+        result = remap_packaging_for_rating(body)
+        pkg = result["RateRequest"]["Shipment"]["Package"][0]
+        self.assertNotIn("PackagingType", pkg)
+        self.assertNotIn("Packaging", pkg)
+
+    def test_does_not_mutate_input(self) -> None:
+        body = make_complete_rate_body()
+        original = copy.deepcopy(body)
+        remap_packaging_for_rating(body)
+        self.assertEqual(body, original)
+
+    def test_empty_body_tolerated(self) -> None:
+        result = remap_packaging_for_rating({})
+        self.assertEqual(result, {})
+
+    def test_package_as_dict_handled(self) -> None:
+        body = {
+            "RateRequest": {
+                "Shipment": {
+                    "Package": {"Packaging": {"Code": "02"}, "PackageWeight": {"Weight": "5"}},
+                }
+            }
+        }
+        result = remap_packaging_for_rating(body)
+        # Package stays as dict (remap handles dict form)
+        pkg = result["RateRequest"]["Shipment"]["Package"]
+        if isinstance(pkg, list):
+            pkg = pkg[0]
+        self.assertIn("PackagingType", pkg)
+        self.assertNotIn("Packaging", pkg)
+
+    def test_preserves_packaging_value(self) -> None:
+        body = make_complete_rate_body()
+        body["RateRequest"]["Shipment"]["Package"][0]["Packaging"] = {
+            "Code": "21", "Description": "Express Box"
+        }
+        result = remap_packaging_for_rating(body)
+        pkg = result["RateRequest"]["Shipment"]["Package"][0]
+        self.assertEqual(pkg["PackagingType"], {"Code": "21", "Description": "Express Box"})
 
 
 if __name__ == "__main__":

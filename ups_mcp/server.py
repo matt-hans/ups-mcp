@@ -179,16 +179,18 @@ async def rate_shipment(
         apply_rate_defaults,
         find_missing_rate_fields,
         canonicalize_rate_body,
+        remap_packaging_for_rating,
     )
     from .elicitation import elicit_and_rehydrate
     from .shipment_validator import AmbiguousPayerError
 
-    # Helper: canonicalize and send to UPS
+    # Helper: canonicalize, remap Packaging→PackagingType, and send to UPS
     def _send_to_ups(body):
         canonical = canonicalize_rate_body(body)
+        api_body = remap_packaging_for_rating(canonical)
         return _require_tool_manager().rate_shipment(
             requestoption=requestoption,
-            request_body=canonical,
+            request_body=api_body,
             version=version,
             additionalinfo=additionalinfo or None,
             trans_id=trans_id or None,

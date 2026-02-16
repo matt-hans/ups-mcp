@@ -163,6 +163,29 @@ def canonicalize_rate_body(request_body: dict) -> dict:
     return result
 
 
+def remap_packaging_for_rating(body: dict) -> dict:
+    """Rename Packaging → PackagingType in each package for the Rating API.
+
+    The UPS Rating API uses ``PackagingType`` while the Shipping API uses
+    ``Packaging``.  The MCP validator normalises to ``Packaging`` for both,
+    so this remap is applied **after** validation, before the HTTP call.
+
+    Returns a deep copy — the input dict is never mutated.
+    """
+    result = copy.deepcopy(body)
+    packages = (
+        result.get("RateRequest", {})
+        .get("Shipment", {})
+        .get("Package", [])
+    )
+    if isinstance(packages, dict):
+        packages = [packages]
+    for pkg in packages:
+        if "Packaging" in pkg:
+            pkg["PackagingType"] = pkg.pop("Packaging")
+    return result
+
+
 # ---------------------------------------------------------------------------
 # 3-tier defaults application
 # ---------------------------------------------------------------------------
