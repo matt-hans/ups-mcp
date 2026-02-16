@@ -157,6 +157,19 @@ async def rate_shipment(
     When requestoption is "Shop" or "Shoptimeintransit", Service.Code is not
     required — UPS returns rates for all available services.
 
+    ## International Rate Requests
+
+    When origin and destination countries differ, the following additional fields
+    are validated and elicited:
+
+    - **Shipper.AttentionName** and **Shipper.Phone.Number** — required for international
+    - **ShipTo.AttentionName** and **ShipTo.Phone.Number** — required for international or service "14"
+    - **Shipment.Description** — description of goods (max 50 chars); exempt for UPS Letter packages and EU-to-EU UPS Standard
+    - **InvoiceLineTotal** (CurrencyCode + MonetaryValue) — required for US→CA/PR forward shipments
+
+    InternationalForms is NOT required for rating — use `create_shipment` for the full
+    international forms workflow. For duties/taxes estimates, see `get_landed_cost_quote`.
+
     Args:
         requestoption (str): One of Rate, Shop, Ratetimeintransit, Shoptimeintransit.
         request_body (dict): JSON object matching `RATERequestWrapper`.
@@ -166,6 +179,10 @@ async def rate_shipment(
             - RateRequest.Shipment.Service (Code) — not required for Shop mode
             - RateRequest.Shipment.Package (Packaging, PackageWeight)
             - RateRequest.Shipment.PaymentInformation (ShipmentCharge)
+            For international, also include:
+            - Shipper.AttentionName, Shipper.Phone.Number
+            - ShipTo.AttentionName, ShipTo.Phone.Number
+            - Shipment.Description
         version (str): API version. Default `v2409`.
         additionalinfo (str): Optional query param. Supports `timeintransit`.
         trans_id (str): Optional request id.
@@ -251,6 +268,54 @@ async def create_shipment(
     the server will prompt for the missing information. Otherwise, a structured
     ToolError is raised listing the missing fields.
 
+    ## International Shipments
+
+    When origin and destination countries differ, additional fields are validated:
+
+    - **Shipper.AttentionName** and **Shipper.Phone.Number**
+    - **ShipTo.AttentionName** and **ShipTo.Phone.Number**
+    - **Shipment.Description** — description of goods (exempt for UPS Letter, EU-to-EU Standard)
+    - **InvoiceLineTotal** — required for US→CA/PR forward shipments
+    - **ShipmentServiceOptions.InternationalForms** — required for most international
+      shipments (exempt for UPS Letter packages and EU-to-EU UPS Standard)
+
+    ### InternationalForms Structure
+
+    FormType codes: 01=Invoice, 03=Certificate of Origin, 04=USMCA, 05=Partial Invoice,
+    06=Packing List, 07=Customer Generated, 08=Air Freight Packing List, 09=CN22, 10=Premium Care, 11=EEI.
+
+    Example Commercial Invoice (FormType "01"):
+    ```json
+    {"ShipmentServiceOptions": {"InternationalForms": {
+        "FormType": "01",
+        "CurrencyCode": "USD",
+        "ReasonForExport": "SALE",
+        "InvoiceNumber": "INV-001",
+        "InvoiceDate": "20260216",
+        "Product": [{"Description": "Electronics", "Unit": {"Number": "1",
+            "Value": "100", "UnitOfMeasurement": {"Code": "PCS"}},
+            "CommodityCode": "8471.30", "OriginCountryCode": "US"}]
+    }}}
+    ```
+
+    ReasonForExport: SALE, GIFT, SAMPLE, RETURN, REPAIR, INTERCOMPANYDATA.
+    Incoterms (TermsOfShipment): CFR, CIF, CIP, CPT, DAF, DDP, DAP, DEQ, DES, EXW, FAS, FCA, FOB.
+
+    ### Duties & Taxes Payment
+
+    To bill duties/taxes separately, add a second ShipmentCharge with Type "02":
+    ```json
+    {"PaymentInformation": {"ShipmentCharge": [
+        {"Type": "01", "BillShipper": {"AccountNumber": "..."}},
+        {"Type": "02", "BillReceiver": {"AccountNumber": "..."}}
+    ]}}
+    ```
+
+    ### EEI (Electronic Export Information)
+
+    Required for US exports valued >$2,500 or to embargoed destinations. Include
+    EEIFilingOption in InternationalForms (codes: 1=Shipper Filed, 2=AES Direct, 3=UPS Filed).
+
     Args:
         request_body (dict): JSON object matching `SHIPRequestWrapper`.
             Minimum practical shape:
@@ -260,6 +325,11 @@ async def create_shipment(
             - ShipmentRequest.Shipment.Service
             - ShipmentRequest.Shipment.Package
             - ShipmentRequest.Shipment.PaymentInformation
+            For international, also include:
+            - Shipper.AttentionName, Shipper.Phone.Number
+            - ShipTo.AttentionName, ShipTo.Phone.Number
+            - Shipment.Description
+            - ShipmentServiceOptions.InternationalForms (FormType, Product[], CurrencyCode, etc.)
         version (str): API version. Default `v2409`.
         additionaladdressvalidation (str): Optional query param (for example `city`).
         trans_id (str): Optional request id.

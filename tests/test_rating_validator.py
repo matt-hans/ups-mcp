@@ -491,5 +491,136 @@ class RemapPackagingForRatingTests(unittest.TestCase):
         self.assertEqual(pkg["PackagingType"], {"Code": "21", "Description": "Express Box"})
 
 
+from ups_mcp.rating_validator import (
+    RATE_INTL_DESCRIPTION_RULE,
+    RATE_INTL_SHIPPER_CONTACT_RULES,
+    RATE_SHIP_TO_CONTACT_RULES,
+    RATE_INVOICE_LINE_TOTAL_RULES,
+)
+
+
+# ---------------------------------------------------------------------------
+# International validation tests
+# ---------------------------------------------------------------------------
+
+class InternationalRateValidationTests(unittest.TestCase):
+    def test_intl_flags_shipper_contacts(self) -> None:
+        body = make_complete_rate_body(shipper_country="US", ship_to_country="GB")
+        missing = find_missing_rate_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("shipper_attention_name", flat_keys)
+        self.assertIn("shipper_phone", flat_keys)
+
+    def test_domestic_skips_shipper_contacts(self) -> None:
+        body = make_complete_rate_body(shipper_country="US", ship_to_country="US")
+        missing = find_missing_rate_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("shipper_attention_name", flat_keys)
+
+    def test_intl_flags_ship_to_contacts(self) -> None:
+        body = make_complete_rate_body(shipper_country="US", ship_to_country="GB")
+        missing = find_missing_rate_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("ship_to_attention_name", flat_keys)
+        self.assertIn("ship_to_phone", flat_keys)
+
+    def test_domestic_service_14_flags_ship_to_contacts(self) -> None:
+        body = make_complete_rate_body(shipper_country="US", ship_to_country="US")
+        body["RateRequest"]["Shipment"]["Service"]["Code"] = "14"
+        missing = find_missing_rate_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("ship_to_attention_name", flat_keys)
+        self.assertIn("ship_to_phone", flat_keys)
+
+    def test_domestic_non_14_skips_ship_to_contacts(self) -> None:
+        body = make_complete_rate_body(shipper_country="US", ship_to_country="US")
+        body["RateRequest"]["Shipment"]["Service"]["Code"] = "03"
+        missing = find_missing_rate_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("ship_to_attention_name", flat_keys)
+        self.assertNotIn("ship_to_phone", flat_keys)
+
+    def test_intl_missing_description(self) -> None:
+        body = make_complete_rate_body(shipper_country="US", ship_to_country="GB")
+        missing = find_missing_rate_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("shipment_description", flat_keys)
+
+    def test_ups_letter_exempts_description(self) -> None:
+        body = make_complete_rate_body(shipper_country="US", ship_to_country="GB")
+        body["RateRequest"]["Shipment"]["Package"] = [
+            {"Packaging": {"Code": "01"}, "PackageWeight": {"UnitOfMeasurement": {"Code": "LBS"}, "Weight": "1"}},
+        ]
+        missing = find_missing_rate_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("shipment_description", flat_keys)
+
+    def test_eu_to_eu_standard_exempts_description(self) -> None:
+        body = make_complete_rate_body(shipper_country="DE", ship_to_country="FR")
+        body["RateRequest"]["Shipment"]["Service"]["Code"] = "11"
+        missing = find_missing_rate_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("shipment_description", flat_keys)
+
+    def test_us_to_ca_requires_invoice(self) -> None:
+        body = make_complete_rate_body(shipper_country="US", ship_to_country="CA")
+        missing = find_missing_rate_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("invoice_currency_code", flat_keys)
+        self.assertIn("invoice_monetary_value", flat_keys)
+
+    def test_us_to_gb_no_invoice(self) -> None:
+        body = make_complete_rate_body(shipper_country="US", ship_to_country="GB", include_international=True)
+        missing = find_missing_rate_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("invoice_currency_code", flat_keys)
+        self.assertNotIn("invoice_monetary_value", flat_keys)
+
+    def test_ship_from_precedence(self) -> None:
+        body = make_complete_rate_body(shipper_country="US", ship_to_country="CA")
+        body["RateRequest"]["Shipment"]["ShipFrom"] = {
+            "Address": {"CountryCode": "CA"},
+        }
+        missing = find_missing_rate_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        # Should be domestic CA→CA, no international fields required
+        self.assertNotIn("shipper_attention_name", flat_keys)
+        self.assertNotIn("shipment_description", flat_keys)
+
+    def test_no_intl_forms_validation_for_rating(self) -> None:
+        body = make_complete_rate_body(shipper_country="US", ship_to_country="GB")
+        missing = find_missing_rate_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("intl_forms_required", flat_keys)
+
+    def test_complete_intl_body_returns_no_intl_fields(self) -> None:
+        body = make_complete_rate_body(
+            shipper_country="US", ship_to_country="GB", include_international=True,
+        )
+        missing = find_missing_rate_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("shipper_attention_name", flat_keys)
+        self.assertNotIn("shipper_phone", flat_keys)
+        self.assertNotIn("ship_to_attention_name", flat_keys)
+        self.assertNotIn("ship_to_phone", flat_keys)
+        self.assertNotIn("shipment_description", flat_keys)
+
+    def test_all_dot_paths_use_rate_prefix(self) -> None:
+        body = make_complete_rate_body(shipper_country="US", ship_to_country="GB")
+        missing = find_missing_rate_fields(body)
+        intl_flat_keys = {
+            "shipper_attention_name", "shipper_phone",
+            "ship_to_attention_name", "ship_to_phone",
+            "shipment_description",
+        }
+        intl_missing = [mf for mf in missing if mf.flat_key in intl_flat_keys]
+        for mf in intl_missing:
+            self.assertTrue(
+                mf.dot_path.startswith("RateRequest."),
+                f"International field {mf.flat_key} dot_path '{mf.dot_path}' "
+                f"does not start with 'RateRequest.'"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

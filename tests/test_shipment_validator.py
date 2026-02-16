@@ -1487,5 +1487,211 @@ class RehydrateTests(unittest.TestCase):
         self.assertEqual(pkg[0]["Packaging"]["Code"], "02")
 
 
+class FindMissingFieldsInternationalFormsTests(unittest.TestCase):
+    """InternationalForms validation tests for international shipments."""
+
+    # --- InternationalForms presence check ---
+
+    def test_intl_no_forms_flagged(self) -> None:
+        """International US→GB without InternationalForms → intl_forms_required flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("intl_forms_required", flat_keys)
+
+    def test_domestic_no_forms_not_flagged(self) -> None:
+        """Domestic US→US → intl_forms_required NOT flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="US")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("intl_forms_required", flat_keys)
+
+    def test_ups_letter_exempts_forms(self) -> None:
+        """International US→GB with all UPS Letter packages → intl_forms_required NOT flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB")
+        body["ShipmentRequest"]["Shipment"]["Package"] = [
+            {"Packaging": {"Code": "01"}, "PackageWeight": {"UnitOfMeasurement": {"Code": "LBS"}, "Weight": "1"}},
+        ]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("intl_forms_required", flat_keys)
+
+    def test_eu_to_eu_standard_exempts_forms(self) -> None:
+        """DE→FR with service '11' → intl_forms_required NOT flagged."""
+        body = make_complete_body(shipper_country="DE", ship_to_country="FR")
+        body["ShipmentRequest"]["Shipment"]["Service"]["Code"] = "11"
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("intl_forms_required", flat_keys)
+
+    def test_intl_complete_forms_not_flagged(self) -> None:
+        """include_international=True with US→GB → no intl forms fields flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB", include_international=True)
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("intl_forms_required", flat_keys)
+        self.assertNotIn("intl_forms_form_type", flat_keys)
+        self.assertNotIn("intl_forms_product_required", flat_keys)
+        self.assertNotIn("intl_forms_currency_code", flat_keys)
+        self.assertNotIn("intl_forms_reason_for_export", flat_keys)
+        self.assertNotIn("intl_forms_invoice_number", flat_keys)
+        self.assertNotIn("intl_forms_invoice_date", flat_keys)
+
+    # --- FormType validation ---
+
+    def test_form_type_missing_flagged(self) -> None:
+        """InternationalForms present but no FormType → intl_forms_form_type flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB")
+        body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"] = {
+            "InternationalForms": {}
+        }
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("intl_forms_form_type", flat_keys)
+
+    def test_form_type_present_not_flagged(self) -> None:
+        """InternationalForms with FormType '01' → intl_forms_form_type NOT flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB", include_international=True)
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("intl_forms_form_type", flat_keys)
+
+    # --- Product[] validation ---
+
+    def test_product_missing_for_invoice_flagged(self) -> None:
+        """FormType '01' without Product → intl_forms_product_required flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB", include_international=True)
+        del body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"]["InternationalForms"]["Product"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("intl_forms_product_required", flat_keys)
+
+    def test_product_present_not_flagged(self) -> None:
+        """FormType '01' with Product → intl_forms_product_required NOT flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB", include_international=True)
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("intl_forms_product_required", flat_keys)
+
+    def test_product_not_required_for_cn22(self) -> None:
+        """FormType '09' (CN22) without Product → intl_forms_product_required NOT flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB")
+        body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"] = {
+            "InternationalForms": {"FormType": "09"}
+        }
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("intl_forms_product_required", flat_keys)
+
+    # --- CurrencyCode validation ---
+
+    def test_currency_required_for_invoice(self) -> None:
+        """FormType '01' without CurrencyCode → intl_forms_currency_code flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB", include_international=True)
+        del body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"]["InternationalForms"]["CurrencyCode"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("intl_forms_currency_code", flat_keys)
+
+    def test_currency_required_for_partial_invoice(self) -> None:
+        """FormType '05' without CurrencyCode → intl_forms_currency_code flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB")
+        body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"] = {
+            "InternationalForms": {
+                "FormType": "05",
+                "Product": [{"Description": "Test", "Unit": {"Number": "1", "Value": "10", "UnitOfMeasurement": {"Code": "PCS"}}, "OriginCountryCode": "US"}],
+            }
+        }
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("intl_forms_currency_code", flat_keys)
+
+    def test_currency_not_required_for_co(self) -> None:
+        """FormType '03' without CurrencyCode → intl_forms_currency_code NOT flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB")
+        body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"] = {
+            "InternationalForms": {"FormType": "03"}
+        }
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("intl_forms_currency_code", flat_keys)
+
+    # --- ReasonForExport validation ---
+
+    def test_reason_for_export_required_for_invoice(self) -> None:
+        """FormType '01' without ReasonForExport → intl_forms_reason_for_export flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB", include_international=True)
+        del body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"]["InternationalForms"]["ReasonForExport"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("intl_forms_reason_for_export", flat_keys)
+
+    def test_reason_not_required_for_non_invoice(self) -> None:
+        """FormType '03' without ReasonForExport → intl_forms_reason_for_export NOT flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB")
+        body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"] = {
+            "InternationalForms": {"FormType": "03"}
+        }
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("intl_forms_reason_for_export", flat_keys)
+
+    # --- InvoiceNumber / InvoiceDate validation ---
+
+    def test_invoice_number_required_for_invoice(self) -> None:
+        """FormType '01' without InvoiceNumber → intl_forms_invoice_number flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB", include_international=True)
+        del body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"]["InternationalForms"]["InvoiceNumber"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("intl_forms_invoice_number", flat_keys)
+
+    def test_invoice_date_required_for_invoice(self) -> None:
+        """FormType '01' without InvoiceDate → intl_forms_invoice_date flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB", include_international=True)
+        del body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"]["InternationalForms"]["InvoiceDate"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("intl_forms_invoice_date", flat_keys)
+
+    def test_invoice_date_not_required_for_return(self) -> None:
+        """FormType '01' + ReturnService present → intl_forms_invoice_date NOT flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB", include_international=True)
+        body["ShipmentRequest"]["Shipment"]["ReturnService"] = {"Code": "8"}
+        del body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"]["InternationalForms"]["InvoiceDate"]
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("intl_forms_invoice_date", flat_keys)
+
+    # --- Duties payment validation ---
+
+    def test_duties_charge_missing_payer_flagged(self) -> None:
+        """Second ShipmentCharge Type '02' without payer → duties_payer_required flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB", include_international=True)
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"].append({
+            "Type": "02",
+        })
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("duties_payer_required", flat_keys)
+
+    def test_duties_charge_with_payer_not_flagged(self) -> None:
+        """Second ShipmentCharge Type '02' with BillReceiver → duties_payer_required NOT flagged."""
+        body = make_complete_body(shipper_country="US", ship_to_country="GB", include_international=True)
+        body["ShipmentRequest"]["Shipment"]["PaymentInformation"]["ShipmentCharge"].append({
+            "Type": "02",
+            "BillReceiver": {"AccountNumber": "RCV456"},
+        })
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("duties_payer_required", flat_keys)
+
+    def test_no_false_positives_domestic(self) -> None:
+        """Complete domestic body returns zero missing fields (no intl fields leak)."""
+        body = make_complete_body(shipper_country="US", ship_to_country="US")
+        missing = find_missing_fields(body)
+        self.assertEqual(missing, [])
+
+
 if __name__ == "__main__":
     unittest.main()

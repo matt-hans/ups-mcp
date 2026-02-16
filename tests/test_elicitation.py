@@ -21,6 +21,8 @@ from ups_mcp.elicitation import (
     check_form_elicitation,
     elicit_and_rehydrate,
     build_elicitation_schema,
+    normalize_elicited_values,
+    validate_elicited_values,
     rehydrate,
     RehydrationError,
     _field_exists,
@@ -384,6 +386,118 @@ class BuildElicitationSchemaModelNameTests(unittest.TestCase):
     def test_custom_model_name(self) -> None:
         schema = build_elicitation_schema([], model_name="MissingRateFields")
         self.assertEqual(schema.__name__, "MissingRateFields")
+
+
+# ---------------------------------------------------------------------------
+# Structural (non-elicitable) MissingField tests
+# ---------------------------------------------------------------------------
+
+class StructuralFieldTests(unittest.IsolatedAsyncioTestCase):
+    """Structural MissingFields (elicitable=False) must trigger an immediate
+    error instead of entering the flat-form elicitation flow."""
+
+    async def test_structural_field_raises_before_elicitation(self) -> None:
+        """Non-elicitable field raises STRUCTURAL_FIELDS_REQUIRED."""
+        ctx = _make_form_ctx()
+        missing = [MissingField(
+            "Root.Container",
+            "container_required",
+            "Container is required. Build it in request_body.",
+            elicitable=False,
+        )]
+
+        with self.assertRaises(ToolError) as cm:
+            await elicit_and_rehydrate(
+                ctx, {"Root": {}}, missing,
+                find_missing_fn=lambda b: [],
+                tool_label="test",
+            )
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "STRUCTURAL_FIELDS_REQUIRED")
+        self.assertEqual(payload["reason"], "structural")
+        self.assertEqual(len(payload["missing"]), 1)
+        self.assertIn("Container is required", payload["missing"][0]["prompt"])
+
+    async def test_structural_field_not_sent_to_elicit(self) -> None:
+        """ctx.elicit() should never be called when structural fields exist."""
+        ctx = _make_form_ctx()
+        missing = [MissingField(
+            "Root.Big", "big_thing", "Build this complex thing.",
+            elicitable=False,
+        )]
+        with self.assertRaises(ToolError):
+            await elicit_and_rehydrate(
+                ctx, {"Root": {}}, missing,
+                find_missing_fn=lambda b: [],
+                tool_label="test",
+            )
+        ctx.elicit.assert_not_called()
+
+    async def test_mixed_structural_and_scalar_raises_structural(self) -> None:
+        """When both structural and scalar fields are missing, structural wins."""
+        ctx = _make_form_ctx()
+        missing = [
+            MissingField("Root.Name", "name", "Name"),
+            MissingField("Root.Container", "container", "Build this.", elicitable=False),
+        ]
+        with self.assertRaises(ToolError) as cm:
+            await elicit_and_rehydrate(
+                ctx, {"Root": {}}, missing,
+                find_missing_fn=lambda b: [],
+                tool_label="test",
+            )
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "STRUCTURAL_FIELDS_REQUIRED")
+        # Only the structural field is reported
+        self.assertEqual(len(payload["missing"]), 1)
+        self.assertEqual(payload["missing"][0]["flat_key"], "container")
+
+    async def test_elicitable_true_by_default(self) -> None:
+        """MissingField defaults to elicitable=True."""
+        mf = MissingField("A.B", "ab", "AB field")
+        self.assertTrue(mf.elicitable)
+
+
+# ---------------------------------------------------------------------------
+# Currency code normalization & validation tests
+# ---------------------------------------------------------------------------
+
+class CurrencyCodeNormalizationTests(unittest.TestCase):
+    def test_currency_code_uppercased(self) -> None:
+        result = normalize_elicited_values({"intl_forms_currency_code": "usd"})
+        self.assertEqual(result["intl_forms_currency_code"], "USD")
+
+    def test_currency_code_already_upper(self) -> None:
+        result = normalize_elicited_values({"intl_forms_currency_code": "EUR"})
+        self.assertEqual(result["intl_forms_currency_code"], "EUR")
+
+    def test_invoice_currency_code_uppercased(self) -> None:
+        result = normalize_elicited_values({"invoice_currency_code": "gbp"})
+        self.assertEqual(result["invoice_currency_code"], "GBP")
+
+
+class CurrencyCodeValidationTests(unittest.TestCase):
+    def test_valid_currency_code(self) -> None:
+        missing = [MissingField("A.CurrencyCode", "intl_forms_currency_code", "Currency")]
+        errors = validate_elicited_values({"intl_forms_currency_code": "USD"}, missing)
+        self.assertEqual(errors, [])
+
+    def test_invalid_currency_code_too_short(self) -> None:
+        missing = [MissingField("A.CurrencyCode", "intl_forms_currency_code", "Currency")]
+        errors = validate_elicited_values({"intl_forms_currency_code": "US"}, missing)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("3-letter currency code", errors[0])
+
+    def test_invalid_currency_code_numeric(self) -> None:
+        missing = [MissingField("A.CurrencyCode", "intl_forms_currency_code", "Currency")]
+        errors = validate_elicited_values({"intl_forms_currency_code": "123"}, missing)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("3-letter currency code", errors[0])
+
+    def test_invalid_currency_code_too_long(self) -> None:
+        missing = [MissingField("A.CurrencyCode", "intl_forms_currency_code", "Currency")]
+        errors = validate_elicited_values({"intl_forms_currency_code": "USDD"}, missing)
+        self.assertEqual(len(errors), 1)
 
 
 if __name__ == "__main__":

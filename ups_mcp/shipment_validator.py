@@ -10,6 +10,12 @@ import copy
 from typing import Any
 
 from .elicitation import FieldRule, MissingField, _missing_from_rule, _field_exists, _set_field
+from .constants import (
+    INTERNATIONAL_FORM_TYPES,
+    FORMS_REQUIRING_PRODUCTS,
+    FORMS_REQUIRING_CURRENCY,
+    REASON_FOR_EXPORT_VALUES,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +206,71 @@ INVOICE_LINE_TOTAL_RULES: list[FieldRule] = [
         constraints=(("maxLength", 11), ("pattern", r"^\d+(\.\d{1,2})?$")),
     ),
 ]
+
+
+# ---------------------------------------------------------------------------
+# International Forms field rules
+# ---------------------------------------------------------------------------
+
+INTL_FORMS_FORM_TYPE_RULE: FieldRule = FieldRule(
+    "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.FormType",
+    "intl_forms_form_type",
+    "International form type",
+    enum_values=tuple(INTERNATIONAL_FORM_TYPES.keys()),
+    enum_titles=tuple(INTERNATIONAL_FORM_TYPES.values()),
+)
+
+INTL_FORMS_CURRENCY_CODE_RULE: FieldRule = FieldRule(
+    "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.CurrencyCode",
+    "intl_forms_currency_code",
+    "Currency code for international forms (e.g. USD, EUR, GBP)",
+    constraints=(("maxLength", 3), ("pattern", "^[A-Z]{3}$")),
+)
+
+INTL_FORMS_REASON_FOR_EXPORT_RULE: FieldRule = FieldRule(
+    "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.ReasonForExport",
+    "intl_forms_reason_for_export",
+    "Reason for export",
+    enum_values=REASON_FOR_EXPORT_VALUES,
+    enum_titles=("Sale", "Gift", "Sample", "Return", "Repair", "Intercompany Data"),
+)
+
+INTL_FORMS_INVOICE_NUMBER_RULE: FieldRule = FieldRule(
+    "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.InvoiceNumber",
+    "intl_forms_invoice_number",
+    "Commercial invoice number",
+    constraints=(("maxLength", 35),),
+)
+
+INTL_FORMS_INVOICE_DATE_RULE: FieldRule = FieldRule(
+    "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.InvoiceDate",
+    "intl_forms_invoice_date",
+    "Invoice date (YYYYMMDD format)",
+    constraints=(("maxLength", 8), ("pattern", r"^\d{8}$")),
+)
+
+
+# ---------------------------------------------------------------------------
+# International Forms helpers
+# ---------------------------------------------------------------------------
+
+def _get_intl_forms(shipment: dict) -> dict | None:
+    """Extract InternationalForms from ShipmentServiceOptions, or None."""
+    sso = shipment.get("ShipmentServiceOptions")
+    if not isinstance(sso, dict):
+        return None
+    forms = sso.get("InternationalForms")
+    return forms if isinstance(forms, dict) else None
+
+
+def _get_form_types(intl_forms: dict) -> list[str]:
+    """Extract FormType codes as a normalized list of strings."""
+    ft = intl_forms.get("FormType")
+    if isinstance(ft, str):
+        return [ft]
+    if isinstance(ft, list):
+        return [str(f).strip() for f in ft if f]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -529,9 +600,8 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
     # InvoiceLineTotal prompts to avoid false-positive forward requirements
     # on attempted returns with bad payloads. UPS API will still reject the
     # malformed ReturnService itself.
-    # TODO: tighten to isinstance(dict) + Code check once InternationalForms
-    # adds stricter shape validation (PR 2). Current permissive guard is the
-    # safer baseline for forward/return classification.
+    # TODO: tighten to isinstance(dict) + Code check. Current permissive
+    # guard is the safer baseline for forward/return classification.
     is_return = shipment.get("ReturnService") is not None
     if (
         effective_origin == "US"
@@ -541,5 +611,109 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
         for rule in INVOICE_LINE_TOTAL_RULES:
             if not _field_exists(body, rule.dot_path):
                 missing.append(_missing_from_rule(rule))
+
+    # ----- InternationalForms validation -----
+
+    if is_international:
+        intl_forms = _get_intl_forms(shipment)
+
+        # InternationalForms presence check (with exemptions)
+        if (
+            not all_ups_letter
+            and not eu_to_eu_standard
+            and intl_forms is None
+        ):
+            missing.append(MissingField(
+                dot_path="ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms",
+                flat_key="intl_forms_required",
+                prompt=(
+                    "International shipments require InternationalForms. "
+                    "Add ShipmentServiceOptions.InternationalForms to request_body with at least: "
+                    "FormType (e.g. '01' for Invoice), CurrencyCode, ReasonForExport, "
+                    "and a Product array. Example structure: "
+                    '{"ShipmentServiceOptions": {"InternationalForms": {'
+                    '"FormType": "01", "CurrencyCode": "USD", '
+                    '"ReasonForExport": "SALE", "InvoiceNumber": "INV-001", '
+                    '"InvoiceDate": "20260216", '
+                    '"Product": [{"Description": "Electronics", '
+                    '"Unit": {"Number": "1", "Value": "100", '
+                    '"UnitOfMeasurement": {"Code": "PCS"}}, '
+                    '"CommodityCode": "8471.30", "OriginCountryCode": "US"}]}}}'
+                ),
+                elicitable=False,
+            ))
+
+        # Sub-field checks when InternationalForms IS present
+        if intl_forms is not None:
+            form_types = _get_form_types(intl_forms)
+
+            # FormType missing
+            if not form_types:
+                missing.append(_missing_from_rule(INTL_FORMS_FORM_TYPE_RULE))
+
+            # Product[] missing for forms that require it
+            if form_types and any(ft in FORMS_REQUIRING_PRODUCTS for ft in form_types):
+                products = intl_forms.get("Product")
+                has_products = (
+                    isinstance(products, list) and len(products) > 0
+                ) or isinstance(products, dict)
+                if not has_products:
+                    missing.append(MissingField(
+                        dot_path="ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Product",
+                        flat_key="intl_forms_product_required",
+                        prompt=(
+                            "This form type requires a Product array. Add Product to InternationalForms "
+                            "with at least: Description, Unit (Number, Value, UnitOfMeasurement.Code), "
+                            "OriginCountryCode. Example: "
+                            '"Product": [{"Description": "Electronics", '
+                            '"Unit": {"Number": "1", "Value": "100", '
+                            '"UnitOfMeasurement": {"Code": "PCS"}}, '
+                            '"CommodityCode": "8471.30", "OriginCountryCode": "US"}]'
+                        ),
+                        elicitable=False,
+                    ))
+
+            # CurrencyCode missing for forms that require it (01, 05)
+            if form_types and any(ft in FORMS_REQUIRING_CURRENCY for ft in form_types):
+                if not _field_exists(intl_forms, "CurrencyCode"):
+                    missing.append(_missing_from_rule(INTL_FORMS_CURRENCY_CODE_RULE))
+
+            # Invoice-specific fields (form type 01)
+            if "01" in form_types:
+                if not _field_exists(intl_forms, "ReasonForExport"):
+                    missing.append(_missing_from_rule(INTL_FORMS_REASON_FOR_EXPORT_RULE))
+                if not _field_exists(intl_forms, "InvoiceNumber"):
+                    missing.append(_missing_from_rule(INTL_FORMS_INVOICE_NUMBER_RULE))
+                # InvoiceDate not required for returns
+                if not is_return and not _field_exists(intl_forms, "InvoiceDate"):
+                    missing.append(_missing_from_rule(INTL_FORMS_INVOICE_DATE_RULE))
+
+    # ----- Duties & Taxes payment check -----
+
+    if is_international:
+        charges = (
+            body
+            .get("ShipmentRequest", {})
+            .get("Shipment", {})
+            .get("PaymentInformation", {})
+            .get("ShipmentCharge", [])
+        )
+        if isinstance(charges, list) and len(charges) >= 2:
+            second_charge = charges[1] if isinstance(charges[1], dict) else {}
+            if str(second_charge.get("Type", "")).strip() == "02":
+                has_payer = any(
+                    key in second_charge
+                    for key in ("BillShipper", "BillReceiver", "BillThirdParty")
+                )
+                if not has_payer:
+                    missing.append(MissingField(
+                        dot_path="ShipmentRequest.Shipment.PaymentInformation.ShipmentCharge[1]",
+                        flat_key="duties_payer_required",
+                        prompt=(
+                            "Duties and Taxes charge (ShipmentCharge[1] Type '02') requires a payer. "
+                            "Add BillShipper, BillReceiver, or BillThirdParty with AccountNumber."
+                        ),
+                        elicitable=False,
+                    ))
 
     return missing

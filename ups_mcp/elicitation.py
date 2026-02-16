@@ -32,6 +32,11 @@ class MissingField:
 
     Carries optional type metadata so that ``build_elicitation_schema`` can
     produce richer JSON Schema types (enums, numbers, defaults, constraints).
+
+    Set ``elicitable=False`` for structural fields (dicts/arrays) that cannot
+    be meaningfully collected via flat key→value forms.  These fields carry
+    guidance in their ``prompt`` and trigger an immediate error instead of
+    entering the elicitation form.
     """
     dot_path: str   # e.g. "ShipmentRequest.Shipment.Shipper.Name"
     flat_key: str   # e.g. "shipper_name"
@@ -41,6 +46,7 @@ class MissingField:
     enum_titles: tuple[str, ...] | None = None
     default: Any = None
     constraints: tuple[tuple[str, Any], ...] | None = None
+    elicitable: bool = True
 
 
 @dataclass(frozen=True)
@@ -255,6 +261,7 @@ def build_elicitation_schema(
 _COUNTRY_CODE_KEYS = re.compile(r".*_country_code$")
 _STATE_KEYS = re.compile(r".*_state$")
 _WEIGHT_UNIT_KEYS = re.compile(r".*_weight_unit$")
+_CURRENCY_CODE_KEYS = re.compile(r".*_currency_code$")
 
 
 def normalize_elicited_values(flat_data: dict[str, str]) -> dict[str, str]:
@@ -272,7 +279,10 @@ def normalize_elicited_values(flat_data: dict[str, str]) -> dict[str, str]:
         value = value.strip()
         if not value:
             continue
-        if _COUNTRY_CODE_KEYS.match(key) or _STATE_KEYS.match(key) or _WEIGHT_UNIT_KEYS.match(key):
+        if (
+            _COUNTRY_CODE_KEYS.match(key) or _STATE_KEYS.match(key)
+            or _WEIGHT_UNIT_KEYS.match(key) or _CURRENCY_CODE_KEYS.match(key)
+        ):
             value = value.upper()
         result[key] = value
     return result
@@ -284,6 +294,7 @@ def normalize_elicited_values(flat_data: dict[str, str]) -> dict[str, str]:
 
 _WEIGHT_VALUE_KEYS = re.compile(r".*_weight$")
 _TWO_ALPHA = re.compile(r"^[A-Z]{2}$")
+_THREE_ALPHA = re.compile(r"^[A-Z]{3}$")
 
 _POSTAL_CODE_US = re.compile(r"^\d{5}(-\d{4})?$")
 _POSTAL_CODE_CA = re.compile(r"^[A-Z]\d[A-Z] ?\d[A-Z]\d$")
@@ -331,6 +342,10 @@ def validate_elicited_values(
         # State code: 2-letter uppercase alpha
         if _STATE_KEYS.match(key) and not _TWO_ALPHA.match(value):
             errors.append(f"{label}: must be a 2-letter state/province code")
+
+        # Currency code: 3-letter uppercase alpha (ISO 4217)
+        if _CURRENCY_CODE_KEYS.match(key) and not _THREE_ALPHA.match(value):
+            errors.append(f"{label}: must be a 3-letter currency code (e.g. USD, EUR, GBP)")
 
         # Postal code: format depends on associated country code
         if _POSTAL_CODE_KEYS.match(key):
@@ -452,6 +467,23 @@ async def elicit_and_rehydrate(
 
     Returns the updated body dict on success.
     """
+    # Separate structural (non-elicitable) fields from scalar ones.
+    # Structural fields (dicts/arrays) can't be collected via flat forms;
+    # they carry guidance in their prompt and trigger an immediate error.
+    structural = [mf for mf in missing if not mf.elicitable]
+    elicitable = [mf for mf in missing if mf.elicitable]
+
+    if structural:
+        raise ToolError(json.dumps({
+            "code": "STRUCTURAL_FIELDS_REQUIRED",
+            "message": (
+                f"Missing {len(structural)} structural field(s) that must be "
+                "added directly to request_body (cannot be elicited via form)"
+            ),
+            "reason": "structural",
+            "missing": _missing_payload(structural),
+        }))
+
     if not check_form_elicitation(ctx):
         raise ToolError(json.dumps({
             "code": "ELICITATION_UNSUPPORTED",

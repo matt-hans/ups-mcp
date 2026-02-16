@@ -24,6 +24,7 @@ from .shipment_validator import (
     PAYMENT_CHARGE_TYPE_RULE as _SHIP_PAYMENT_CHARGE_TYPE_RULE,
     PAYMENT_PAYER_RULES as _SHIP_PAYMENT_PAYER_RULES,
     COUNTRY_CONDITIONAL_RULES,
+    EU_COUNTRIES,
     AmbiguousPayerError,
     _PAYER_OBJECT_KEYS,
     _normalize_list_field,
@@ -102,6 +103,62 @@ RATE_PAYMENT_PAYER_RULES: dict[str, FieldRule] = {
         "Billing account number",
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# Rating-specific international rules
+# ---------------------------------------------------------------------------
+
+RATE_INTL_DESCRIPTION_RULE: FieldRule = FieldRule(
+    "RateRequest.Shipment.Description", "shipment_description",
+    "Description of goods (required for international)",
+    constraints=(("maxLength", 50),),
+)
+
+RATE_INTL_SHIPPER_CONTACT_RULES: list[FieldRule] = [
+    FieldRule(
+        "RateRequest.Shipment.Shipper.AttentionName",
+        "shipper_attention_name",
+        "Shipper attention name",
+        constraints=(("maxLength", 35),),
+    ),
+    FieldRule(
+        "RateRequest.Shipment.Shipper.Phone.Number",
+        "shipper_phone",
+        "Shipper phone number",
+        constraints=(("maxLength", 15),),
+    ),
+]
+
+RATE_SHIP_TO_CONTACT_RULES: list[FieldRule] = [
+    FieldRule(
+        "RateRequest.Shipment.ShipTo.AttentionName",
+        "ship_to_attention_name",
+        "Recipient attention name",
+        constraints=(("maxLength", 35),),
+    ),
+    FieldRule(
+        "RateRequest.Shipment.ShipTo.Phone.Number",
+        "ship_to_phone",
+        "Recipient phone number",
+        constraints=(("maxLength", 15),),
+    ),
+]
+
+RATE_INVOICE_LINE_TOTAL_RULES: list[FieldRule] = [
+    FieldRule(
+        "RateRequest.Shipment.InvoiceLineTotal.CurrencyCode",
+        "invoice_currency_code",
+        "Invoice currency code (e.g. USD)",
+        constraints=(("maxLength", 3), ("pattern", "^[A-Z]{3}$")),
+    ),
+    FieldRule(
+        "RateRequest.Shipment.InvoiceLineTotal.MonetaryValue",
+        "invoice_monetary_value",
+        "Invoice total monetary value",
+        constraints=(("maxLength", 11), ("pattern", r"^\d+(\.\d{1,2})?$")),
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -335,5 +392,69 @@ def find_missing_rate_fields(
                         missing.append(_missing_from_rule(
                             rule, dot_path=full_dot_path, flat_key=flat_key, prompt=prompt,
                         ))
+
+    # ----- International validation -----
+
+    def _safe_country(obj: Any) -> str:
+        if not isinstance(obj, dict):
+            return ""
+        addr = obj.get("Address", {})
+        if not isinstance(addr, dict):
+            return ""
+        return str(addr.get("CountryCode", "")).strip().upper()
+
+    ship_from_country = _safe_country(shipment.get("ShipFrom"))
+    effective_origin = ship_from_country or _safe_country(shipment.get("Shipper"))
+    ship_to_country = _safe_country(shipment.get("ShipTo"))
+    _service = shipment.get("Service", {})
+    service_code = str(
+        (_service.get("Code", "")) if isinstance(_service, dict) else ""
+    ).strip()
+    is_international = (
+        effective_origin and ship_to_country
+        and effective_origin != ship_to_country
+    )
+
+    # Shipper contact rules (international only)
+    if is_international:
+        for rule in RATE_INTL_SHIPPER_CONTACT_RULES:
+            if not _field_exists(body, rule.dot_path):
+                missing.append(_missing_from_rule(rule))
+
+    # ShipTo contact rules (international OR service "14")
+    if is_international or service_code == "14":
+        for rule in RATE_SHIP_TO_CONTACT_RULES:
+            if not _field_exists(body, rule.dot_path):
+                missing.append(_missing_from_rule(rule))
+
+    # Shipment Description with UPS Letter and EU+Standard exemptions
+    if is_international:
+        packages = _get_rate_packages(body)
+        all_ups_letter = all(
+            str(pkg.get("Packaging", {}).get("Code", "")).strip() == "01"
+            for pkg in packages
+        ) if packages else False
+        eu_to_eu_standard = (
+            effective_origin in EU_COUNTRIES
+            and ship_to_country in EU_COUNTRIES
+            and service_code == "11"
+        )
+        if (
+            not all_ups_letter
+            and not eu_to_eu_standard
+            and not _field_exists(body, RATE_INTL_DESCRIPTION_RULE.dot_path)
+        ):
+            missing.append(_missing_from_rule(RATE_INTL_DESCRIPTION_RULE))
+
+    # InvoiceLineTotal for forward US→CA/PR
+    is_return = shipment.get("ReturnService") is not None
+    if (
+        effective_origin == "US"
+        and ship_to_country in ("CA", "PR")
+        and not is_return
+    ):
+        for rule in RATE_INVOICE_LINE_TOTAL_RULES:
+            if not _field_exists(body, rule.dot_path):
+                missing.append(_missing_from_rule(rule))
 
     return missing
