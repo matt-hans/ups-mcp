@@ -72,6 +72,21 @@ class FieldRule:
     constraints: tuple[tuple[str, Any], ...] | None = None  # min, max, pattern, maxLength, etc.
 
 
+@dataclass(frozen=True)
+class ArrayFieldRule:
+    """Declares an array of structured items elicitable via flat forms.
+
+    The system flattens each item's sub-fields into indexed scalar keys
+    (e.g. product_1_description, product_1_value) and reconstructs the
+    nested array during rehydration.
+    """
+    array_dot_path: str
+    item_prefix: str
+    item_rules: tuple[FieldRule, ...]
+    max_items: int = 10
+    default_count: int = 1
+
+
 # ---------------------------------------------------------------------------
 # Dict navigation helpers
 # ---------------------------------------------------------------------------
@@ -188,6 +203,87 @@ def _missing_from_rule(
         default=rule.default,
         constraints=rule.constraints,
     )
+
+
+# ---------------------------------------------------------------------------
+# Array flattening helpers
+# ---------------------------------------------------------------------------
+
+def _get_existing_array(data: dict, dot_path: str) -> list[dict]:
+    """Navigate to dot_path and return the existing array items.
+
+    Returns [] if the path doesn't exist or isn't a list/dict.
+    A single dict is normalized to [dict].
+    """
+    current: Any = data
+    for segment in dot_path.split("."):
+        key, idx = _parse_path_segment(segment)
+        if not isinstance(current, dict) or key not in current:
+            return []
+        current = current[key]
+        if idx is not None:
+            if not isinstance(current, list) or len(current) <= idx:
+                return []
+            current = current[idx]
+    if isinstance(current, dict):
+        return [current]
+    if isinstance(current, list):
+        return [item if isinstance(item, dict) else {} for item in current]
+    return []
+
+
+def expand_array_fields(
+    rule: ArrayFieldRule,
+    data: dict,
+    start_count: int | None = None,
+) -> list[MissingField]:
+    """Expand an ArrayFieldRule into indexed MissingFields for each item.
+
+    Inspects existing data at array_dot_path to determine item count.
+    For each item, checks which sub-fields are missing and generates
+    indexed MissingFields with flat keys like product_1_description.
+    """
+    existing = _get_existing_array(data, rule.array_dot_path)
+    count = start_count if start_count is not None else max(len(existing), rule.default_count)
+    count = min(count, rule.max_items)
+
+    missing: list[MissingField] = []
+    for i in range(count):
+        n = i + 1
+        item_data = existing[i] if i < len(existing) else {}
+        for sub_rule in rule.item_rules:
+            if not _field_exists(item_data, sub_rule.dot_path):
+                missing.append(_missing_from_rule(
+                    sub_rule,
+                    dot_path=f"{rule.array_dot_path}[{i}].{sub_rule.dot_path}",
+                    flat_key=f"{rule.item_prefix}_{n}_{sub_rule.flat_key}",
+                    prompt=f"Item {n}: {sub_rule.prompt}",
+                ))
+    return missing
+
+
+def reconstruct_array(
+    flat_data: dict[str, str],
+    rule: ArrayFieldRule,
+    count: int,
+) -> list[dict]:
+    """Reconstruct a nested array from flat indexed elicitation values.
+
+    Matches keys like product_1_description, product_1_value and builds
+    nested dicts using _set_field for each item's sub-rules.
+    """
+    items: list[dict] = []
+    for i in range(count):
+        n = i + 1
+        item: dict = {}
+        for sub_rule in rule.item_rules:
+            flat_key = f"{rule.item_prefix}_{n}_{sub_rule.flat_key}"
+            value = flat_data.get(flat_key)
+            if value is not None and value != "":
+                _set_field(item, sub_rule.dot_path, value)
+        if item:
+            items.append(item)
+    return items
 
 
 # ---------------------------------------------------------------------------

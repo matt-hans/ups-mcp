@@ -713,5 +713,109 @@ class PydanticConstraintTests(unittest.TestCase):
         self.assertTrue(prop["strict"])
 
 
+from ups_mcp.elicitation import ArrayFieldRule, expand_array_fields, reconstruct_array
+
+
+class ArrayFieldRuleTests(unittest.TestCase):
+    """Tests for the ArrayFieldRule data structure and helper functions."""
+
+    def _make_product_rule(self) -> ArrayFieldRule:
+        return ArrayFieldRule(
+            array_dot_path="Root.Items.Product",
+            item_prefix="product",
+            item_rules=(
+                FieldRule("Description", "description", "Product description"),
+                FieldRule("Value", "value", "Unit value", type_hint=float),
+            ),
+            max_items=5,
+            default_count=1,
+        )
+
+    def test_expand_empty_data_generates_default_count_fields(self) -> None:
+        rule = self._make_product_rule()
+        missing = expand_array_fields(rule, {"Root": {"Items": {}}})
+        # default_count=1, 2 rules per item = 2 fields
+        self.assertEqual(len(missing), 2)
+        self.assertEqual(missing[0].flat_key, "product_1_description")
+        self.assertEqual(missing[0].dot_path, "Root.Items.Product[0].Description")
+        self.assertEqual(missing[0].prompt, "Item 1: Product description")
+        self.assertEqual(missing[1].flat_key, "product_1_value")
+
+    def test_expand_existing_items_generates_per_item_fields(self) -> None:
+        rule = self._make_product_rule()
+        data = {"Root": {"Items": {"Product": [
+            {"Description": "Widget"},  # Value missing
+            {},                         # Both missing
+        ]}}}
+        missing = expand_array_fields(rule, data)
+        flat_keys = {mf.flat_key for mf in missing}
+        # Item 1: only value missing (description exists)
+        self.assertNotIn("product_1_description", flat_keys)
+        self.assertIn("product_1_value", flat_keys)
+        # Item 2: both missing
+        self.assertIn("product_2_description", flat_keys)
+        self.assertIn("product_2_value", flat_keys)
+
+    def test_expand_respects_max_items(self) -> None:
+        rule = self._make_product_rule()  # max_items=5
+        data = {"Root": {"Items": {"Product": [{} for _ in range(10)]}}}
+        missing = expand_array_fields(rule, data)
+        # Should cap at 5 items * 2 rules = 10 max fields
+        item_indices = {int(mf.flat_key.split("_")[1]) for mf in missing}
+        self.assertTrue(max(item_indices) <= 5)
+
+    def test_expand_with_explicit_count(self) -> None:
+        rule = self._make_product_rule()
+        missing = expand_array_fields(rule, {"Root": {"Items": {}}}, start_count=3)
+        item_indices = {int(mf.flat_key.split("_")[1]) for mf in missing}
+        self.assertEqual(item_indices, {1, 2, 3})
+
+    def test_expand_single_dict_product_treated_as_list(self) -> None:
+        rule = self._make_product_rule()
+        data = {"Root": {"Items": {"Product": {"Description": "Widget"}}}}
+        missing = expand_array_fields(rule, data)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("product_1_description", flat_keys)
+        self.assertIn("product_1_value", flat_keys)
+
+    def test_reconstruct_builds_nested_array(self) -> None:
+        rule = self._make_product_rule()
+        flat_data = {
+            "product_1_description": "Widget",
+            "product_1_value": "100.00",
+            "product_2_description": "Gadget",
+            "product_2_value": "50.00",
+        }
+        items = reconstruct_array(flat_data, rule, count=2)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["Description"], "Widget")
+        self.assertEqual(items[0]["Value"], "100.00")
+        self.assertEqual(items[1]["Description"], "Gadget")
+
+    def test_reconstruct_skips_empty_items(self) -> None:
+        rule = self._make_product_rule()
+        flat_data = {
+            "product_1_description": "Widget",
+            "product_1_value": "100.00",
+            # product_2 has no data
+        }
+        items = reconstruct_array(flat_data, rule, count=2)
+        self.assertEqual(len(items), 1)  # only non-empty items
+
+    def test_reconstruct_handles_nested_dot_paths(self) -> None:
+        rule = ArrayFieldRule(
+            array_dot_path="Root.Product",
+            item_prefix="prod",
+            item_rules=(
+                FieldRule("Unit.Value", "unit_value", "Value"),
+                FieldRule("Unit.Code", "unit_code", "Code"),
+            ),
+        )
+        flat_data = {"prod_1_unit_value": "100", "prod_1_unit_code": "PCS"}
+        items = reconstruct_array(flat_data, rule, count=1)
+        self.assertEqual(items[0]["Unit"]["Value"], "100")
+        self.assertEqual(items[0]["Unit"]["Code"], "PCS")
+
+
 if __name__ == "__main__":
     unittest.main()
