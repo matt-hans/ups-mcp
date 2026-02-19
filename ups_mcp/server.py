@@ -344,6 +344,7 @@ async def create_shipment(
         find_missing_fields,
         canonicalize_body,
         AmbiguousPayerError,
+        PRODUCT_ARRAY_RULE,
     )
     from .elicitation import elicit_and_rehydrate
 
@@ -392,6 +393,7 @@ async def create_shipment(
         find_missing_fn=find_missing_fields,
         tool_label="shipment creation",
         canonicalize_fn=canonicalize_body,
+        array_rules=[PRODUCT_ARRAY_RULE],
     )
     return _send_to_ups(merged_body)
 
