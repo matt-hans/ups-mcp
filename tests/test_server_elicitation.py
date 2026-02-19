@@ -134,7 +134,8 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(str(cm.exception))
         self.assertEqual(payload["code"], "ELICITATION_CANCELLED")
 
-    async def test_still_missing_after_accept_raises_incomplete(self) -> None:
+    async def test_still_missing_after_accept_exhausts_retries(self) -> None:
+        """Persistently missing fields after accept exhaust retries."""
         body = make_complete_body()
         del body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"]
         del body["ShipmentRequest"]["Shipment"]["ShipTo"]["Name"]
@@ -146,7 +147,7 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ToolError) as cm:
             await server.create_shipment(request_body=body, ctx=ctx)
         payload = json.loads(str(cm.exception))
-        self.assertEqual(payload["code"], "INCOMPLETE_SHIPMENT")
+        self.assertEqual(payload["code"], "ELICITATION_MAX_RETRIES")
 
     async def test_malformed_body_raises_structured_tool_error(self) -> None:
         """Structural TypeError during apply_defaults wraps as MALFORMED_REQUEST."""
@@ -259,8 +260,8 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("flat_key", first)
         self.assertIn("prompt", first)
 
-    async def test_validation_errors_raise_structured_tool_error(self) -> None:
-        """Invalid elicited values (e.g. non-numeric weight) raise ELICITATION_INVALID_RESPONSE."""
+    async def test_validation_errors_exhaust_retries(self) -> None:
+        """Persistent invalid elicited values exhaust retries and raise ELICITATION_MAX_RETRIES."""
         body = make_complete_body()
         del body["ShipmentRequest"]["Shipment"]["Package"][0]["PackageWeight"]["Weight"]
 
@@ -271,8 +272,7 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ToolError) as cm:
             await server.create_shipment(request_body=body, ctx=ctx)
         payload = json.loads(str(cm.exception))
-        self.assertEqual(payload["code"], "ELICITATION_INVALID_RESPONSE")
-        self.assertEqual(payload["reason"], "validation_errors")
+        self.assertEqual(payload["code"], "ELICITATION_MAX_RETRIES")
 
     async def test_elicitation_transport_failure_raises_structured_error(self) -> None:
         """If ctx.elicit() raises an unexpected exception, wrap as ELICITATION_FAILED."""

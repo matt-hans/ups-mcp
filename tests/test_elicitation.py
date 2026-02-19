@@ -233,8 +233,8 @@ class ElicitAndRehydrateTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(str(cm.exception), "original error")
 
-    async def test_still_missing_raises_incomplete(self) -> None:
-        """If fields are still missing after rehydration, raise INCOMPLETE_SHIPMENT."""
+    async def test_still_missing_exhausts_retries(self) -> None:
+        """Persistently missing fields after rehydration exhaust retries."""
         accepted = _make_accepted({"name": "Test"})
         ctx = _make_form_ctx(elicit_result=accepted)
         missing = _simple_missing()
@@ -249,11 +249,10 @@ class ElicitAndRehydrateTests(unittest.IsolatedAsyncioTestCase):
                 tool_label="test",
             )
         payload = json.loads(str(cm.exception))
-        self.assertEqual(payload["code"], "INCOMPLETE_SHIPMENT")
+        self.assertEqual(payload["code"], "ELICITATION_MAX_RETRIES")
 
-    async def test_validation_errors_raise_invalid_response(self) -> None:
-        """Invalid elicited values raise ELICITATION_INVALID_RESPONSE."""
-        # Use a weight field with non-numeric value
+    async def test_validation_errors_exhaust_retries(self) -> None:
+        """Persistent invalid elicited values exhaust retries."""
         missing = [MissingField("Root.Weight", "package_1_weight", "Package weight")]
         accepted = _make_accepted({"package_1_weight": "not_a_number"})
         ctx = _make_form_ctx(elicit_result=accepted)
@@ -265,8 +264,7 @@ class ElicitAndRehydrateTests(unittest.IsolatedAsyncioTestCase):
                 tool_label="test",
             )
         payload = json.loads(str(cm.exception))
-        self.assertEqual(payload["code"], "ELICITATION_INVALID_RESPONSE")
-        self.assertEqual(payload["reason"], "validation_errors")
+        self.assertEqual(payload["code"], "ELICITATION_MAX_RETRIES")
 
     async def test_rehydration_error_raises_invalid_response(self) -> None:
         """Structural conflict during rehydration raises ELICITATION_INVALID_RESPONSE."""

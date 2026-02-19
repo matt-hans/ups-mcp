@@ -459,23 +459,24 @@ async def elicit_and_rehydrate(
     find_missing_fn: Callable[[dict], list[MissingField]],
     tool_label: str,
     canonicalize_fn: Callable[[dict], dict] | None = None,
+    max_retries: int = 3,
 ) -> dict:
-    """Centralized elicitation flow: check support, elicit, validate, rehydrate.
+    """Centralized elicitation flow with retry on validation errors.
 
-    1. Check form elicitation support -> raise ELICITATION_UNSUPPORTED if not
-    2. Build schema -> call ctx.elicit() -> handle transport errors
-    3. On accept: normalize -> validate -> rehydrate -> re-run find_missing_fn
-       -> raise if still missing
-    4. On decline/cancel: raise appropriate ToolError
-
-    The ``canonicalize_fn`` is called before rehydration (for body normalization).
-    Passed as ``None`` for tools that don't need it.
+    1. Separate structural (non-elicitable) fields -> raise STRUCTURAL_FIELDS_REQUIRED
+    2. Check form elicitation support -> raise ELICITATION_UNSUPPORTED
+    3. Loop up to max_retries:
+       a. Build schema -> call ctx.elicit()
+       b. On accept: normalize -> validate -> if errors, retry with error context
+       c. On valid: rehydrate -> re-run find_missing_fn
+          -> if still missing (elicitable), retry with remaining fields
+          -> if still missing (structural), raise immediately
+          -> if complete, return updated body
+       d. On decline/cancel: raise immediately
+    4. After max_retries exhausted: raise ELICITATION_MAX_RETRIES
 
     Returns the updated body dict on success.
     """
-    # Separate structural (non-elicitable) fields from scalar ones.
-    # Structural fields (dicts/arrays) can't be collected via flat forms;
-    # they carry guidance in their prompt and trigger an immediate error.
     structural = [mf for mf in missing if not mf.elicitable]
     elicitable = [mf for mf in missing if mf.elicitable]
 
@@ -493,70 +494,106 @@ async def elicit_and_rehydrate(
     if not check_form_elicitation(ctx):
         raise ToolError(json.dumps({
             "code": "ELICITATION_UNSUPPORTED",
-            "message": f"Missing {len(elicitable)} required field(s) and client does not support form elicitation",
+            "message": (
+                f"Missing {len(elicitable)} required field(s) and client "
+                "does not support form elicitation"
+            ),
             "reason": "unsupported",
             "missing": _missing_payload(elicitable),
         }))
 
     schema = build_elicitation_schema(elicitable)
-    try:
-        result = await ctx.elicit(
-            message=f"Missing {len(elicitable)} required field(s) for {tool_label}.",
-            schema=schema,
-        )
-    except ToolError:
-        raise  # re-raise ToolErrors as-is
-    except Exception as exc:
-        raise ToolError(json.dumps({
-            "code": "ELICITATION_FAILED",
-            "message": f"Elicitation request failed: {exc}",
-            "reason": "transport_error",
-            "missing": _missing_payload(elicitable),
-        }))
+    base_message = f"Missing {len(elicitable)} required field(s) for {tool_label}."
+    current_message = base_message
 
-    if isinstance(result, AcceptedElicitation):
-        normalized = normalize_elicited_values(result.data.model_dump())
-        validation_errors = validate_elicited_values(normalized, elicitable)
-        if validation_errors:
-            raise ToolError(json.dumps({
-                "code": "ELICITATION_INVALID_RESPONSE",
-                "message": "; ".join(validation_errors),
-                "reason": "validation_errors",
-                "missing": _missing_payload(elicitable),
-            }))
+    for attempt in range(max_retries):
         try:
-            if canonicalize_fn is not None:
-                body = canonicalize_fn(body)
-            updated = rehydrate(body, normalized, elicitable)
-        except RehydrationError as exc:
+            result = await ctx.elicit(message=current_message, schema=schema)
+        except ToolError:
+            raise
+        except Exception as exc:
             raise ToolError(json.dumps({
-                "code": "ELICITATION_INVALID_RESPONSE",
-                "message": f"Elicited data conflicts with request structure: {exc}",
-                "reason": "rehydration_error",
+                "code": "ELICITATION_FAILED",
+                "message": f"Elicitation request failed: {exc}",
+                "reason": "transport_error",
                 "missing": _missing_payload(elicitable),
             }))
-        still_missing = find_missing_fn(updated)
-        if still_missing:
+
+        if isinstance(result, AcceptedElicitation):
+            normalized = normalize_elicited_values(result.data.model_dump())
+            validation_errors = validate_elicited_values(normalized, elicitable)
+
+            if validation_errors:
+                error_text = "\n".join(f"- {err}" for err in validation_errors)
+                current_message = (
+                    f"Please correct the following:\n{error_text}"
+                    f"\n\n{base_message}"
+                )
+                continue
+
+            try:
+                if canonicalize_fn is not None:
+                    body = canonicalize_fn(body)
+                updated = rehydrate(body, normalized, elicitable)
+            except RehydrationError as exc:
+                raise ToolError(json.dumps({
+                    "code": "ELICITATION_INVALID_RESPONSE",
+                    "message": f"Elicited data conflicts with request structure: {exc}",
+                    "reason": "rehydration_error",
+                    "missing": _missing_payload(elicitable),
+                }))
+
+            still_missing = find_missing_fn(updated)
+            if not still_missing:
+                return updated
+
+            still_structural = [mf for mf in still_missing if not mf.elicitable]
+            still_elicitable = [mf for mf in still_missing if mf.elicitable]
+
+            if still_structural:
+                raise ToolError(json.dumps({
+                    "code": "STRUCTURAL_FIELDS_REQUIRED",
+                    "message": (
+                        f"Missing {len(still_structural)} structural field(s) "
+                        "that must be added directly to request_body"
+                    ),
+                    "reason": "structural",
+                    "missing": _missing_payload(still_structural),
+                }))
+
+            elicitable = still_elicitable
+            schema = build_elicitation_schema(elicitable)
+            body = updated
+            error_text = "\n".join(f"- {mf.prompt}" for mf in still_elicitable)
+            base_message = (
+                f"Missing {len(still_elicitable)} required field(s) for {tool_label}."
+            )
+            current_message = (
+                f"Still missing after elicitation:\n{error_text}\n\n{base_message}"
+            )
+            continue
+
+        elif isinstance(result, DeclinedElicitation):
             raise ToolError(json.dumps({
-                "code": "INCOMPLETE_SHIPMENT",
-                "message": "Still missing required fields after elicitation",
-                "reason": "still_missing",
-                "missing": _missing_payload(still_missing),
+                "code": "ELICITATION_DECLINED",
+                "message": f"User declined to provide missing {tool_label} fields",
+                "reason": "declined",
+                "missing": _missing_payload(elicitable),
             }))
-        return updated
 
-    elif isinstance(result, DeclinedElicitation):
-        raise ToolError(json.dumps({
-            "code": "ELICITATION_DECLINED",
-            "message": f"User declined to provide missing {tool_label} fields",
-            "reason": "declined",
-            "missing": _missing_payload(elicitable),
-        }))
+        else:  # CancelledElicitation
+            raise ToolError(json.dumps({
+                "code": "ELICITATION_CANCELLED",
+                "message": f"User cancelled {tool_label} field elicitation",
+                "reason": "cancelled",
+                "missing": _missing_payload(elicitable),
+            }))
 
-    else:  # CancelledElicitation
-        raise ToolError(json.dumps({
-            "code": "ELICITATION_CANCELLED",
-            "message": f"User cancelled {tool_label} field elicitation",
-            "reason": "cancelled",
-            "missing": _missing_payload(elicitable),
-        }))
+    raise ToolError(json.dumps({
+        "code": "ELICITATION_MAX_RETRIES",
+        "message": (
+            f"Maximum elicitation retries ({max_retries}) exceeded for {tool_label}"
+        ),
+        "reason": "max_retries",
+        "missing": _missing_payload(elicitable),
+    }))

@@ -158,7 +158,8 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(str(cm.exception))
         self.assertEqual(payload["code"], "ELICITATION_CANCELLED")
 
-    async def test_still_missing_after_accept_raises_incomplete(self) -> None:
+    async def test_still_missing_after_accept_exhausts_retries(self) -> None:
+        """Persistently missing fields after accept exhaust retries."""
         body = make_complete_rate_body()
         del body["RateRequest"]["Shipment"]["Shipper"]["Name"]
         del body["RateRequest"]["Shipment"]["ShipTo"]["Name"]
@@ -172,7 +173,7 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
                 requestoption="Rate", request_body=body, ctx=ctx,
             )
         payload = json.loads(str(cm.exception))
-        self.assertEqual(payload["code"], "INCOMPLETE_SHIPMENT")
+        self.assertEqual(payload["code"], "ELICITATION_MAX_RETRIES")
 
     # --- Error cases ---
 
@@ -201,7 +202,8 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["code"], "MALFORMED_REQUEST")
         self.assertEqual(payload["reason"], "ambiguous_payer")
 
-    async def test_validation_errors_raise_structured_tool_error(self) -> None:
+    async def test_validation_errors_exhaust_retries(self) -> None:
+        """Persistent invalid elicited values exhaust retries."""
         body = make_complete_rate_body()
         del body["RateRequest"]["Shipment"]["Package"][0]["PackageWeight"]["Weight"]
 
@@ -214,8 +216,7 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
                 requestoption="Rate", request_body=body, ctx=ctx,
             )
         payload = json.loads(str(cm.exception))
-        self.assertEqual(payload["code"], "ELICITATION_INVALID_RESPONSE")
-        self.assertEqual(payload["reason"], "validation_errors")
+        self.assertEqual(payload["code"], "ELICITATION_MAX_RETRIES")
 
     async def test_elicitation_transport_failure_raises_structured_error(self) -> None:
         body = make_complete_rate_body()
