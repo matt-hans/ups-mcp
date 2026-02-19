@@ -1529,7 +1529,7 @@ class FindMissingFieldsInternationalFormsTests(unittest.TestCase):
         flat_keys = {mf.flat_key for mf in missing}
         self.assertNotIn("intl_forms_required", flat_keys)
         self.assertNotIn("intl_forms_form_type", flat_keys)
-        self.assertNotIn("intl_forms_product_required", flat_keys)
+        self.assertNotIn("product_1_description", flat_keys)
         self.assertNotIn("intl_forms_currency_code", flat_keys)
         self.assertNotIn("intl_forms_reason_for_export", flat_keys)
         self.assertNotIn("intl_forms_invoice_number", flat_keys)
@@ -1556,30 +1556,31 @@ class FindMissingFieldsInternationalFormsTests(unittest.TestCase):
 
     # --- Product[] validation ---
 
-    def test_product_missing_for_invoice_flagged(self) -> None:
-        """FormType '01' without Product → intl_forms_product_required flagged."""
+    def test_product_missing_for_invoice_generates_indexed_fields(self) -> None:
+        """FormType '01' without Product → product_1_* indexed fields generated."""
         body = make_complete_body(shipper_country="US", ship_to_country="GB", include_international=True)
         del body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"]["InternationalForms"]["Product"]
         missing = find_missing_fields(body)
         flat_keys = {mf.flat_key for mf in missing}
-        self.assertIn("intl_forms_product_required", flat_keys)
+        self.assertIn("product_1_description", flat_keys)
+        self.assertIn("product_1_value", flat_keys)
 
     def test_product_present_not_flagged(self) -> None:
-        """FormType '01' with Product → intl_forms_product_required NOT flagged."""
+        """FormType '01' with complete Product → no product_1_* fields generated."""
         body = make_complete_body(shipper_country="US", ship_to_country="GB", include_international=True)
         missing = find_missing_fields(body)
         flat_keys = {mf.flat_key for mf in missing}
-        self.assertNotIn("intl_forms_product_required", flat_keys)
+        self.assertNotIn("product_1_description", flat_keys)
 
     def test_product_not_required_for_cn22(self) -> None:
-        """FormType '09' (CN22) without Product → intl_forms_product_required NOT flagged."""
+        """FormType '09' (CN22) without Product → no product_1_* fields generated."""
         body = make_complete_body(shipper_country="US", ship_to_country="GB")
         body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"] = {
             "InternationalForms": {"FormType": "09"}
         }
         missing = find_missing_fields(body)
         flat_keys = {mf.flat_key for mf in missing}
-        self.assertNotIn("intl_forms_product_required", flat_keys)
+        self.assertNotIn("product_1_description", flat_keys)
 
     # --- CurrencyCode validation ---
 
@@ -1772,6 +1773,128 @@ class ReturnServiceCheckTests(unittest.TestCase):
         missing = find_missing_fields(body)
         flat_keys = {mf.flat_key for mf in missing}
         self.assertIn("invoice_currency_code", flat_keys)
+
+
+from ups_mcp.shipment_validator import PRODUCT_ITEM_RULES, PRODUCT_ARRAY_RULE
+from ups_mcp.elicitation import ArrayFieldRule
+
+
+class ProductArrayRuleTests(unittest.TestCase):
+    """Product array should generate elicitable indexed fields instead of
+    a structural STRUCTURAL_FIELDS_REQUIRED error."""
+
+    def test_product_array_rule_exists(self) -> None:
+        self.assertIsInstance(PRODUCT_ARRAY_RULE, ArrayFieldRule)
+        self.assertEqual(PRODUCT_ARRAY_RULE.item_prefix, "product")
+
+    def test_product_item_rules_has_required_fields(self) -> None:
+        flat_keys = {r.flat_key for r in PRODUCT_ITEM_RULES}
+        self.assertIn("description", flat_keys)
+        self.assertIn("quantity", flat_keys)
+        self.assertIn("value", flat_keys)
+        self.assertIn("unit_code", flat_keys)
+        self.assertIn("origin_country", flat_keys)
+
+    def test_international_missing_product_generates_indexed_fields(self) -> None:
+        """When InternationalForms has no Product, generate product_1_* fields."""
+        body = {
+            "ShipmentRequest": {
+                "Request": {"RequestOption": "nonvalidate"},
+                "Shipment": {
+                    "Shipper": {
+                        "Name": "Test", "ShipperNumber": "129D9Y",
+                        "Address": {"AddressLine": ["123 Main"], "City": "NYC",
+                                    "StateProvinceCode": "NY", "PostalCode": "10001",
+                                    "CountryCode": "US"},
+                        "AttentionName": "Attn", "Phone": {"Number": "1234567890"},
+                    },
+                    "ShipTo": {
+                        "Name": "Recip",
+                        "Address": {"AddressLine": ["456 Elm"], "City": "London",
+                                    "CountryCode": "GB"},
+                        "AttentionName": "Recip", "Phone": {"Number": "4412345678"},
+                    },
+                    "Service": {"Code": "07"},
+                    "Description": "Test goods",
+                    "Package": [{"Packaging": {"Code": "02"},
+                                 "PackageWeight": {"UnitOfMeasurement": {"Code": "LBS"},
+                                                   "Weight": "5"}}],
+                    "PaymentInformation": {
+                        "ShipmentCharge": [{"Type": "01",
+                                            "BillShipper": {"AccountNumber": "129D9Y"}}],
+                    },
+                    "ShipmentServiceOptions": {
+                        "InternationalForms": {
+                            "FormType": "01", "CurrencyCode": "USD",
+                            "ReasonForExport": "SALE", "InvoiceNumber": "INV-1",
+                            "InvoiceDate": "20260219",
+                            # Product is missing!
+                        },
+                    },
+                },
+            },
+        }
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        # Should have product_1_* indexed fields, NOT intl_forms_product_required
+        self.assertNotIn("intl_forms_product_required", flat_keys)
+        self.assertIn("product_1_description", flat_keys)
+        self.assertIn("product_1_value", flat_keys)
+        self.assertIn("product_1_origin_country", flat_keys)
+        # All should be elicitable
+        product_fields = [mf for mf in missing if mf.flat_key.startswith("product_")]
+        for mf in product_fields:
+            self.assertTrue(mf.elicitable, f"{mf.flat_key} should be elicitable")
+
+    def test_existing_product_only_elicits_missing_subfields(self) -> None:
+        """When Product[0] has Description, only elicit the missing sub-fields."""
+        body = {
+            "ShipmentRequest": {
+                "Request": {"RequestOption": "nonvalidate"},
+                "Shipment": {
+                    "Shipper": {
+                        "Name": "Test", "ShipperNumber": "129D9Y",
+                        "Address": {"AddressLine": ["123 Main"], "City": "NYC",
+                                    "StateProvinceCode": "NY", "PostalCode": "10001",
+                                    "CountryCode": "US"},
+                        "AttentionName": "Attn", "Phone": {"Number": "1234567890"},
+                    },
+                    "ShipTo": {
+                        "Name": "Recip",
+                        "Address": {"AddressLine": ["456 Elm"], "City": "London",
+                                    "CountryCode": "GB"},
+                        "AttentionName": "Recip", "Phone": {"Number": "4412345678"},
+                    },
+                    "Service": {"Code": "07"},
+                    "Description": "Test goods",
+                    "Package": [{"Packaging": {"Code": "02"},
+                                 "PackageWeight": {"UnitOfMeasurement": {"Code": "LBS"},
+                                                   "Weight": "5"}}],
+                    "PaymentInformation": {
+                        "ShipmentCharge": [{"Type": "01",
+                                            "BillShipper": {"AccountNumber": "129D9Y"}}],
+                    },
+                    "ShipmentServiceOptions": {
+                        "InternationalForms": {
+                            "FormType": "01", "CurrencyCode": "USD",
+                            "ReasonForExport": "SALE", "InvoiceNumber": "INV-1",
+                            "InvoiceDate": "20260219",
+                            "Product": [{"Description": "Widget",
+                                         "OriginCountryCode": "US"}],
+                        },
+                    },
+                },
+            },
+        }
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        # Description and OriginCountryCode are present — should NOT be missing
+        self.assertNotIn("product_1_description", flat_keys)
+        self.assertNotIn("product_1_origin_country", flat_keys)
+        # Unit.Number, Unit.Value, Unit.UnitOfMeasurement.Code ARE missing
+        self.assertIn("product_1_quantity", flat_keys)
+        self.assertIn("product_1_value", flat_keys)
+        self.assertIn("product_1_unit_code", flat_keys)
 
 
 if __name__ == "__main__":

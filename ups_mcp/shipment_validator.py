@@ -9,7 +9,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from .elicitation import FieldRule, MissingField, _missing_from_rule, _field_exists, _set_field
+from .elicitation import FieldRule, MissingField, _missing_from_rule, _field_exists, _set_field, ArrayFieldRule, expand_array_fields
 from .constants import (
     INTERNATIONAL_FORM_TYPES,
     FORMS_REQUIRING_PRODUCTS,
@@ -247,6 +247,31 @@ INTL_FORMS_INVOICE_DATE_RULE: FieldRule = FieldRule(
     "intl_forms_invoice_date",
     "Invoice date (YYYYMMDD format)",
     constraints=(("maxLength", 8), ("pattern", r"^\d{8}$")),
+)
+
+# ---------------------------------------------------------------------------
+# International Forms — Product array rules (elicitable via flat forms)
+# ---------------------------------------------------------------------------
+
+PRODUCT_ITEM_RULES: tuple[FieldRule, ...] = (
+    FieldRule("Description", "description", "Product description",
+              constraints=(("maxLength", 35),)),
+    FieldRule("Unit.Number", "quantity", "Quantity",
+              type_hint=int, constraints=(("gt", 0),)),
+    FieldRule("Unit.Value", "value", "Unit value ($)",
+              type_hint=float, constraints=(("gt", 0),)),
+    FieldRule("Unit.UnitOfMeasurement.Code", "unit_code", "Unit of measure",
+              enum_values=("PCS", "BOX", "DZ", "EA", "KG", "LB", "PR"),
+              enum_titles=("Pieces", "Box", "Dozen", "Each", "Kilogram", "Pound", "Pair"),
+              default="PCS"),
+    FieldRule("OriginCountryCode", "origin_country", "Country of origin",
+              constraints=(("maxLength", 2), ("pattern", "^[A-Z]{2}$"))),
+)
+
+PRODUCT_ARRAY_RULE: ArrayFieldRule = ArrayFieldRule(
+    array_dot_path="ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Product",
+    item_prefix="product",
+    item_rules=PRODUCT_ITEM_RULES,
 )
 
 
@@ -643,27 +668,9 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
             if not form_types:
                 missing.append(_missing_from_rule(INTL_FORMS_FORM_TYPE_RULE))
 
-            # Product[] missing for forms that require it
+            # Product array: expand into indexed elicitable fields
             if form_types and any(ft in FORMS_REQUIRING_PRODUCTS for ft in form_types):
-                products = intl_forms.get("Product")
-                has_products = (
-                    isinstance(products, list) and len(products) > 0
-                ) or isinstance(products, dict)
-                if not has_products:
-                    missing.append(MissingField(
-                        dot_path="ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Product",
-                        flat_key="intl_forms_product_required",
-                        prompt=(
-                            "This form type requires a Product array. Add Product to InternationalForms "
-                            "with at least: Description, Unit (Number, Value, UnitOfMeasurement.Code), "
-                            "OriginCountryCode. Example: "
-                            '"Product": [{"Description": "Electronics", '
-                            '"Unit": {"Number": "1", "Value": "100", '
-                            '"UnitOfMeasurement": {"Code": "PCS"}}, '
-                            '"CommodityCode": "8471.30", "OriginCountryCode": "US"}]'
-                        ),
-                        elicitable=False,
-                    ))
+                missing.extend(expand_array_fields(PRODUCT_ARRAY_RULE, body))
 
             # CurrencyCode missing for forms that require it (01, 05)
             if form_types and any(ft in FORMS_REQUIRING_CURRENCY for ft in form_types):
