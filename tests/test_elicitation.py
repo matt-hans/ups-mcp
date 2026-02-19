@@ -500,6 +500,37 @@ class CurrencyCodeValidationTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
 
 
+class WeightValidationEdgeCaseTests(unittest.TestCase):
+    def test_infinity_weight_rejected(self) -> None:
+        missing = [MissingField("Root.Weight", "package_1_weight", "Package weight")]
+        errors = validate_elicited_values({"package_1_weight": "inf"}, missing)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("positive, finite", errors[0])
+
+    def test_negative_infinity_weight_rejected(self) -> None:
+        missing = [MissingField("Root.Weight", "package_1_weight", "Package weight")]
+        errors = validate_elicited_values({"package_1_weight": "-inf"}, missing)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("positive, finite", errors[0])
+
+    def test_nan_weight_rejected(self) -> None:
+        missing = [MissingField("Root.Weight", "package_1_weight", "Package weight")]
+        errors = validate_elicited_values({"package_1_weight": "nan"}, missing)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("positive, finite", errors[0])
+
+    def test_valid_weight_still_passes(self) -> None:
+        missing = [MissingField("Root.Weight", "package_1_weight", "Package weight")]
+        errors = validate_elicited_values({"package_1_weight": "5.5"}, missing)
+        self.assertEqual(errors, [])
+
+    def test_zero_weight_rejected(self) -> None:
+        missing = [MissingField("Root.Weight", "package_1_weight", "Package weight")]
+        errors = validate_elicited_values({"package_1_weight": "0"}, missing)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("positive, finite", errors[0])
+
+
 class PydanticConstraintTests(unittest.TestCase):
     def test_strict_not_in_native_constraints(self) -> None:
         """'strict' should not be in _PYDANTIC_NATIVE_CONSTRAINTS as it

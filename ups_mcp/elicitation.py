@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
@@ -330,8 +331,8 @@ def validate_elicited_values(
         if _WEIGHT_VALUE_KEYS.match(key):
             try:
                 w = float(value)
-                if w <= 0:
-                    errors.append(f"{label}: must be a positive number")
+                if not math.isfinite(w) or w <= 0:
+                    errors.append(f"{label}: must be a positive, finite number")
             except (ValueError, TypeError):
                 errors.append(f"{label}: must be a number")
 
