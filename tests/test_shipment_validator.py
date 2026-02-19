@@ -1897,5 +1897,105 @@ class ProductArrayRuleTests(unittest.TestCase):
         self.assertIn("product_1_unit_code", flat_keys)
 
 
+class SoldToRuleTests(unittest.TestCase):
+    """SoldTo (invoice recipient) should be required for Invoice/USMCA forms."""
+
+    def _make_intl_body(self, form_type: str, sold_to: dict | None = None) -> dict:
+        """Build US->GB body with InternationalForms and optional SoldTo."""
+        body = {
+            "ShipmentRequest": {
+                "Request": {"RequestOption": "nonvalidate"},
+                "Shipment": {
+                    "Shipper": {
+                        "Name": "Test", "ShipperNumber": "129D9Y",
+                        "Address": {"AddressLine": ["123 Main"], "City": "NYC",
+                                    "StateProvinceCode": "NY", "PostalCode": "10001",
+                                    "CountryCode": "US"},
+                        "AttentionName": "Attn", "Phone": {"Number": "1234567890"},
+                    },
+                    "ShipTo": {
+                        "Name": "Recip",
+                        "Address": {"AddressLine": ["456 Elm"], "City": "London",
+                                    "CountryCode": "GB"},
+                        "AttentionName": "Recip", "Phone": {"Number": "4412345678"},
+                    },
+                    "Service": {"Code": "07"}, "Description": "Test goods",
+                    "Package": [{"Packaging": {"Code": "02"},
+                                 "PackageWeight": {"UnitOfMeasurement": {"Code": "LBS"},
+                                                   "Weight": "5"}}],
+                    "PaymentInformation": {
+                        "ShipmentCharge": [{"Type": "01",
+                                            "BillShipper": {"AccountNumber": "129D9Y"}}],
+                    },
+                    "ShipmentServiceOptions": {
+                        "InternationalForms": {
+                            "FormType": form_type, "CurrencyCode": "USD",
+                            "ReasonForExport": "SALE", "InvoiceNumber": "INV-1",
+                            "InvoiceDate": "20260219",
+                            "Product": [{"Description": "Widget",
+                                         "Unit": {"Number": "1", "Value": "100",
+                                                  "UnitOfMeasurement": {"Code": "PCS"}},
+                                         "OriginCountryCode": "US"}],
+                        },
+                    },
+                },
+            },
+        }
+        if sold_to is not None:
+            body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"][
+                "InternationalForms"].setdefault("Contacts", {})["SoldTo"] = sold_to
+        return body
+
+    def test_invoice_form_requires_sold_to(self) -> None:
+        body = self._make_intl_body("01")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("sold_to_name", flat_keys)
+        self.assertIn("sold_to_address_line", flat_keys)
+        self.assertIn("sold_to_city", flat_keys)
+        self.assertIn("sold_to_country_code", flat_keys)
+
+    def test_usmca_form_requires_sold_to(self) -> None:
+        body = self._make_intl_body("04")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("sold_to_name", flat_keys)
+
+    def test_packing_list_does_not_require_sold_to(self) -> None:
+        body = self._make_intl_body("06")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("sold_to_name", flat_keys)
+
+    def test_populated_sold_to_not_missing(self) -> None:
+        sold_to = {
+            "Name": "Buyer Co", "AttentionName": "Jane",
+            "Phone": {"Number": "5551234567"},
+            "Address": {"AddressLine": "789 Oak", "City": "London",
+                        "CountryCode": "GB"},
+        }
+        body = self._make_intl_body("01", sold_to=sold_to)
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("sold_to_name", flat_keys)
+        self.assertNotIn("sold_to_city", flat_keys)
+
+    def test_partial_sold_to_elicits_missing_subfields(self) -> None:
+        sold_to = {"Name": "Buyer Co"}  # Address fields missing
+        body = self._make_intl_body("01", sold_to=sold_to)
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("sold_to_name", flat_keys)
+        self.assertIn("sold_to_address_line", flat_keys)
+        self.assertIn("sold_to_city", flat_keys)
+
+    def test_sold_to_fields_are_elicitable(self) -> None:
+        body = self._make_intl_body("01")
+        missing = find_missing_fields(body)
+        sold_to_fields = [mf for mf in missing if mf.flat_key.startswith("sold_to_")]
+        for mf in sold_to_fields:
+            self.assertTrue(mf.elicitable, f"{mf.flat_key} should be elicitable")
+
+
 if __name__ == "__main__":
     unittest.main()

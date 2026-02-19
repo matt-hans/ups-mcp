@@ -274,6 +274,42 @@ PRODUCT_ARRAY_RULE: ArrayFieldRule = ArrayFieldRule(
     item_rules=PRODUCT_ITEM_RULES,
 )
 
+# ---------------------------------------------------------------------------
+# International Forms — SoldTo (invoice recipient) rules
+# Required for Invoice (01) and USMCA (04) forms.
+# ---------------------------------------------------------------------------
+
+SOLD_TO_RULES: list[FieldRule] = [
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Name",
+        "sold_to_name", "Sold-to party name",
+        constraints=(("maxLength", 35),),
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.AttentionName",
+        "sold_to_attention_name", "Sold-to attention name",
+        constraints=(("maxLength", 35),),
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Phone.Number",
+        "sold_to_phone", "Sold-to phone number",
+        constraints=(("maxLength", 15),),
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Address.AddressLine",
+        "sold_to_address_line", "Sold-to street address",
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Address.City",
+        "sold_to_city", "Sold-to city",
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Address.CountryCode",
+        "sold_to_country_code", "Sold-to country code",
+        constraints=(("maxLength", 2), ("pattern", "^[A-Z]{2}$")),
+    ),
+]
+
 
 # ---------------------------------------------------------------------------
 # International Forms helpers
@@ -686,6 +722,12 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
                 # InvoiceDate not required for returns
                 if not is_return and not _field_exists(intl_forms, "InvoiceDate"):
                     missing.append(_missing_from_rule(INTL_FORMS_INVOICE_DATE_RULE))
+
+            # SoldTo required for Invoice (01) and USMCA (04)
+            if any(ft in ("01", "04") for ft in form_types):
+                for rule in SOLD_TO_RULES:
+                    if not _field_exists(body, rule.dot_path):
+                        missing.append(_missing_from_rule(rule))
 
     # ----- Duties & Taxes payment check -----
 
