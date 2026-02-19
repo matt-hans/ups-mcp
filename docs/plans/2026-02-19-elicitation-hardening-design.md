@@ -135,8 +135,6 @@ class ArrayFieldRule:
     """
     array_dot_path: str            # e.g. "...InternationalForms.Product"
     item_prefix: str               # e.g. "product" -> product_1_*, product_2_*
-    count_key: str                 # flat key for item count
-    count_prompt: str              # "How many products?"
     item_rules: tuple[FieldRule, ...]  # Sub-path rules per item
     max_items: int = 10            # Safety cap
     default_count: int = 1         # If no existing items
@@ -179,8 +177,6 @@ PRODUCT_ITEM_RULES: tuple[FieldRule, ...] = (
 PRODUCT_ARRAY_RULE = ArrayFieldRule(
     array_dot_path="ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Product",
     item_prefix="product",
-    count_key="product_count",
-    count_prompt="How many different products in this shipment?",
     item_rules=PRODUCT_ITEM_RULES,
 )
 ```
@@ -218,6 +214,81 @@ InternationalForms.Product goes from STRUCTURAL_FIELDS_REQUIRED error to a flat 
 
 Reusable for `get_landed_cost_quote` commodity arrays.
 
+## Layer 4: SoldTo + EEI Filing Rules
+
+### SoldTo Address Rules
+
+**File:** `shipment_validator.py`
+
+SoldTo (the party who receives the invoice) is required for Invoice (01) and USMCA (04) forms. Its structure mirrors ShipTo — flat scalar fields, fully elicitable:
+
+```python
+SOLD_TO_RULES: list[FieldRule] = [
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Name",
+        "sold_to_name", "Sold-to party name",
+        constraints=(("maxLength", 35),),
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.AttentionName",
+        "sold_to_attention_name", "Sold-to attention name",
+        constraints=(("maxLength", 35),),
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Phone.Number",
+        "sold_to_phone", "Sold-to phone number",
+        constraints=(("maxLength", 15),),
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Address.AddressLine",
+        "sold_to_address_line", "Sold-to street address",
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Address.City",
+        "sold_to_city", "Sold-to city",
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Address.CountryCode",
+        "sold_to_country_code", "Sold-to country code",
+        constraints=(("maxLength", 2), ("pattern", "^[A-Z]{2}$")),
+    ),
+]
+```
+
+In `find_missing_fields()`, check SoldTo when FormType includes "01" or "04":
+```python
+if form_types and any(ft in ("01", "04") for ft in form_types):
+    sold_to = intl_forms.get("Contacts", {}).get("SoldTo", {})
+    if not isinstance(sold_to, dict):
+        sold_to = {}
+    for rule in SOLD_TO_RULES:
+        if not _field_exists(body, rule.dot_path):
+            missing.append(_missing_from_rule(rule))
+```
+
+### EEI Filing Option Rules
+
+**File:** `shipment_validator.py`
+
+EEI (Electronic Export Information) is required when FormType includes "11". The top-level Code is a scalar enum (fully elicitable). The sub-objects (ShipperFiled, UPSFiled) are conditional on Code value and contain their own scalars:
+
+```python
+EEI_FILING_OPTION_CODE_RULE: FieldRule = FieldRule(
+    "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.EEIFilingOption.Code",
+    "eei_filing_code", "EEI filing option",
+    enum_values=("1", "2", "3"),
+    enum_titles=("Shipper Filed", "AES Direct", "UPS Filed"),
+)
+```
+
+In `find_missing_fields()`, check EEI when FormType includes "11":
+```python
+if "11" in form_types:
+    eei = intl_forms.get("EEIFilingOption")
+    if not isinstance(eei, dict) or not eei.get("Code"):
+        missing.append(_missing_from_rule(EEI_FILING_OPTION_CODE_RULE))
+```
+
 ## Test Plan
 
 ### Layer 1 tests
@@ -243,15 +314,24 @@ Reusable for `get_landed_cost_quote` commodity arrays.
 - Integration: international shipment with Product array flows through full elicitation pipeline
 - Integration: Product with pre-populated items only elicits missing sub-fields
 
+### Layer 4 tests
+- SoldTo: Invoice form (01) with no SoldTo generates all sold_to_* missing fields
+- SoldTo: USMCA form (04) with no SoldTo generates sold_to_* missing fields
+- SoldTo: Non-invoice form (e.g. 06) does NOT require SoldTo
+- SoldTo: Partially populated SoldTo only elicits missing sub-fields
+- EEI: Form type 11 with no EEIFilingOption generates eei_filing_code missing field
+- EEI: Form type 11 with EEIFilingOption.Code present does NOT generate missing field
+- EEI: Non-EEI form (e.g. 01) does NOT require EEIFilingOption
+
 ## Files Changed
 
 | File | Changes |
 |------|---------|
 | `elicitation.py` | Remove strict, add math.isfinite, isinstance matching, retry loop, ArrayFieldRule, expand/reconstruct functions, array_rules param |
-| `shipment_validator.py` | Tighten ReturnService, add PRODUCT_ITEM_RULES + PRODUCT_ARRAY_RULE, replace elicitable=False Product with expand_array_fields |
+| `shipment_validator.py` | Tighten ReturnService, add PRODUCT_ITEM_RULES + PRODUCT_ARRAY_RULE, replace elicitable=False Product with expand_array_fields, add SOLD_TO_RULES + EEI_FILING_OPTION_CODE_RULE |
 | `rating_validator.py` | Tighten ReturnService |
 | `server.py` | Pass array_rules to elicit_and_rehydrate for create_shipment |
 | `tests/test_elicitation.py` | Layer 1 + 2 + 3 unit tests |
-| `tests/test_shipment_validator.py` | ReturnService + array rule tests |
+| `tests/test_shipment_validator.py` | ReturnService + array rule + SoldTo + EEI tests |
 | `tests/test_rating_validator.py` | ReturnService tests |
 | `tests/test_server_elicitation.py` | Retry integration + array integration tests |

@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Harden the elicitation system with bug fixes, a retry loop for validation errors, and general-purpose array flattening so InternationalForms.Product can be elicited via flat forms.
+**Goal:** Harden the elicitation system with bug fixes, a retry loop for validation errors, general-purpose array flattening so InternationalForms.Product can be elicited via flat forms, and add SoldTo + EEI filing rules for international shipments.
 
 **Architecture:** Three incremental layers applied to `elicitation.py` (core), `shipment_validator.py` / `rating_validator.py` (validators), and `server.py` (wiring). Each layer builds on the previous and is independently testable. TDD throughout — tests first, then implementation.
 
@@ -427,7 +427,26 @@ class DefensiveSchemaTests(unittest.IsolatedAsyncioTestCase):
 Run: `python3 -m pytest tests/test_elicitation.py::TypedElicitationResultTests -v`
 Expected: These may pass with the current string-matching code since `AcceptedElicitation` has `.action = "accept"` and `.data`. But the real point is they confirm the typed objects work. Run them first to establish baseline.
 
-**Step 3: Implement isinstance matching + defensive schema build**
+**Step 3: Update `_make_accepted` helper to return real AcceptedElicitation**
+
+In `tests/test_elicitation.py`, the `_make_accepted` helper currently returns a `MagicMock` with `.action = "accept"`. After switching to `isinstance` checks, `MagicMock` won't pass `isinstance(result, AcceptedElicitation)`. Update the helper:
+
+```python
+from mcp.server.elicitation import AcceptedElicitation
+from pydantic import create_model
+
+
+def _make_accepted(data_dict):
+    """Make a real AcceptedElicitation result for testing."""
+    fields = {k: (type(v) if v is not None else str, ...) for k, v in data_dict.items()}
+    Model = create_model("ElicitedData", **fields)
+    instance = Model(**data_dict)
+    return AcceptedElicitation(data=instance)
+```
+
+Also update existing `_make_form_ctx` test for `decline` in Task 5 to use `DeclinedElicitation()` instead of a MagicMock with `.action = "decline"`.
+
+**Step 4: Implement isinstance matching + defensive schema build**
 
 In `ups_mcp/elicitation.py`, add the import (after line 22):
 ```python
@@ -551,12 +570,12 @@ async def elicit_and_rehydrate(
         }))
 ```
 
-**Step 4: Run all tests**
+**Step 5: Run all tests**
 
 Run: `python3 -m pytest tests/ -v`
 Expected: All pass including new and existing tests
 
-**Step 5: Commit**
+**Step 6: Commit**
 
 ```bash
 git add ups_mcp/elicitation.py tests/test_elicitation.py
@@ -636,8 +655,7 @@ class RetryLoopTests(unittest.IsolatedAsyncioTestCase):
         missing = [MissingField("Root.Weight", "package_1_weight", "Package weight")]
 
         bad_result = _make_accepted({"package_1_weight": "not_a_number"})
-        declined = MagicMock()
-        declined.action = "decline"
+        declined = DeclinedElicitation()
         ctx = _make_form_ctx(elicit_side_effect=[bad_result, declined])
 
         with self.assertRaises(ToolError) as cm:
@@ -905,8 +923,6 @@ class ArrayFieldRuleTests(unittest.TestCase):
         return ArrayFieldRule(
             array_dot_path="Root.Items.Product",
             item_prefix="product",
-            count_key="product_count",
-            count_prompt="How many products?",
             item_rules=(
                 FieldRule("Description", "description", "Product description"),
                 FieldRule("Value", "value", "Unit value", type_hint=float),
@@ -990,8 +1006,6 @@ class ArrayFieldRuleTests(unittest.TestCase):
         rule = ArrayFieldRule(
             array_dot_path="Root.Product",
             item_prefix="prod",
-            count_key="prod_count",
-            count_prompt="How many?",
             item_rules=(
                 FieldRule("Unit.Value", "unit_value", "Value"),
                 FieldRule("Unit.Code", "unit_code", "Code"),
@@ -1023,8 +1037,6 @@ class ArrayFieldRule:
     """
     array_dot_path: str
     item_prefix: str
-    count_key: str
-    count_prompt: str
     item_rules: tuple[FieldRule, ...]
     max_items: int = 10
     default_count: int = 1
@@ -1147,8 +1159,6 @@ class ArrayElicitationIntegrationTests(unittest.IsolatedAsyncioTestCase):
         return ArrayFieldRule(
             array_dot_path="Root.Items.Product",
             item_prefix="product",
-            count_key="product_count",
-            count_prompt="How many?",
             item_rules=(
                 FieldRule("Description", "description", "Product description"),
                 FieldRule("Value", "value", "Unit value", type_hint=float),
@@ -1458,8 +1468,6 @@ PRODUCT_ITEM_RULES: tuple[FieldRule, ...] = (
 PRODUCT_ARRAY_RULE: ArrayFieldRule = ArrayFieldRule(
     array_dot_path="ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Product",
     item_prefix="product",
-    count_key="product_count",
-    count_prompt="How many different products in this shipment?",
     item_rules=PRODUCT_ITEM_RULES,
 )
 ```
@@ -1563,7 +1571,351 @@ git commit -m "feat: pass PRODUCT_ARRAY_RULE to elicit_and_rehydrate in create_s
 
 ---
 
-### Task 11: Final verification and cleanup
+### Task 11: SoldTo address rules for Invoice/USMCA forms
+
+**Files:**
+- Modify: `ups_mcp/shipment_validator.py` (add SOLD_TO_RULES, wire into find_missing_fields)
+- Test: `tests/test_shipment_validator.py`
+
+**Step 1: Write failing tests**
+
+Add to `tests/test_shipment_validator.py`:
+
+```python
+class SoldToRuleTests(unittest.TestCase):
+    """SoldTo (invoice recipient) should be required for Invoice/USMCA forms."""
+
+    def _make_intl_body(self, form_type: str, sold_to: dict | None = None) -> dict:
+        """Build US->GB body with InternationalForms and optional SoldTo."""
+        body = {
+            "ShipmentRequest": {
+                "Request": {"RequestOption": "nonvalidate"},
+                "Shipment": {
+                    "Shipper": {
+                        "Name": "Test", "ShipperNumber": "129D9Y",
+                        "Address": {"AddressLine": ["123 Main"], "City": "NYC",
+                                    "StateProvinceCode": "NY", "PostalCode": "10001",
+                                    "CountryCode": "US"},
+                        "AttentionName": "Attn", "Phone": {"Number": "1234567890"},
+                    },
+                    "ShipTo": {
+                        "Name": "Recip",
+                        "Address": {"AddressLine": ["456 Elm"], "City": "London",
+                                    "CountryCode": "GB"},
+                        "AttentionName": "Recip", "Phone": {"Number": "4412345678"},
+                    },
+                    "Service": {"Code": "07"}, "Description": "Test goods",
+                    "Package": [{"Packaging": {"Code": "02"},
+                                 "PackageWeight": {"UnitOfMeasurement": {"Code": "LBS"},
+                                                   "Weight": "5"}}],
+                    "PaymentInformation": {
+                        "ShipmentCharge": [{"Type": "01",
+                                            "BillShipper": {"AccountNumber": "129D9Y"}}],
+                    },
+                    "ShipmentServiceOptions": {
+                        "InternationalForms": {
+                            "FormType": form_type, "CurrencyCode": "USD",
+                            "ReasonForExport": "SALE", "InvoiceNumber": "INV-1",
+                            "InvoiceDate": "20260219",
+                            "Product": [{"Description": "Widget",
+                                         "Unit": {"Number": "1", "Value": "100",
+                                                  "UnitOfMeasurement": {"Code": "PCS"}},
+                                         "OriginCountryCode": "US"}],
+                        },
+                    },
+                },
+            },
+        }
+        if sold_to is not None:
+            body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"][
+                "InternationalForms"].setdefault("Contacts", {})["SoldTo"] = sold_to
+        return body
+
+    def test_invoice_form_requires_sold_to(self) -> None:
+        body = self._make_intl_body("01")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("sold_to_name", flat_keys)
+        self.assertIn("sold_to_address_line", flat_keys)
+        self.assertIn("sold_to_city", flat_keys)
+        self.assertIn("sold_to_country_code", flat_keys)
+
+    def test_usmca_form_requires_sold_to(self) -> None:
+        body = self._make_intl_body("04")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("sold_to_name", flat_keys)
+
+    def test_packing_list_does_not_require_sold_to(self) -> None:
+        body = self._make_intl_body("06")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("sold_to_name", flat_keys)
+
+    def test_populated_sold_to_not_missing(self) -> None:
+        sold_to = {
+            "Name": "Buyer Co", "AttentionName": "Jane",
+            "Phone": {"Number": "5551234567"},
+            "Address": {"AddressLine": "789 Oak", "City": "London",
+                        "CountryCode": "GB"},
+        }
+        body = self._make_intl_body("01", sold_to=sold_to)
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("sold_to_name", flat_keys)
+        self.assertNotIn("sold_to_city", flat_keys)
+
+    def test_partial_sold_to_elicits_missing_subfields(self) -> None:
+        sold_to = {"Name": "Buyer Co"}  # Address fields missing
+        body = self._make_intl_body("01", sold_to=sold_to)
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("sold_to_name", flat_keys)
+        self.assertIn("sold_to_address_line", flat_keys)
+        self.assertIn("sold_to_city", flat_keys)
+
+    def test_sold_to_fields_are_elicitable(self) -> None:
+        body = self._make_intl_body("01")
+        missing = find_missing_fields(body)
+        sold_to_fields = [mf for mf in missing if mf.flat_key.startswith("sold_to_")]
+        for mf in sold_to_fields:
+            self.assertTrue(mf.elicitable, f"{mf.flat_key} should be elicitable")
+```
+
+**Step 2: Run tests to verify they fail**
+
+Run: `python3 -m pytest tests/test_shipment_validator.py::SoldToRuleTests -v`
+Expected: FAIL — `sold_to_name` etc. are never generated
+
+**Step 3: Implement SoldTo rules**
+
+In `ups_mcp/shipment_validator.py`, add after the `INTL_FORMS_INVOICE_DATE_RULE` (around line 250):
+
+```python
+# ---------------------------------------------------------------------------
+# International Forms — SoldTo (invoice recipient) rules
+# Required for Invoice (01) and USMCA (04) forms.
+# ---------------------------------------------------------------------------
+
+SOLD_TO_RULES: list[FieldRule] = [
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Name",
+        "sold_to_name", "Sold-to party name",
+        constraints=(("maxLength", 35),),
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.AttentionName",
+        "sold_to_attention_name", "Sold-to attention name",
+        constraints=(("maxLength", 35),),
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Phone.Number",
+        "sold_to_phone", "Sold-to phone number",
+        constraints=(("maxLength", 15),),
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Address.AddressLine",
+        "sold_to_address_line", "Sold-to street address",
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Address.City",
+        "sold_to_city", "Sold-to city",
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Address.CountryCode",
+        "sold_to_country_code", "Sold-to country code",
+        constraints=(("maxLength", 2), ("pattern", "^[A-Z]{2}$")),
+    ),
+]
+```
+
+Then in `find_missing_fields()`, inside the `if intl_forms is not None:` block, after the Invoice-specific fields check (after the `InvoiceDate` check), add:
+
+```python
+            # SoldTo required for Invoice (01) and USMCA (04)
+            if any(ft in ("01", "04") for ft in form_types):
+                for rule in SOLD_TO_RULES:
+                    if not _field_exists(body, rule.dot_path):
+                        missing.append(_missing_from_rule(rule))
+```
+
+**Step 4: Run tests**
+
+Run: `python3 -m pytest tests/test_shipment_validator.py::SoldToRuleTests -v`
+Expected: All PASS
+
+**Step 5: Run full suite**
+
+Run: `python3 -m pytest tests/ -v`
+Expected: All pass
+
+**Step 6: Commit**
+
+```bash
+git add ups_mcp/shipment_validator.py tests/test_shipment_validator.py
+git commit -m "feat: add SoldTo address rules for Invoice/USMCA international forms"
+```
+
+---
+
+### Task 12: EEI filing option rules for EEI forms
+
+**Files:**
+- Modify: `ups_mcp/shipment_validator.py` (add EEI_FILING_OPTION_CODE_RULE, wire into find_missing_fields)
+- Test: `tests/test_shipment_validator.py`
+
+**Step 1: Write failing tests**
+
+Add to `tests/test_shipment_validator.py`:
+
+```python
+class EEIFilingRuleTests(unittest.TestCase):
+    """EEI filing option should be required for form type 11 (EEI)."""
+
+    def _make_eei_body(self, eei_option: dict | None = None) -> dict:
+        """Build US->GB body with FormType 11 and optional EEIFilingOption."""
+        body = {
+            "ShipmentRequest": {
+                "Request": {"RequestOption": "nonvalidate"},
+                "Shipment": {
+                    "Shipper": {
+                        "Name": "Test", "ShipperNumber": "129D9Y",
+                        "Address": {"AddressLine": ["123 Main"], "City": "NYC",
+                                    "StateProvinceCode": "NY", "PostalCode": "10001",
+                                    "CountryCode": "US"},
+                        "AttentionName": "Attn", "Phone": {"Number": "1234567890"},
+                    },
+                    "ShipTo": {
+                        "Name": "Recip",
+                        "Address": {"AddressLine": ["456 Elm"], "City": "London",
+                                    "CountryCode": "GB"},
+                        "AttentionName": "Recip", "Phone": {"Number": "4412345678"},
+                    },
+                    "Service": {"Code": "07"}, "Description": "Test goods",
+                    "Package": [{"Packaging": {"Code": "02"},
+                                 "PackageWeight": {"UnitOfMeasurement": {"Code": "LBS"},
+                                                   "Weight": "5"}}],
+                    "PaymentInformation": {
+                        "ShipmentCharge": [{"Type": "01",
+                                            "BillShipper": {"AccountNumber": "129D9Y"}}],
+                    },
+                    "ShipmentServiceOptions": {
+                        "InternationalForms": {
+                            "FormType": "11", "CurrencyCode": "USD",
+                            "Product": [{"Description": "Widget",
+                                         "Unit": {"Number": "1", "Value": "100",
+                                                  "UnitOfMeasurement": {"Code": "PCS"}},
+                                         "OriginCountryCode": "US"}],
+                        },
+                    },
+                },
+            },
+        }
+        if eei_option is not None:
+            body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"][
+                "InternationalForms"]["EEIFilingOption"] = eei_option
+        return body
+
+    def test_eei_form_requires_filing_code(self) -> None:
+        body = self._make_eei_body()
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("eei_filing_code", flat_keys)
+
+    def test_eei_form_with_code_not_missing(self) -> None:
+        body = self._make_eei_body(eei_option={"Code": "3"})
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("eei_filing_code", flat_keys)
+
+    def test_eei_form_with_empty_code_missing(self) -> None:
+        body = self._make_eei_body(eei_option={"Code": ""})
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("eei_filing_code", flat_keys)
+
+    def test_eei_form_with_empty_dict_missing(self) -> None:
+        body = self._make_eei_body(eei_option={})
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("eei_filing_code", flat_keys)
+
+    def test_non_eei_form_does_not_require_filing(self) -> None:
+        body = self._make_eei_body()
+        # Change form type to Invoice (01)
+        body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"][
+            "InternationalForms"]["FormType"] = "01"
+        body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"][
+            "InternationalForms"]["ReasonForExport"] = "SALE"
+        body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"][
+            "InternationalForms"]["InvoiceNumber"] = "INV-1"
+        body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"][
+            "InternationalForms"]["InvoiceDate"] = "20260219"
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("eei_filing_code", flat_keys)
+
+    def test_eei_filing_code_is_elicitable(self) -> None:
+        body = self._make_eei_body()
+        missing = find_missing_fields(body)
+        eei_fields = [mf for mf in missing if mf.flat_key == "eei_filing_code"]
+        self.assertEqual(len(eei_fields), 1)
+        self.assertTrue(eei_fields[0].elicitable)
+```
+
+**Step 2: Run tests to verify they fail**
+
+Run: `python3 -m pytest tests/test_shipment_validator.py::EEIFilingRuleTests -v`
+Expected: FAIL — `eei_filing_code` is never generated
+
+**Step 3: Implement EEI filing rules**
+
+In `ups_mcp/shipment_validator.py`, add after the SoldTo rules:
+
+```python
+# ---------------------------------------------------------------------------
+# International Forms — EEI filing option
+# Required for EEI form type (11).
+# ---------------------------------------------------------------------------
+
+EEI_FILING_OPTION_CODE_RULE: FieldRule = FieldRule(
+    "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.EEIFilingOption.Code",
+    "eei_filing_code", "EEI filing option",
+    enum_values=("1", "2", "3"),
+    enum_titles=("Shipper Filed", "AES Direct", "UPS Filed"),
+)
+```
+
+Then in `find_missing_fields()`, inside the `if intl_forms is not None:` block, after the SoldTo check, add:
+
+```python
+            # EEI filing option required for EEI form (11)
+            if "11" in form_types:
+                eei = intl_forms.get("EEIFilingOption")
+                if not isinstance(eei, dict) or not eei.get("Code"):
+                    missing.append(_missing_from_rule(EEI_FILING_OPTION_CODE_RULE))
+```
+
+**Step 4: Run tests**
+
+Run: `python3 -m pytest tests/test_shipment_validator.py::EEIFilingRuleTests -v`
+Expected: All PASS
+
+**Step 5: Run full suite**
+
+Run: `python3 -m pytest tests/ -v`
+Expected: All pass
+
+**Step 6: Commit**
+
+```bash
+git add ups_mcp/shipment_validator.py tests/test_shipment_validator.py
+git commit -m "feat: add EEI filing option rules for international EEI forms"
+```
+
+---
+
+### Task 13: Final verification and cleanup
 
 **Files:**
 - All modified files
@@ -1583,7 +1935,7 @@ Expected: All pass
 Run: `python3 -c "from ups_mcp.elicitation import ArrayFieldRule, expand_array_fields, reconstruct_array, elicit_and_rehydrate; print('OK')"`
 Expected: `OK`
 
-Run: `python3 -c "from ups_mcp.shipment_validator import PRODUCT_ARRAY_RULE, PRODUCT_ITEM_RULES; print('OK')"`
+Run: `python3 -c "from ups_mcp.shipment_validator import PRODUCT_ARRAY_RULE, PRODUCT_ITEM_RULES, SOLD_TO_RULES, EEI_FILING_OPTION_CODE_RULE; print('OK')"`
 Expected: `OK`
 
 **Step 4: Commit any cleanup**
