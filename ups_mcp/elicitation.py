@@ -556,6 +556,7 @@ async def elicit_and_rehydrate(
     tool_label: str,
     canonicalize_fn: Callable[[dict], dict] | None = None,
     max_retries: int = 3,
+    array_rules: list[ArrayFieldRule] | None = None,
 ) -> dict:
     """Centralized elicitation flow with retry on validation errors.
 
@@ -638,6 +639,38 @@ async def elicit_and_rehydrate(
                     "reason": "rehydration_error",
                     "missing": _missing_payload(elicitable),
                 }))
+
+            # Reconstruct arrays from flat indexed values
+            if array_rules:
+                for arr_rule in array_rules:
+                    existing = _get_existing_array(updated, arr_rule.array_dot_path)
+                    # Determine how many items were in the flat data
+                    max_n = 0
+                    for key in normalized:
+                        if key.startswith(f"{arr_rule.item_prefix}_"):
+                            parts = key.split("_")
+                            if len(parts) >= 2 and parts[1].isdigit():
+                                max_n = max(max_n, int(parts[1]))
+                    if max_n > 0:
+                        items = reconstruct_array(normalized, arr_rule, count=max_n)
+                        if items:
+                            # Merge with existing items: reconstructed items
+                            # fill in missing sub-fields of existing items
+                            merged_items = []
+                            for idx, item in enumerate(items):
+                                if idx < len(existing):
+                                    merged = copy.deepcopy(existing[idx])
+                                    for k, v in item.items():
+                                        if k not in merged or merged[k] in (None, ""):
+                                            merged[k] = v
+                                        elif isinstance(merged[k], dict) and isinstance(v, dict):
+                                            for sk, sv in v.items():
+                                                if sk not in merged[k] or merged[k][sk] in (None, ""):
+                                                    merged[k][sk] = sv
+                                    merged_items.append(merged)
+                                else:
+                                    merged_items.append(item)
+                            _set_field(updated, arr_rule.array_dot_path, merged_items)
 
             still_missing = find_missing_fn(updated)
             if not still_missing:
