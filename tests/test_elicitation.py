@@ -574,6 +574,124 @@ class TypedElicitationResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["code"], "ELICITATION_CANCELLED")
 
 
+class RetryLoopTests(unittest.IsolatedAsyncioTestCase):
+    """Elicitation should retry on validation errors instead of terminating."""
+
+    async def test_validation_error_retries_then_succeeds(self) -> None:
+        """First attempt has bad weight, second attempt is valid."""
+        missing = [MissingField("Root.Weight", "package_1_weight", "Package weight")]
+
+        bad_result = _make_accepted({"package_1_weight": "not_a_number"})
+        good_result = _make_accepted({"package_1_weight": "5.0"})
+        ctx = _make_form_ctx(elicit_side_effect=[bad_result, good_result])
+
+        result = await elicit_and_rehydrate(
+            ctx, {"Root": {}}, missing,
+            find_missing_fn=lambda b: [],
+            tool_label="test",
+        )
+        self.assertEqual(result["Root"]["Weight"], "5.0")
+        self.assertEqual(ctx.elicit.call_count, 2)
+
+    async def test_retry_message_contains_errors(self) -> None:
+        """Second elicit call should have error context in the message."""
+        missing = [MissingField("Root.Weight", "package_1_weight", "Package weight")]
+
+        bad_result = _make_accepted({"package_1_weight": "-1"})
+        good_result = _make_accepted({"package_1_weight": "5.0"})
+        ctx = _make_form_ctx(elicit_side_effect=[bad_result, good_result])
+
+        await elicit_and_rehydrate(
+            ctx, {"Root": {}}, missing,
+            find_missing_fn=lambda b: [],
+            tool_label="test",
+        )
+        # Check the second call's message contains error context
+        second_call = ctx.elicit.call_args_list[1]
+        msg = second_call.kwargs.get("message", second_call.args[0] if second_call.args else "")
+        self.assertIn("correct the following", msg.lower())
+        self.assertIn("positive", msg.lower())
+
+    async def test_max_retries_exceeded_raises(self) -> None:
+        """After max_retries validation failures, raise ELICITATION_MAX_RETRIES."""
+        missing = [MissingField("Root.Weight", "package_1_weight", "Package weight")]
+
+        bad_result = _make_accepted({"package_1_weight": "not_a_number"})
+        ctx = _make_form_ctx(elicit_side_effect=[bad_result, bad_result, bad_result])
+
+        with self.assertRaises(ToolError) as cm:
+            await elicit_and_rehydrate(
+                ctx, {"Root": {}}, missing,
+                find_missing_fn=lambda b: [],
+                tool_label="test",
+                max_retries=3,
+            )
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "ELICITATION_MAX_RETRIES")
+        self.assertEqual(ctx.elicit.call_count, 3)
+
+    async def test_decline_on_retry_raises_immediately(self) -> None:
+        """If user declines on retry, raise immediately (no more retries)."""
+        missing = [MissingField("Root.Weight", "package_1_weight", "Package weight")]
+
+        bad_result = _make_accepted({"package_1_weight": "not_a_number"})
+        declined = DeclinedElicitation()
+        ctx = _make_form_ctx(elicit_side_effect=[bad_result, declined])
+
+        with self.assertRaises(ToolError) as cm:
+            await elicit_and_rehydrate(
+                ctx, {"Root": {}}, missing,
+                find_missing_fn=lambda b: [],
+                tool_label="test",
+            )
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "ELICITATION_DECLINED")
+
+    async def test_still_missing_retries_with_remaining_fields(self) -> None:
+        """If rehydration succeeds but fields still missing, retry with those."""
+        missing = [
+            MissingField("Root.Name", "name", "Name"),
+            MissingField("Root.City", "city", "City"),
+        ]
+
+        # First attempt: provides name but find_missing returns city still needed
+        first_result = _make_accepted({"name": "Test", "city": ""})
+        # Second attempt: provides city
+        second_result = _make_accepted({"city": "NYC"})
+
+        call_count = [0]
+        def find_fn(b):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # After first rehydration, city is still missing
+                return [MissingField("Root.City", "city", "City")]
+            return []
+
+        ctx = _make_form_ctx(elicit_side_effect=[first_result, second_result])
+
+        result = await elicit_and_rehydrate(
+            ctx, {"Root": {}}, missing,
+            find_missing_fn=find_fn,
+            tool_label="test",
+        )
+        self.assertEqual(result["Root"]["Name"], "Test")
+        self.assertEqual(result["Root"]["City"], "NYC")
+
+    async def test_first_attempt_success_no_retry(self) -> None:
+        """Valid first attempt returns immediately (backward compat)."""
+        accepted = _make_accepted({"name": "Test Corp"})
+        ctx = _make_form_ctx(elicit_result=accepted)
+        missing = _simple_missing()
+
+        result = await elicit_and_rehydrate(
+            ctx, {"Root": {}}, missing,
+            find_missing_fn=lambda b: [],
+            tool_label="test",
+        )
+        self.assertEqual(result["Root"]["Name"], "Test Corp")
+        self.assertEqual(ctx.elicit.call_count, 1)
+
+
 class PydanticConstraintTests(unittest.TestCase):
     def test_strict_not_in_native_constraints(self) -> None:
         """'strict' should not be in _PYDANTIC_NATIVE_CONSTRAINTS as it
