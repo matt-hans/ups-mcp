@@ -500,5 +500,28 @@ class CurrencyCodeValidationTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
 
 
+class PydanticConstraintTests(unittest.TestCase):
+    def test_strict_not_in_native_constraints(self) -> None:
+        """'strict' should not be in _PYDANTIC_NATIVE_CONSTRAINTS as it
+        causes schema generation crashes when dynamically applied."""
+        from ups_mcp.elicitation import _PYDANTIC_NATIVE_CONSTRAINTS
+        self.assertNotIn("strict", _PYDANTIC_NATIVE_CONSTRAINTS)
+
+    def test_strict_constraint_goes_to_json_schema_extra(self) -> None:
+        """If a FieldRule has constraints=(('strict', True),), it should
+        end up in json_schema_extra, not as a native Pydantic Field kwarg."""
+        mf = MissingField(
+            "Root.Val", "val", "Value",
+            type_hint=float,
+            constraints=(("strict", True),),
+        )
+        Model = build_elicitation_schema([mf])
+        schema = Model.model_json_schema()
+        # 'strict' should be in the property's schema, not as a Pydantic native constraint
+        prop = schema["properties"]["val"]
+        self.assertIn("strict", prop)
+        self.assertTrue(prop["strict"])
+
+
 if __name__ == "__main__":
     unittest.main()

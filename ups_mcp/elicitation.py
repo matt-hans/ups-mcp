@@ -191,7 +191,7 @@ def _missing_from_rule(
 # Pydantic Field() natively supports these constraint keys.
 # Everything else goes into json_schema_extra for the JSON Schema output.
 _PYDANTIC_NATIVE_CONSTRAINTS: frozenset[str] = frozenset({
-    "gt", "ge", "lt", "le", "multiple_of", "strict",
+    "gt", "ge", "lt", "le", "multiple_of",
     "min_length", "max_length", "pattern",
 })
 
