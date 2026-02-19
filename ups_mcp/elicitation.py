@@ -18,6 +18,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
+from mcp.server.elicitation import (
+    AcceptedElicitation,
+    DeclinedElicitation,
+    CancelledElicitation,
+)
 from mcp.server.fastmcp import Context
 from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field, create_model
@@ -488,15 +493,15 @@ async def elicit_and_rehydrate(
     if not check_form_elicitation(ctx):
         raise ToolError(json.dumps({
             "code": "ELICITATION_UNSUPPORTED",
-            "message": f"Missing {len(missing)} required field(s) and client does not support form elicitation",
+            "message": f"Missing {len(elicitable)} required field(s) and client does not support form elicitation",
             "reason": "unsupported",
-            "missing": _missing_payload(missing),
+            "missing": _missing_payload(elicitable),
         }))
 
-    schema = build_elicitation_schema(missing)
+    schema = build_elicitation_schema(elicitable)
     try:
         result = await ctx.elicit(
-            message=f"Missing {len(missing)} required field(s) for {tool_label}.",
+            message=f"Missing {len(elicitable)} required field(s) for {tool_label}.",
             schema=schema,
         )
     except ToolError:
@@ -506,29 +511,29 @@ async def elicit_and_rehydrate(
             "code": "ELICITATION_FAILED",
             "message": f"Elicitation request failed: {exc}",
             "reason": "transport_error",
-            "missing": _missing_payload(missing),
+            "missing": _missing_payload(elicitable),
         }))
 
-    if result.action == "accept":
+    if isinstance(result, AcceptedElicitation):
         normalized = normalize_elicited_values(result.data.model_dump())
-        validation_errors = validate_elicited_values(normalized, missing)
+        validation_errors = validate_elicited_values(normalized, elicitable)
         if validation_errors:
             raise ToolError(json.dumps({
                 "code": "ELICITATION_INVALID_RESPONSE",
                 "message": "; ".join(validation_errors),
                 "reason": "validation_errors",
-                "missing": _missing_payload(missing),
+                "missing": _missing_payload(elicitable),
             }))
         try:
             if canonicalize_fn is not None:
                 body = canonicalize_fn(body)
-            updated = rehydrate(body, normalized, missing)
+            updated = rehydrate(body, normalized, elicitable)
         except RehydrationError as exc:
             raise ToolError(json.dumps({
                 "code": "ELICITATION_INVALID_RESPONSE",
                 "message": f"Elicited data conflicts with request structure: {exc}",
                 "reason": "rehydration_error",
-                "missing": _missing_payload(missing),
+                "missing": _missing_payload(elicitable),
             }))
         still_missing = find_missing_fn(updated)
         if still_missing:
@@ -540,18 +545,18 @@ async def elicit_and_rehydrate(
             }))
         return updated
 
-    elif result.action == "decline":
+    elif isinstance(result, DeclinedElicitation):
         raise ToolError(json.dumps({
             "code": "ELICITATION_DECLINED",
             "message": f"User declined to provide missing {tool_label} fields",
             "reason": "declined",
-            "missing": _missing_payload(missing),
+            "missing": _missing_payload(elicitable),
         }))
 
-    else:  # cancel
+    else:  # CancelledElicitation
         raise ToolError(json.dumps({
             "code": "ELICITATION_CANCELLED",
             "message": f"User cancelled {tool_label} field elicitation",
             "reason": "cancelled",
-            "missing": _missing_payload(missing),
+            "missing": _missing_payload(elicitable),
         }))

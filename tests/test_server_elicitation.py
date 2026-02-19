@@ -4,6 +4,7 @@ import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
+from mcp.server.elicitation import AcceptedElicitation, DeclinedElicitation, CancelledElicitation
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import (
     ClientCapabilities,
@@ -12,6 +13,7 @@ from mcp.types import (
     InitializeRequestParams,
     Implementation,
 )
+from pydantic import create_model
 
 import ups_mcp.server as server
 from tests.shipment_fixtures import make_complete_body
@@ -104,11 +106,8 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         body = make_complete_body()
         del body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"]
 
-        mock_data = MagicMock()
-        mock_data.model_dump.return_value = {"shipper_name": "Elicited Corp"}
-        accepted = MagicMock()
-        accepted.action = "accept"
-        accepted.data = mock_data
+        Model = create_model("ElicitedData", shipper_name=(str, ...))
+        accepted = AcceptedElicitation(data=Model(shipper_name="Elicited Corp"))
 
         ctx = self._make_ctx(form_supported=True, elicit_result=accepted)
         result = await server.create_shipment(request_body=body, ctx=ctx)
@@ -118,8 +117,7 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
     async def test_declined_raises_elicitation_declined(self) -> None:
         body = make_complete_body()
         del body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"]
-        declined = MagicMock()
-        declined.action = "decline"
+        declined = DeclinedElicitation()
         ctx = self._make_ctx(form_supported=True, elicit_result=declined)
         with self.assertRaises(ToolError) as cm:
             await server.create_shipment(request_body=body, ctx=ctx)
@@ -129,8 +127,7 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_raises_elicitation_cancelled(self) -> None:
         body = make_complete_body()
         del body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"]
-        cancelled = MagicMock()
-        cancelled.action = "cancel"
+        cancelled = CancelledElicitation()
         ctx = self._make_ctx(form_supported=True, elicit_result=cancelled)
         with self.assertRaises(ToolError) as cm:
             await server.create_shipment(request_body=body, ctx=ctx)
@@ -142,11 +139,8 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         del body["ShipmentRequest"]["Shipment"]["Shipper"]["Name"]
         del body["ShipmentRequest"]["Shipment"]["ShipTo"]["Name"]
 
-        mock_data = MagicMock()
-        mock_data.model_dump.return_value = {"shipper_name": "Filled"}
-        accepted = MagicMock()
-        accepted.action = "accept"
-        accepted.data = mock_data
+        Model = create_model("ElicitedData", shipper_name=(str, ...))
+        accepted = AcceptedElicitation(data=Model(shipper_name="Filled"))
 
         ctx = self._make_ctx(form_supported=True, elicit_result=accepted)
         with self.assertRaises(ToolError) as cm:
@@ -201,14 +195,15 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         # Corrupt the structure so rehydration will fail
         body["ShipmentRequest"]["Shipment"]["Shipper"]["Address"] = "not_a_dict"
 
-        mock_data = MagicMock()
-        mock_data.model_dump.return_value = {
-            "shipper_name": "Test",
-            "shipper_address_line_1": "123 Main",  # This will fail — Address is a string
-        }
-        accepted = MagicMock()
-        accepted.action = "accept"
-        accepted.data = mock_data
+        Model = create_model(
+            "ElicitedData",
+            shipper_name=(str, ...),
+            shipper_address_line_1=(str, ...),
+        )
+        accepted = AcceptedElicitation(data=Model(
+            shipper_name="Test",
+            shipper_address_line_1="123 Main",
+        ))
 
         # Missing fields will include shipper_name and shipper_address_line_1
         # because we deleted Name and corrupted Address
@@ -269,11 +264,8 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         body = make_complete_body()
         del body["ShipmentRequest"]["Shipment"]["Package"][0]["PackageWeight"]["Weight"]
 
-        mock_data = MagicMock()
-        mock_data.model_dump.return_value = {"package_1_weight": "not_a_number"}
-        accepted = MagicMock()
-        accepted.action = "accept"
-        accepted.data = mock_data
+        Model = create_model("ElicitedData", package_1_weight=(str, ...))
+        accepted = AcceptedElicitation(data=Model(package_1_weight="not_a_number"))
 
         ctx = self._make_ctx(form_supported=True, elicit_result=accepted)
         with self.assertRaises(ToolError) as cm:

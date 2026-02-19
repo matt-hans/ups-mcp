@@ -4,6 +4,7 @@ import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
+from mcp.server.elicitation import AcceptedElicitation, DeclinedElicitation, CancelledElicitation
 from mcp.server.fastmcp import Context
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import (
@@ -14,6 +15,7 @@ from mcp.types import (
     InitializeRequestParams,
     Implementation,
 )
+from pydantic import create_model
 
 from ups_mcp.elicitation import (
     FieldRule,
@@ -133,13 +135,11 @@ def _simple_missing():
 
 
 def _make_accepted(data_dict):
-    """Make a mock elicitation result with action=accept."""
-    mock_data = MagicMock()
-    mock_data.model_dump.return_value = data_dict
-    result = MagicMock()
-    result.action = "accept"
-    result.data = mock_data
-    return result
+    """Make a real AcceptedElicitation result for testing."""
+    fields = {k: (type(v) if v is not None else str, ...) for k, v in data_dict.items()}
+    Model = create_model("ElicitedData", **fields)
+    instance = Model(**data_dict)
+    return AcceptedElicitation(data=instance)
 
 
 class ElicitAndRehydrateTests(unittest.IsolatedAsyncioTestCase):
@@ -182,8 +182,7 @@ class ElicitAndRehydrateTests(unittest.IsolatedAsyncioTestCase):
         ctx.elicit.assert_called_once()
 
     async def test_decline_raises_declined(self) -> None:
-        declined = MagicMock()
-        declined.action = "decline"
+        declined = DeclinedElicitation()
         ctx = _make_form_ctx(elicit_result=declined)
 
         with self.assertRaises(ToolError) as cm:
@@ -196,8 +195,7 @@ class ElicitAndRehydrateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["code"], "ELICITATION_DECLINED")
 
     async def test_cancel_raises_cancelled(self) -> None:
-        cancelled = MagicMock()
-        cancelled.action = "cancel"
+        cancelled = CancelledElicitation()
         ctx = _make_form_ctx(elicit_result=cancelled)
 
         with self.assertRaises(ToolError) as cm:
@@ -529,6 +527,51 @@ class WeightValidationEdgeCaseTests(unittest.TestCase):
         errors = validate_elicited_values({"package_1_weight": "0"}, missing)
         self.assertEqual(len(errors), 1)
         self.assertIn("positive, finite", errors[0])
+
+
+class TypedElicitationResultTests(unittest.IsolatedAsyncioTestCase):
+    """Verify elicit_and_rehydrate works with real typed result classes."""
+
+    async def test_accept_with_real_accepted_elicitation(self) -> None:
+        """AcceptedElicitation instance with .data as a real Pydantic model."""
+        Model = create_model("TestModel", name=(str, ...))
+        data_instance = Model(name="Test Corp")
+        accepted = AcceptedElicitation(data=data_instance)
+        ctx = _make_form_ctx(elicit_result=accepted)
+        missing = _simple_missing()
+
+        result = await elicit_and_rehydrate(
+            ctx, {"Root": {}}, missing,
+            find_missing_fn=lambda b: [],
+            tool_label="test",
+        )
+        self.assertEqual(result["Root"]["Name"], "Test Corp")
+
+    async def test_decline_with_real_declined_elicitation(self) -> None:
+        declined = DeclinedElicitation()
+        ctx = _make_form_ctx(elicit_result=declined)
+
+        with self.assertRaises(ToolError) as cm:
+            await elicit_and_rehydrate(
+                ctx, {"Root": {}}, _simple_missing(),
+                find_missing_fn=lambda b: [],
+                tool_label="test",
+            )
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "ELICITATION_DECLINED")
+
+    async def test_cancel_with_real_cancelled_elicitation(self) -> None:
+        cancelled = CancelledElicitation()
+        ctx = _make_form_ctx(elicit_result=cancelled)
+
+        with self.assertRaises(ToolError) as cm:
+            await elicit_and_rehydrate(
+                ctx, {"Root": {}}, _simple_missing(),
+                find_missing_fn=lambda b: [],
+                tool_label="test",
+            )
+        payload = json.loads(str(cm.exception))
+        self.assertEqual(payload["code"], "ELICITATION_CANCELLED")
 
 
 class PydanticConstraintTests(unittest.TestCase):
