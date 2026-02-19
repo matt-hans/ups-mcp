@@ -593,16 +593,8 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
         ):
             missing.append(_missing_from_rule(INTERNATIONAL_DESCRIPTION_RULE))
 
-    # InvoiceLineTotal for forward US→CA/PR (with return-shipment guard)
-    # Key-presence check: if ReturnService key exists with any non-None value,
-    # treat as return intent. Catches {Code:"8"}, {}, "malformed", [etc].
-    # Intentional: non-None malformed values (e.g. "", "x", []) suppress
-    # InvoiceLineTotal prompts to avoid false-positive forward requirements
-    # on attempted returns with bad payloads. UPS API will still reject the
-    # malformed ReturnService itself.
-    # TODO: tighten to isinstance(dict) + Code check. Current permissive
-    # guard is the safer baseline for forward/return classification.
-    is_return = shipment.get("ReturnService") is not None
+    rs = shipment.get("ReturnService")
+    is_return = isinstance(rs, dict) and bool(rs.get("Code"))
     if (
         effective_origin == "US"
         and ship_to_country in ("CA", "PR")

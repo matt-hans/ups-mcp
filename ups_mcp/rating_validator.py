@@ -447,7 +447,8 @@ def find_missing_rate_fields(
             missing.append(_missing_from_rule(RATE_INTL_DESCRIPTION_RULE))
 
     # InvoiceLineTotal for forward US→CA/PR
-    is_return = shipment.get("ReturnService") is not None
+    rs = shipment.get("ReturnService")
+    is_return = isinstance(rs, dict) and bool(rs.get("Code"))
     if (
         effective_origin == "US"
         and ship_to_country in ("CA", "PR")

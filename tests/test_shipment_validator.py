@@ -732,23 +732,21 @@ class FindMissingFieldsInternationalTests(unittest.TestCase):
         self.assertNotIn("invoice_currency_code", flat_keys)
         self.assertNotIn("invoice_monetary_value", flat_keys)
 
-    def test_malformed_return_service_still_guards(self) -> None:
-        """Key present with malformed value = return intent, no invoice required."""
+    def test_malformed_return_service_treated_as_forward(self) -> None:
+        """Non-dict ReturnService = forward shipment, invoice required."""
         body = make_complete_body(shipper_country="US", ship_to_country="CA")
         body["ShipmentRequest"]["Shipment"]["ReturnService"] = "malformed"
         missing = find_missing_fields(body)
         flat_keys = {mf.flat_key for mf in missing}
-        self.assertNotIn("invoice_currency_code", flat_keys)
-        self.assertNotIn("invoice_monetary_value", flat_keys)
+        self.assertIn("invoice_currency_code", flat_keys)
 
-    def test_empty_dict_return_service_still_guards(self) -> None:
-        """Key present with empty dict = return intent, no invoice required."""
+    def test_empty_dict_return_service_treated_as_forward(self) -> None:
+        """Empty dict ReturnService (no Code) = forward shipment, invoice required."""
         body = make_complete_body(shipper_country="US", ship_to_country="CA")
         body["ShipmentRequest"]["Shipment"]["ReturnService"] = {}
         missing = find_missing_fields(body)
         flat_keys = {mf.flat_key for mf in missing}
-        self.assertNotIn("invoice_currency_code", flat_keys)
-        self.assertNotIn("invoice_monetary_value", flat_keys)
+        self.assertIn("invoice_currency_code", flat_keys)
 
     def test_return_service_none_treated_as_forward(self) -> None:
         """ReturnService: None = forward shipment, invoice required."""
@@ -1691,6 +1689,89 @@ class FindMissingFieldsInternationalFormsTests(unittest.TestCase):
         body = make_complete_body(shipper_country="US", ship_to_country="US")
         missing = find_missing_fields(body)
         self.assertEqual(missing, [])
+
+
+class ReturnServiceCheckTests(unittest.TestCase):
+    """ReturnService must be a dict with a non-empty Code to be treated as a return."""
+
+    def _make_us_to_ca_body(self, return_service=None) -> dict:
+        """Build a minimal US->CA body to trigger InvoiceLineTotal check."""
+        body = {
+            "ShipmentRequest": {
+                "Request": {"RequestOption": "nonvalidate"},
+                "Shipment": {
+                    "Shipper": {
+                        "Name": "Test",
+                        "ShipperNumber": "129D9Y",
+                        "Address": {"AddressLine": ["123 Main"], "City": "New York",
+                                    "StateProvinceCode": "NY", "PostalCode": "10001",
+                                    "CountryCode": "US"},
+                        "AttentionName": "Attn", "Phone": {"Number": "1234567890"},
+                    },
+                    "ShipTo": {
+                        "Name": "Recip",
+                        "Address": {"AddressLine": ["456 Elm"], "City": "Toronto",
+                                    "StateProvinceCode": "ON", "PostalCode": "M5V 2T6",
+                                    "CountryCode": "CA"},
+                        "AttentionName": "Recip Attn", "Phone": {"Number": "9876543210"},
+                    },
+                    "Service": {"Code": "07"},
+                    "Description": "Test goods",
+                    "Package": [{"Packaging": {"Code": "02"},
+                                 "PackageWeight": {"UnitOfMeasurement": {"Code": "LBS"},
+                                                   "Weight": "5"}}],
+                    "PaymentInformation": {
+                        "ShipmentCharge": [{"Type": "01",
+                                            "BillShipper": {"AccountNumber": "129D9Y"}}],
+                    },
+                    "ShipmentServiceOptions": {
+                        "InternationalForms": {
+                            "FormType": "01", "CurrencyCode": "USD",
+                            "ReasonForExport": "SALE", "InvoiceNumber": "INV-1",
+                            "InvoiceDate": "20260219",
+                            "Product": [{"Description": "Widget",
+                                         "Unit": {"Number": "1", "Value": "100",
+                                                  "UnitOfMeasurement": {"Code": "PCS"}},
+                                         "OriginCountryCode": "US"}],
+                        },
+                    },
+                },
+            },
+        }
+        if return_service is not None:
+            body["ShipmentRequest"]["Shipment"]["ReturnService"] = return_service
+        return body
+
+    def test_valid_return_service_suppresses_invoice_line_total(self) -> None:
+        body = self._make_us_to_ca_body(return_service={"Code": "8"})
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("invoice_currency_code", flat_keys)
+        self.assertNotIn("invoice_monetary_value", flat_keys)
+
+    def test_empty_string_return_service_requires_invoice(self) -> None:
+        body = self._make_us_to_ca_body(return_service="")
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("invoice_currency_code", flat_keys)
+
+    def test_empty_dict_return_service_requires_invoice(self) -> None:
+        body = self._make_us_to_ca_body(return_service={})
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("invoice_currency_code", flat_keys)
+
+    def test_dict_with_empty_code_requires_invoice(self) -> None:
+        body = self._make_us_to_ca_body(return_service={"Code": ""})
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("invoice_currency_code", flat_keys)
+
+    def test_no_return_service_requires_invoice(self) -> None:
+        body = self._make_us_to_ca_body(return_service=None)
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("invoice_currency_code", flat_keys)
 
 
 if __name__ == "__main__":
