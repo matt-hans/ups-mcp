@@ -310,6 +310,18 @@ SOLD_TO_RULES: list[FieldRule] = [
     ),
 ]
 
+# ---------------------------------------------------------------------------
+# International Forms — EEI filing option
+# Required for EEI form type (11).
+# ---------------------------------------------------------------------------
+
+EEI_FILING_OPTION_CODE_RULE: FieldRule = FieldRule(
+    "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.EEIFilingOption.Code",
+    "eei_filing_code", "EEI filing option",
+    enum_values=("1", "2", "3"),
+    enum_titles=("Shipper Filed", "AES Direct", "UPS Filed"),
+)
+
 
 # ---------------------------------------------------------------------------
 # International Forms helpers
@@ -728,6 +740,12 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
                 for rule in SOLD_TO_RULES:
                     if not _field_exists(body, rule.dot_path):
                         missing.append(_missing_from_rule(rule))
+
+            # EEI filing option required for EEI form (11)
+            if "11" in form_types:
+                eei = intl_forms.get("EEIFilingOption")
+                if not isinstance(eei, dict) or not eei.get("Code"):
+                    missing.append(_missing_from_rule(EEI_FILING_OPTION_CODE_RULE))
 
     # ----- Duties & Taxes payment check -----
 

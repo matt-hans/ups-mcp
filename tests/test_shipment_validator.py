@@ -1997,5 +1997,98 @@ class SoldToRuleTests(unittest.TestCase):
             self.assertTrue(mf.elicitable, f"{mf.flat_key} should be elicitable")
 
 
+class EEIFilingRuleTests(unittest.TestCase):
+    """EEI filing option should be required for form type 11 (EEI)."""
+
+    def _make_eei_body(self, eei_option: dict | None = None) -> dict:
+        """Build US->GB body with FormType 11 and optional EEIFilingOption."""
+        body = {
+            "ShipmentRequest": {
+                "Request": {"RequestOption": "nonvalidate"},
+                "Shipment": {
+                    "Shipper": {
+                        "Name": "Test", "ShipperNumber": "129D9Y",
+                        "Address": {"AddressLine": ["123 Main"], "City": "NYC",
+                                    "StateProvinceCode": "NY", "PostalCode": "10001",
+                                    "CountryCode": "US"},
+                        "AttentionName": "Attn", "Phone": {"Number": "1234567890"},
+                    },
+                    "ShipTo": {
+                        "Name": "Recip",
+                        "Address": {"AddressLine": ["456 Elm"], "City": "London",
+                                    "CountryCode": "GB"},
+                        "AttentionName": "Recip", "Phone": {"Number": "4412345678"},
+                    },
+                    "Service": {"Code": "07"}, "Description": "Test goods",
+                    "Package": [{"Packaging": {"Code": "02"},
+                                 "PackageWeight": {"UnitOfMeasurement": {"Code": "LBS"},
+                                                   "Weight": "5"}}],
+                    "PaymentInformation": {
+                        "ShipmentCharge": [{"Type": "01",
+                                            "BillShipper": {"AccountNumber": "129D9Y"}}],
+                    },
+                    "ShipmentServiceOptions": {
+                        "InternationalForms": {
+                            "FormType": "11", "CurrencyCode": "USD",
+                            "Product": [{"Description": "Widget",
+                                         "Unit": {"Number": "1", "Value": "100",
+                                                  "UnitOfMeasurement": {"Code": "PCS"}},
+                                         "OriginCountryCode": "US"}],
+                        },
+                    },
+                },
+            },
+        }
+        if eei_option is not None:
+            body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"][
+                "InternationalForms"]["EEIFilingOption"] = eei_option
+        return body
+
+    def test_eei_form_requires_filing_code(self) -> None:
+        body = self._make_eei_body()
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("eei_filing_code", flat_keys)
+
+    def test_eei_form_with_code_not_missing(self) -> None:
+        body = self._make_eei_body(eei_option={"Code": "3"})
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("eei_filing_code", flat_keys)
+
+    def test_eei_form_with_empty_code_missing(self) -> None:
+        body = self._make_eei_body(eei_option={"Code": ""})
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("eei_filing_code", flat_keys)
+
+    def test_eei_form_with_empty_dict_missing(self) -> None:
+        body = self._make_eei_body(eei_option={})
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertIn("eei_filing_code", flat_keys)
+
+    def test_non_eei_form_does_not_require_filing(self) -> None:
+        body = self._make_eei_body()
+        body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"][
+            "InternationalForms"]["FormType"] = "01"
+        body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"][
+            "InternationalForms"]["ReasonForExport"] = "SALE"
+        body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"][
+            "InternationalForms"]["InvoiceNumber"] = "INV-1"
+        body["ShipmentRequest"]["Shipment"]["ShipmentServiceOptions"][
+            "InternationalForms"]["InvoiceDate"] = "20260219"
+        missing = find_missing_fields(body)
+        flat_keys = {mf.flat_key for mf in missing}
+        self.assertNotIn("eei_filing_code", flat_keys)
+
+    def test_eei_filing_code_is_elicitable(self) -> None:
+        body = self._make_eei_body()
+        missing = find_missing_fields(body)
+        eei_fields = [mf for mf in missing if mf.flat_key == "eei_filing_code"]
+        self.assertEqual(len(eei_fields), 1)
+        self.assertTrue(eei_fields[0].elicitable)
+
+
 if __name__ == "__main__":
     unittest.main()
