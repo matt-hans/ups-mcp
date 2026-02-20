@@ -9,7 +9,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from .elicitation import FieldRule, MissingField, _missing_from_rule, _field_exists, _set_field
+from .elicitation import FieldRule, MissingField, _missing_from_rule, _field_exists, _set_field, ArrayFieldRule, expand_array_fields
 from .constants import (
     INTERNATIONAL_FORM_TYPES,
     FORMS_REQUIRING_PRODUCTS,
@@ -247,6 +247,79 @@ INTL_FORMS_INVOICE_DATE_RULE: FieldRule = FieldRule(
     "intl_forms_invoice_date",
     "Invoice date (YYYYMMDD format)",
     constraints=(("maxLength", 8), ("pattern", r"^\d{8}$")),
+)
+
+# ---------------------------------------------------------------------------
+# International Forms — Product array rules (elicitable via flat forms)
+# ---------------------------------------------------------------------------
+
+PRODUCT_ITEM_RULES: tuple[FieldRule, ...] = (
+    FieldRule("Description", "description", "Product description",
+              constraints=(("maxLength", 35),)),
+    FieldRule("Unit.Number", "quantity", "Quantity",
+              type_hint=int, constraints=(("gt", 0),)),
+    FieldRule("Unit.Value", "value", "Unit value ($)",
+              type_hint=float, constraints=(("gt", 0),)),
+    FieldRule("Unit.UnitOfMeasurement.Code", "unit_code", "Unit of measure",
+              enum_values=("PCS", "BOX", "DZ", "EA", "KG", "LB", "PR"),
+              enum_titles=("Pieces", "Box", "Dozen", "Each", "Kilogram", "Pound", "Pair"),
+              default="PCS"),
+    FieldRule("OriginCountryCode", "origin_country", "Country of origin",
+              constraints=(("maxLength", 2), ("pattern", "^[A-Z]{2}$"))),
+)
+
+PRODUCT_ARRAY_RULE: ArrayFieldRule = ArrayFieldRule(
+    array_dot_path="ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Product",
+    item_prefix="product",
+    item_rules=PRODUCT_ITEM_RULES,
+)
+
+# ---------------------------------------------------------------------------
+# International Forms — SoldTo (invoice recipient) rules
+# Required for Invoice (01) and USMCA (04) forms.
+# ---------------------------------------------------------------------------
+
+SOLD_TO_RULES: list[FieldRule] = [
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Name",
+        "sold_to_name", "Sold-to party name",
+        constraints=(("maxLength", 35),),
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.AttentionName",
+        "sold_to_attention_name", "Sold-to attention name",
+        constraints=(("maxLength", 35),),
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Phone.Number",
+        "sold_to_phone", "Sold-to phone number",
+        constraints=(("maxLength", 15),),
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Address.AddressLine",
+        "sold_to_address_line", "Sold-to street address",
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Address.City",
+        "sold_to_city", "Sold-to city",
+    ),
+    FieldRule(
+        "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Contacts.SoldTo.Address.CountryCode",
+        "sold_to_country_code", "Sold-to country code",
+        constraints=(("maxLength", 2), ("pattern", "^[A-Z]{2}$")),
+    ),
+]
+
+# ---------------------------------------------------------------------------
+# International Forms — EEI filing option
+# Required for EEI form type (11).
+# ---------------------------------------------------------------------------
+
+EEI_FILING_OPTION_CODE_RULE: FieldRule = FieldRule(
+    "ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.EEIFilingOption.Code",
+    "eei_filing_code", "EEI filing option",
+    enum_values=("1", "2", "3"),
+    enum_titles=("Shipper Filed", "AES Direct", "UPS Filed"),
 )
 
 
@@ -593,16 +666,8 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
         ):
             missing.append(_missing_from_rule(INTERNATIONAL_DESCRIPTION_RULE))
 
-    # InvoiceLineTotal for forward US→CA/PR (with return-shipment guard)
-    # Key-presence check: if ReturnService key exists with any non-None value,
-    # treat as return intent. Catches {Code:"8"}, {}, "malformed", [etc].
-    # Intentional: non-None malformed values (e.g. "", "x", []) suppress
-    # InvoiceLineTotal prompts to avoid false-positive forward requirements
-    # on attempted returns with bad payloads. UPS API will still reject the
-    # malformed ReturnService itself.
-    # TODO: tighten to isinstance(dict) + Code check. Current permissive
-    # guard is the safer baseline for forward/return classification.
-    is_return = shipment.get("ReturnService") is not None
+    rs = shipment.get("ReturnService")
+    is_return = isinstance(rs, dict) and bool(rs.get("Code"))
     if (
         effective_origin == "US"
         and ship_to_country in ("CA", "PR")
@@ -651,27 +716,9 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
             if not form_types:
                 missing.append(_missing_from_rule(INTL_FORMS_FORM_TYPE_RULE))
 
-            # Product[] missing for forms that require it
+            # Product array: expand into indexed elicitable fields
             if form_types and any(ft in FORMS_REQUIRING_PRODUCTS for ft in form_types):
-                products = intl_forms.get("Product")
-                has_products = (
-                    isinstance(products, list) and len(products) > 0
-                ) or isinstance(products, dict)
-                if not has_products:
-                    missing.append(MissingField(
-                        dot_path="ShipmentRequest.Shipment.ShipmentServiceOptions.InternationalForms.Product",
-                        flat_key="intl_forms_product_required",
-                        prompt=(
-                            "This form type requires a Product array. Add Product to InternationalForms "
-                            "with at least: Description, Unit (Number, Value, UnitOfMeasurement.Code), "
-                            "OriginCountryCode. Example: "
-                            '"Product": [{"Description": "Electronics", '
-                            '"Unit": {"Number": "1", "Value": "100", '
-                            '"UnitOfMeasurement": {"Code": "PCS"}}, '
-                            '"CommodityCode": "8471.30", "OriginCountryCode": "US"}]'
-                        ),
-                        elicitable=False,
-                    ))
+                missing.extend(expand_array_fields(PRODUCT_ARRAY_RULE, body))
 
             # CurrencyCode missing for forms that require it (01, 05)
             if form_types and any(ft in FORMS_REQUIRING_CURRENCY for ft in form_types):
@@ -687,6 +734,18 @@ def find_missing_fields(request_body: dict) -> list[MissingField]:
                 # InvoiceDate not required for returns
                 if not is_return and not _field_exists(intl_forms, "InvoiceDate"):
                     missing.append(_missing_from_rule(INTL_FORMS_INVOICE_DATE_RULE))
+
+            # SoldTo required for Invoice (01) and USMCA (04)
+            if any(ft in ("01", "04") for ft in form_types):
+                for rule in SOLD_TO_RULES:
+                    if not _field_exists(body, rule.dot_path):
+                        missing.append(_missing_from_rule(rule))
+
+            # EEI filing option required for EEI form (11)
+            if "11" in form_types:
+                eei = intl_forms.get("EEIFilingOption")
+                if not isinstance(eei, dict) or not eei.get("Code"):
+                    missing.append(_missing_from_rule(EEI_FILING_OPTION_CODE_RULE))
 
     # ----- Duties & Taxes payment check -----
 

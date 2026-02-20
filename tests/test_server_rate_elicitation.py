@@ -4,6 +4,7 @@ import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
+from mcp.server.elicitation import AcceptedElicitation, DeclinedElicitation, CancelledElicitation
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import (
     ClientCapabilities,
@@ -12,6 +13,7 @@ from mcp.types import (
     InitializeRequestParams,
     Implementation,
 )
+from pydantic import create_model
 
 import ups_mcp.server as server
 from tests.rating_fixtures import make_complete_rate_body
@@ -122,11 +124,8 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         body = make_complete_rate_body()
         del body["RateRequest"]["Shipment"]["Shipper"]["Name"]
 
-        mock_data = MagicMock()
-        mock_data.model_dump.return_value = {"shipper_name": "Elicited Corp"}
-        accepted = MagicMock()
-        accepted.action = "accept"
-        accepted.data = mock_data
+        Model = create_model("ElicitedData", shipper_name=(str, ...))
+        accepted = AcceptedElicitation(data=Model(shipper_name="Elicited Corp"))
 
         ctx = self._make_ctx(form_supported=True, elicit_result=accepted)
         result = await server.rate_shipment(
@@ -138,8 +137,7 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
     async def test_declined_raises_elicitation_declined(self) -> None:
         body = make_complete_rate_body()
         del body["RateRequest"]["Shipment"]["Shipper"]["Name"]
-        declined = MagicMock()
-        declined.action = "decline"
+        declined = DeclinedElicitation()
         ctx = self._make_ctx(form_supported=True, elicit_result=declined)
         with self.assertRaises(ToolError) as cm:
             await server.rate_shipment(
@@ -151,8 +149,7 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_raises_elicitation_cancelled(self) -> None:
         body = make_complete_rate_body()
         del body["RateRequest"]["Shipment"]["Shipper"]["Name"]
-        cancelled = MagicMock()
-        cancelled.action = "cancel"
+        cancelled = CancelledElicitation()
         ctx = self._make_ctx(form_supported=True, elicit_result=cancelled)
         with self.assertRaises(ToolError) as cm:
             await server.rate_shipment(
@@ -161,16 +158,14 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(str(cm.exception))
         self.assertEqual(payload["code"], "ELICITATION_CANCELLED")
 
-    async def test_still_missing_after_accept_raises_incomplete(self) -> None:
+    async def test_still_missing_after_accept_exhausts_retries(self) -> None:
+        """Persistently missing fields after accept exhaust retries."""
         body = make_complete_rate_body()
         del body["RateRequest"]["Shipment"]["Shipper"]["Name"]
         del body["RateRequest"]["Shipment"]["ShipTo"]["Name"]
 
-        mock_data = MagicMock()
-        mock_data.model_dump.return_value = {"shipper_name": "Filled"}
-        accepted = MagicMock()
-        accepted.action = "accept"
-        accepted.data = mock_data
+        Model = create_model("ElicitedData", shipper_name=(str, ...))
+        accepted = AcceptedElicitation(data=Model(shipper_name="Filled"))
 
         ctx = self._make_ctx(form_supported=True, elicit_result=accepted)
         with self.assertRaises(ToolError) as cm:
@@ -178,7 +173,7 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
                 requestoption="Rate", request_body=body, ctx=ctx,
             )
         payload = json.loads(str(cm.exception))
-        self.assertEqual(payload["code"], "INCOMPLETE_SHIPMENT")
+        self.assertEqual(payload["code"], "ELICITATION_MAX_RETRIES")
 
     # --- Error cases ---
 
@@ -207,15 +202,13 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["code"], "MALFORMED_REQUEST")
         self.assertEqual(payload["reason"], "ambiguous_payer")
 
-    async def test_validation_errors_raise_structured_tool_error(self) -> None:
+    async def test_validation_errors_exhaust_retries(self) -> None:
+        """Persistent invalid elicited values exhaust retries."""
         body = make_complete_rate_body()
         del body["RateRequest"]["Shipment"]["Package"][0]["PackageWeight"]["Weight"]
 
-        mock_data = MagicMock()
-        mock_data.model_dump.return_value = {"package_1_weight": "not_a_number"}
-        accepted = MagicMock()
-        accepted.action = "accept"
-        accepted.data = mock_data
+        Model = create_model("ElicitedData", package_1_weight=(str, ...))
+        accepted = AcceptedElicitation(data=Model(package_1_weight="not_a_number"))
 
         ctx = self._make_ctx(form_supported=True, elicit_result=accepted)
         with self.assertRaises(ToolError) as cm:
@@ -223,8 +216,7 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
                 requestoption="Rate", request_body=body, ctx=ctx,
             )
         payload = json.loads(str(cm.exception))
-        self.assertEqual(payload["code"], "ELICITATION_INVALID_RESPONSE")
-        self.assertEqual(payload["reason"], "validation_errors")
+        self.assertEqual(payload["code"], "ELICITATION_MAX_RETRIES")
 
     async def test_elicitation_transport_failure_raises_structured_error(self) -> None:
         body = make_complete_rate_body()

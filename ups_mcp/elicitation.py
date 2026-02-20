@@ -13,10 +13,16 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
+from mcp.server.elicitation import (
+    AcceptedElicitation,
+    DeclinedElicitation,
+    CancelledElicitation,
+)
 from mcp.server.fastmcp import Context
 from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field, create_model
@@ -64,6 +70,21 @@ class FieldRule:
     enum_titles: tuple[str, ...] | None = None  # paired with enum_values for oneOf
     default: Any = None
     constraints: tuple[tuple[str, Any], ...] | None = None  # min, max, pattern, maxLength, etc.
+
+
+@dataclass(frozen=True)
+class ArrayFieldRule:
+    """Declares an array of structured items elicitable via flat forms.
+
+    The system flattens each item's sub-fields into indexed scalar keys
+    (e.g. product_1_description, product_1_value) and reconstructs the
+    nested array during rehydration.
+    """
+    array_dot_path: str
+    item_prefix: str
+    item_rules: tuple[FieldRule, ...]
+    max_items: int = 10
+    default_count: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -185,13 +206,94 @@ def _missing_from_rule(
 
 
 # ---------------------------------------------------------------------------
+# Array flattening helpers
+# ---------------------------------------------------------------------------
+
+def _get_existing_array(data: dict, dot_path: str) -> list[dict]:
+    """Navigate to dot_path and return the existing array items.
+
+    Returns [] if the path doesn't exist or isn't a list/dict.
+    A single dict is normalized to [dict].
+    """
+    current: Any = data
+    for segment in dot_path.split("."):
+        key, idx = _parse_path_segment(segment)
+        if not isinstance(current, dict) or key not in current:
+            return []
+        current = current[key]
+        if idx is not None:
+            if not isinstance(current, list) or len(current) <= idx:
+                return []
+            current = current[idx]
+    if isinstance(current, dict):
+        return [current]
+    if isinstance(current, list):
+        return [item if isinstance(item, dict) else {} for item in current]
+    return []
+
+
+def expand_array_fields(
+    rule: ArrayFieldRule,
+    data: dict,
+    start_count: int | None = None,
+) -> list[MissingField]:
+    """Expand an ArrayFieldRule into indexed MissingFields for each item.
+
+    Inspects existing data at array_dot_path to determine item count.
+    For each item, checks which sub-fields are missing and generates
+    indexed MissingFields with flat keys like product_1_description.
+    """
+    existing = _get_existing_array(data, rule.array_dot_path)
+    count = start_count if start_count is not None else max(len(existing), rule.default_count)
+    count = min(count, rule.max_items)
+
+    missing: list[MissingField] = []
+    for i in range(count):
+        n = i + 1
+        item_data = existing[i] if i < len(existing) else {}
+        for sub_rule in rule.item_rules:
+            if not _field_exists(item_data, sub_rule.dot_path):
+                missing.append(_missing_from_rule(
+                    sub_rule,
+                    dot_path=f"{rule.array_dot_path}[{i}].{sub_rule.dot_path}",
+                    flat_key=f"{rule.item_prefix}_{n}_{sub_rule.flat_key}",
+                    prompt=f"Item {n}: {sub_rule.prompt}",
+                ))
+    return missing
+
+
+def reconstruct_array(
+    flat_data: dict[str, str],
+    rule: ArrayFieldRule,
+    count: int,
+) -> list[dict]:
+    """Reconstruct a nested array from flat indexed elicitation values.
+
+    Matches keys like product_1_description, product_1_value and builds
+    nested dicts using _set_field for each item's sub-rules.
+    """
+    items: list[dict] = []
+    for i in range(count):
+        n = i + 1
+        item: dict = {}
+        for sub_rule in rule.item_rules:
+            flat_key = f"{rule.item_prefix}_{n}_{sub_rule.flat_key}"
+            value = flat_data.get(flat_key)
+            if value is not None and value != "":
+                _set_field(item, sub_rule.dot_path, value)
+        if item:
+            items.append(item)
+    return items
+
+
+# ---------------------------------------------------------------------------
 # Elicitation schema generation
 # ---------------------------------------------------------------------------
 
 # Pydantic Field() natively supports these constraint keys.
 # Everything else goes into json_schema_extra for the JSON Schema output.
 _PYDANTIC_NATIVE_CONSTRAINTS: frozenset[str] = frozenset({
-    "gt", "ge", "lt", "le", "multiple_of", "strict",
+    "gt", "ge", "lt", "le", "multiple_of",
     "min_length", "max_length", "pattern",
 })
 
@@ -330,8 +432,8 @@ def validate_elicited_values(
         if _WEIGHT_VALUE_KEYS.match(key):
             try:
                 w = float(value)
-                if w <= 0:
-                    errors.append(f"{label}: must be a positive number")
+                if not math.isfinite(w) or w <= 0:
+                    errors.append(f"{label}: must be a positive, finite number")
             except (ValueError, TypeError):
                 errors.append(f"{label}: must be a number")
 
@@ -453,23 +555,25 @@ async def elicit_and_rehydrate(
     find_missing_fn: Callable[[dict], list[MissingField]],
     tool_label: str,
     canonicalize_fn: Callable[[dict], dict] | None = None,
+    max_retries: int = 3,
+    array_rules: list[ArrayFieldRule] | None = None,
 ) -> dict:
-    """Centralized elicitation flow: check support, elicit, validate, rehydrate.
+    """Centralized elicitation flow with retry on validation errors.
 
-    1. Check form elicitation support -> raise ELICITATION_UNSUPPORTED if not
-    2. Build schema -> call ctx.elicit() -> handle transport errors
-    3. On accept: normalize -> validate -> rehydrate -> re-run find_missing_fn
-       -> raise if still missing
-    4. On decline/cancel: raise appropriate ToolError
-
-    The ``canonicalize_fn`` is called before rehydration (for body normalization).
-    Passed as ``None`` for tools that don't need it.
+    1. Separate structural (non-elicitable) fields -> raise STRUCTURAL_FIELDS_REQUIRED
+    2. Check form elicitation support -> raise ELICITATION_UNSUPPORTED
+    3. Loop up to max_retries:
+       a. Build schema -> call ctx.elicit()
+       b. On accept: normalize -> validate -> if errors, retry with error context
+       c. On valid: rehydrate -> re-run find_missing_fn
+          -> if still missing (elicitable), retry with remaining fields
+          -> if still missing (structural), raise immediately
+          -> if complete, return updated body
+       d. On decline/cancel: raise immediately
+    4. After max_retries exhausted: raise ELICITATION_MAX_RETRIES
 
     Returns the updated body dict on success.
     """
-    # Separate structural (non-elicitable) fields from scalar ones.
-    # Structural fields (dicts/arrays) can't be collected via flat forms;
-    # they carry guidance in their prompt and trigger an immediate error.
     structural = [mf for mf in missing if not mf.elicitable]
     elicitable = [mf for mf in missing if mf.elicitable]
 
@@ -487,70 +591,106 @@ async def elicit_and_rehydrate(
     if not check_form_elicitation(ctx):
         raise ToolError(json.dumps({
             "code": "ELICITATION_UNSUPPORTED",
-            "message": f"Missing {len(missing)} required field(s) and client does not support form elicitation",
+            "message": (
+                f"Missing {len(elicitable)} required field(s) and client "
+                "does not support form elicitation"
+            ),
             "reason": "unsupported",
-            "missing": _missing_payload(missing),
+            "missing": _missing_payload(elicitable),
         }))
 
-    schema = build_elicitation_schema(missing)
-    try:
-        result = await ctx.elicit(
-            message=f"Missing {len(missing)} required field(s) for {tool_label}.",
-            schema=schema,
-        )
-    except ToolError:
-        raise  # re-raise ToolErrors as-is
-    except Exception as exc:
-        raise ToolError(json.dumps({
-            "code": "ELICITATION_FAILED",
-            "message": f"Elicitation request failed: {exc}",
-            "reason": "transport_error",
-            "missing": _missing_payload(missing),
-        }))
+    schema = build_elicitation_schema(elicitable)
+    base_message = f"Missing {len(elicitable)} required field(s) for {tool_label}."
+    current_message = base_message
 
-    if result.action == "accept":
-        normalized = normalize_elicited_values(result.data.model_dump())
-        validation_errors = validate_elicited_values(normalized, missing)
-        if validation_errors:
-            raise ToolError(json.dumps({
-                "code": "ELICITATION_INVALID_RESPONSE",
-                "message": "; ".join(validation_errors),
-                "reason": "validation_errors",
-                "missing": _missing_payload(missing),
-            }))
+    for attempt in range(max_retries):
         try:
-            if canonicalize_fn is not None:
-                body = canonicalize_fn(body)
-            updated = rehydrate(body, normalized, missing)
-        except RehydrationError as exc:
+            result = await ctx.elicit(message=current_message, schema=schema)
+        except ToolError:
+            raise
+        except Exception as exc:
             raise ToolError(json.dumps({
-                "code": "ELICITATION_INVALID_RESPONSE",
-                "message": f"Elicited data conflicts with request structure: {exc}",
-                "reason": "rehydration_error",
-                "missing": _missing_payload(missing),
+                "code": "ELICITATION_FAILED",
+                "message": f"Elicitation request failed: {exc}",
+                "reason": "transport_error",
+                "missing": _missing_payload(elicitable),
             }))
-        still_missing = find_missing_fn(updated)
-        if still_missing:
+
+        if isinstance(result, AcceptedElicitation):
+            normalized = normalize_elicited_values(result.data.model_dump())
+            validation_errors = validate_elicited_values(normalized, elicitable)
+
+            if validation_errors:
+                error_text = "\n".join(f"- {err}" for err in validation_errors)
+                current_message = (
+                    f"Please correct the following:\n{error_text}"
+                    f"\n\n{base_message}"
+                )
+                continue
+
+            try:
+                if canonicalize_fn is not None:
+                    body = canonicalize_fn(body)
+                updated = rehydrate(body, normalized, elicitable)
+            except RehydrationError as exc:
+                raise ToolError(json.dumps({
+                    "code": "ELICITATION_INVALID_RESPONSE",
+                    "message": f"Elicited data conflicts with request structure: {exc}",
+                    "reason": "rehydration_error",
+                    "missing": _missing_payload(elicitable),
+                }))
+
+            still_missing = find_missing_fn(updated)
+            if not still_missing:
+                return updated
+
+            still_structural = [mf for mf in still_missing if not mf.elicitable]
+            still_elicitable = [mf for mf in still_missing if mf.elicitable]
+
+            if still_structural:
+                raise ToolError(json.dumps({
+                    "code": "STRUCTURAL_FIELDS_REQUIRED",
+                    "message": (
+                        f"Missing {len(still_structural)} structural field(s) "
+                        "that must be added directly to request_body"
+                    ),
+                    "reason": "structural",
+                    "missing": _missing_payload(still_structural),
+                }))
+
+            elicitable = still_elicitable
+            schema = build_elicitation_schema(elicitable)
+            body = updated
+            error_text = "\n".join(f"- {mf.prompt}" for mf in still_elicitable)
+            base_message = (
+                f"Missing {len(still_elicitable)} required field(s) for {tool_label}."
+            )
+            current_message = (
+                f"Still missing after elicitation:\n{error_text}\n\n{base_message}"
+            )
+            continue
+
+        elif isinstance(result, DeclinedElicitation):
             raise ToolError(json.dumps({
-                "code": "INCOMPLETE_SHIPMENT",
-                "message": "Still missing required fields after elicitation",
-                "reason": "still_missing",
-                "missing": _missing_payload(still_missing),
+                "code": "ELICITATION_DECLINED",
+                "message": f"User declined to provide missing {tool_label} fields",
+                "reason": "declined",
+                "missing": _missing_payload(elicitable),
             }))
-        return updated
 
-    elif result.action == "decline":
-        raise ToolError(json.dumps({
-            "code": "ELICITATION_DECLINED",
-            "message": f"User declined to provide missing {tool_label} fields",
-            "reason": "declined",
-            "missing": _missing_payload(missing),
-        }))
+        else:  # CancelledElicitation
+            raise ToolError(json.dumps({
+                "code": "ELICITATION_CANCELLED",
+                "message": f"User cancelled {tool_label} field elicitation",
+                "reason": "cancelled",
+                "missing": _missing_payload(elicitable),
+            }))
 
-    else:  # cancel
-        raise ToolError(json.dumps({
-            "code": "ELICITATION_CANCELLED",
-            "message": f"User cancelled {tool_label} field elicitation",
-            "reason": "cancelled",
-            "missing": _missing_payload(missing),
-        }))
+    raise ToolError(json.dumps({
+        "code": "ELICITATION_MAX_RETRIES",
+        "message": (
+            f"Maximum elicitation retries ({max_retries}) exceeded for {tool_label}"
+        ),
+        "reason": "max_retries",
+        "missing": _missing_payload(elicitable),
+    }))
