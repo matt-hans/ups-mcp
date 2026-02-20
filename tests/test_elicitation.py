@@ -775,6 +775,96 @@ class ArrayElicitationIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["Root"]["Name"], "Test Corp")
 
+    async def test_sparse_product_2_targets_correct_index(self) -> None:
+        """Sparse product_2_* updates must target index [1], not collapse to [0]."""
+        rule = self._make_rule()
+        # Only product_2 fields are missing; product_1 is complete
+        missing = [
+            MissingField("Root.Items.Product[1].Description",
+                         "product_2_description", "Item 2: Product description"),
+            MissingField("Root.Items.Product[1].Value",
+                         "product_2_value", "Item 2: Unit value", type_hint=float),
+        ]
+        accepted = _make_accepted({
+            "product_2_description": "Gadget",
+            "product_2_value": "50",
+        })
+        ctx = _make_form_ctx(elicit_result=accepted)
+
+        body = {"Root": {"Items": {"Product": [
+            {"Description": "Widget", "Value": "100"},
+        ]}}}
+        result = await elicit_and_rehydrate(
+            ctx, body, missing,
+            find_missing_fn=lambda b: [],
+            tool_label="test",
+            array_rules=[rule],
+        )
+        products = result["Root"]["Items"]["Product"]
+        # Original item preserved at index 0
+        self.assertEqual(products[0]["Description"], "Widget")
+        self.assertEqual(products[0]["Value"], "100")
+        # New item at index 1
+        self.assertEqual(products[1]["Description"], "Gadget")
+        self.assertEqual(products[1]["Value"], "50")
+
+    async def test_existing_multi_item_array_preserves_all(self) -> None:
+        """Existing multi-item array preserves untouched items."""
+        rule = self._make_rule()
+        # Only item 1 is missing Value; item 2 is complete
+        missing = [
+            MissingField("Root.Items.Product[0].Value",
+                         "product_1_value", "Item 1: Unit value", type_hint=float),
+        ]
+        accepted = _make_accepted({"product_1_value": "75"})
+        ctx = _make_form_ctx(elicit_result=accepted)
+
+        body = {"Root": {"Items": {"Product": [
+            {"Description": "Widget"},
+            {"Description": "Gadget", "Value": "50"},
+        ]}}}
+        result = await elicit_and_rehydrate(
+            ctx, body, missing,
+            find_missing_fn=lambda b: [],
+            tool_label="test",
+            array_rules=[rule],
+        )
+        products = result["Root"]["Items"]["Product"]
+        self.assertEqual(len(products), 2)
+        self.assertEqual(products[0]["Description"], "Widget")
+        self.assertEqual(products[0]["Value"], "75")
+        self.assertEqual(products[1]["Description"], "Gadget")
+        self.assertEqual(products[1]["Value"], "50")
+
+    async def test_nested_leaf_field_filled_via_rehydration(self) -> None:
+        """Deeply nested leaf fields (e.g. Unit.UnitOfMeasurement.Code) are
+        filled correctly by rehydrate() via indexed dot-paths."""
+        rule = ArrayFieldRule(
+            array_dot_path="Root.Items.Product",
+            item_prefix="product",
+            item_rules=(
+                FieldRule("Unit.UnitOfMeasurement.Code", "unit_code", "Unit code"),
+            ),
+        )
+        missing = [
+            MissingField("Root.Items.Product[0].Unit.UnitOfMeasurement.Code",
+                         "product_1_unit_code", "Item 1: Unit code"),
+        ]
+        accepted = _make_accepted({"product_1_unit_code": "PCS"})
+        ctx = _make_form_ctx(elicit_result=accepted)
+
+        body = {"Root": {"Items": {"Product": [
+            {"Description": "Widget", "Unit": {"UnitOfMeasurement": {}}},
+        ]}}}
+        result = await elicit_and_rehydrate(
+            ctx, body, missing,
+            find_missing_fn=lambda b: [],
+            tool_label="test",
+            array_rules=[rule],
+        )
+        code = result["Root"]["Items"]["Product"][0]["Unit"]["UnitOfMeasurement"]["Code"]
+        self.assertEqual(code, "PCS")
+
 
 class ArrayFieldRuleTests(unittest.TestCase):
     """Tests for the ArrayFieldRule data structure and helper functions."""
