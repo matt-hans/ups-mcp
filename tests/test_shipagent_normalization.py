@@ -50,6 +50,7 @@ class ShipAgentCapabilitiesAndErrorTests(unittest.TestCase):
         self.assertEqual(
             error,
             {
+                "success": False,
                 "error": {
                     "category": "normalization",
                     "code": "UPS_NORMALIZATION_ERROR",
@@ -123,7 +124,8 @@ class ShipAgentCapabilitiesAndErrorTests(unittest.TestCase):
             with self.subTest(expected["category"]):
                 error = to_safe_error(exc, "corr_map")
 
-                self.assertEqual(set(error), {"error"})
+                self.assertEqual(set(error), {"success", "error"})
+                self.assertIs(error["success"], False)
                 self.assertEqual(
                     error["error"],
                     {
@@ -152,6 +154,7 @@ class ShipAgentCapabilitiesAndErrorTests(unittest.TestCase):
         self.assertEqual(
             error,
             {
+                "success": False,
                 "error": {
                     "category": "validation",
                     "code": "UPS_VALIDATION_ERROR",
@@ -191,6 +194,8 @@ class ShipAgentCapabilitiesAndErrorTests(unittest.TestCase):
             with self.subTest(payload["code"]):
                 error = to_safe_error(ToolError(json.dumps(payload)), "corr_domain")
 
+                self.assertEqual(set(error), {"success", "error"})
+                self.assertIs(error["success"], False)
                 self.assertEqual(error["error"]["category"], "validation")
                 self.assertEqual(error["error"]["code"], "UPS_VALIDATION_ERROR")
                 serialized = json.dumps(error).lower()

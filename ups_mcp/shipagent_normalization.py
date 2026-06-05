@@ -73,6 +73,7 @@ def build_shipagent_capabilities(server_version: str) -> dict[str, Any]:
 
 def to_normalization_error(correlation_id: str) -> dict[str, Any]:
     return {
+        "success": False,
         "error": {
             "category": "normalization",
             "code": "UPS_NORMALIZATION_ERROR",
@@ -90,6 +91,7 @@ def to_safe_error(exc: BaseException, correlation_id: str) -> dict[str, Any]:
 
     public_error = _CATEGORY_TO_PUBLIC_ERROR.get(category, _CATEGORY_TO_PUBLIC_ERROR["unknown"])
     return {
+        "success": False,
         "error": {
             "category": category if category in _CATEGORY_TO_PUBLIC_ERROR else "unknown",
             "code": public_error["code"],
