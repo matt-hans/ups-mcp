@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -126,6 +127,8 @@ def _classify_exception(exc: BaseException) -> str:
     code_status = _coerce_int(code)
     if status_code is None:
         status_code = code_status
+    if status_code is None:
+        status_code = _coerce_status_from_text(message)
     text = f"{code or ''} {message or ''}".lower()
 
     if status_code in {401, 403} or code_upper in {
@@ -139,7 +142,12 @@ def _classify_exception(exc: BaseException) -> str:
         return "rate_limit"
     if status_code in {502, 503, 504}:
         return "service_unavailable"
-    if code_upper in {"REQUEST_ERROR", "TRANSPORT_ERROR", "NETWORK_ERROR"}:
+    if status_code == 408 or code_upper in {
+        "REQUEST_ERROR",
+        "REQUEST_TIMEOUT",
+        "TRANSPORT_ERROR",
+        "NETWORK_ERROR",
+    }:
         return "transport"
     if status_code is not None and 400 <= status_code < 500:
         return "validation"
@@ -173,6 +181,13 @@ def _coerce_int(value: Any) -> int | None:
             except ValueError:
                 return None
     return None
+
+
+def _coerce_status_from_text(value: str | None) -> int | None:
+    if value is None:
+        return None
+    match = re.search(r"\b([1-5][0-9]{2})\b", value)
+    return int(match.group(1)) if match else None
 
 
 def _as_mapping(value: Any) -> dict[str, Any]:

@@ -134,6 +134,71 @@ class ShipAgentCapabilitiesAndErrorTests(unittest.TestCase):
                     },
                 )
 
+    def test_to_safe_error_prioritizes_status_text_in_request_errors(self) -> None:
+        cases = [
+            (
+                {"code": "REQUEST_ERROR", "message": "401 Unauthorized"},
+                {
+                    "category": "auth",
+                    "code": "UPS_AUTH_ERROR",
+                    "message": "UPS authentication failed.",
+                    "retryable": False,
+                },
+            ),
+            (
+                {"code": "REQUEST_ERROR", "message": "403 Forbidden"},
+                {
+                    "category": "auth",
+                    "code": "UPS_AUTH_ERROR",
+                    "message": "UPS authentication failed.",
+                    "retryable": False,
+                },
+            ),
+            (
+                {"code": "REQUEST_ERROR", "message": "429 Too Many Requests"},
+                {
+                    "category": "rate_limit",
+                    "code": "UPS_RATE_LIMIT_ERROR",
+                    "message": "UPS rate limit exceeded.",
+                    "retryable": True,
+                },
+            ),
+        ]
+
+        for payload, expected in cases:
+            with self.subTest(payload["message"]):
+                error = to_safe_error(ToolError(json.dumps(payload)), "corr_request")
+
+                self.assertEqual(set(error), {"success", "error"})
+                self.assertIs(error["success"], False)
+                self.assertEqual(
+                    error["error"],
+                    {
+                        **expected,
+                        "correlation_id": "corr_request",
+                    },
+                )
+
+    def test_to_safe_error_maps_direct_request_timeout_as_transport(self) -> None:
+        error = to_safe_error(
+            ToolError(json.dumps({"status_code": 408, "code": "REQUEST_TIMEOUT"})),
+            "corr_timeout",
+        )
+
+        self.assertEqual(
+            error,
+            {
+                "success": False,
+                "error": {
+                    "category": "transport",
+                    "code": "UPS_TRANSPORT_ERROR",
+                    "message": "UPS transport request failed.",
+                    "correlation_id": "corr_timeout",
+                    "retryable": True,
+                },
+            },
+        )
+
     def test_to_safe_error_does_not_leak_raw_ups_details(self) -> None:
         exc = ToolError(
             json.dumps(
