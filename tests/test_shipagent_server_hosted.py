@@ -13,6 +13,7 @@ from mcp.types import (
 
 import ups_mcp.server as server
 from tests.rating_fixtures import make_complete_rate_body
+from tests.shipment_fixtures import make_complete_body
 
 
 class _FakeToolManager:
@@ -29,6 +30,27 @@ class _FakeToolManager:
         self.rate_exception = rate_exception
         self.validate_address_response = validate_address_response or _address_valid_response()
         self.validate_address_exception = validate_address_exception
+        self.create_shipment_response: dict = {
+            "ShipmentResponse": {
+                "ShipmentResults": {
+                    "ShipmentIdentificationNumber": "1ZSHIP",
+                    "ShipmentCharges": {
+                        "TotalCharges": {
+                            "CurrencyCode": "USD",
+                            "MonetaryValue": "20.00",
+                        }
+                    },
+                    "PackageResults": {
+                        "TrackingNumber": "1ZTRACK1",
+                        "ShippingLabel": {
+                            "ImageFormat": {"Code": "ZPL"},
+                            "GraphicImage": "QkFTRTY0UERG",
+                        },
+                    },
+                }
+            }
+        }
+        self.create_shipment_exception: BaseException | None = None
 
     def rate_shipment(self, **kwargs):  # noqa: ANN003
         self.calls.append(("rate_shipment", kwargs))
@@ -44,7 +66,9 @@ class _FakeToolManager:
 
     def create_shipment(self, **kwargs):  # noqa: ANN003
         self.calls.append(("create_shipment", kwargs))
-        return {"ShipmentResponse": {"ShipmentResults": {}}}
+        if self.create_shipment_exception is not None:
+            raise self.create_shipment_exception
+        return self.create_shipment_response
 
 
 def _rate_quote_response(
@@ -754,6 +778,294 @@ class ShipAgentHostedServerTests(unittest.IsolatedAsyncioTestCase):
                 },
             },
         )
+
+    async def test_create_shipment_raw_is_default_and_does_not_require_idempotency_key(self) -> None:
+        result = await server.create_shipment(request_body=make_complete_body())
+
+        self.assertIn("ShipmentResponse", result)
+        call_args = self.fake_tool_manager.calls[0][1]
+        self.assertIsNone(call_args["trans_id"])
+        self.assertIsNone(call_args.get("idempotency_key"))
+
+    async def test_create_shipment_invalid_response_format_raises_tool_error(self) -> None:
+        for invalid_format in ("xml", "ShipAgent_V1", "RAW", "shipagent-v1"):
+            with self.subTest(response_format=invalid_format):
+                with self.assertRaises(ToolError) as ctx:
+                    await server.create_shipment(
+                        request_body=make_complete_body(),
+                        response_format=invalid_format,
+                    )
+
+                payload = json.loads(str(ctx.exception))
+                self.assertEqual(payload["code"], "INVALID_RESPONSE_FORMAT")
+                self.assertEqual(payload["allowed"], ["raw", "shipagent_v1"])
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_rejects_trans_id_control_chars_before_ups(self) -> None:
+        result = await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key="idem-valid",
+            trans_id="corr\nbad",
+        )
+
+        self._assert_safe_validation(result)
+        self._assert_corr_id(result["error"]["correlation_id"])
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_rejects_transaction_src_control_chars_before_ups(self) -> None:
+        result = await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key="idem-valid",
+            trans_id="corr_create_tx_src",
+            transaction_src="ship\nagent",
+        )
+
+        self._assert_safe_validation(result, correlation_id="corr_create_tx_src")
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_requires_non_empty_idempotency_key_before_ups(self) -> None:
+        for key in ("", "   "):
+            with self.subTest(key=repr(key)):
+                result = await server.create_shipment(
+                    request_body=make_complete_body(),
+                    response_format="shipagent_v1",
+                    idempotency_key=key,
+                    trans_id="corr_missing_key",
+                )
+
+                self._assert_safe_validation(result, correlation_id="corr_missing_key")
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_rejects_idempotency_key_over_512_chars_before_ups(self) -> None:
+        result = await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key="k" * 513,
+            trans_id="corr_long_key",
+        )
+
+        self._assert_safe_validation(result, correlation_id="corr_long_key")
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_rejects_idempotency_key_control_chars_before_ups(self) -> None:
+        bad_keys = {
+            "newline": "idem\nkey",
+            "carriage_return": "idem\rkey",
+            "tab": "idem\tkey",
+            "nul": "idem\x00key",
+            "del": f"idem{chr(127)}key",
+        }
+
+        for name, key in bad_keys.items():
+            with self.subTest(name=name):
+                result = await server.create_shipment(
+                    request_body=make_complete_body(),
+                    response_format="shipagent_v1",
+                    idempotency_key=key,
+                    trans_id="corr_control_key",
+                )
+
+                self._assert_safe_validation(result, correlation_id="corr_control_key")
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_rejects_existing_customer_context_over_512_chars_before_ups(self) -> None:
+        body = make_complete_body()
+        body["ShipmentRequest"]["Request"]["TransactionReference"] = {
+            "CustomerContext": "x" * 513,
+        }
+
+        result = await server.create_shipment(
+            request_body=body,
+            response_format="shipagent_v1",
+            idempotency_key="idem-valid",
+            trans_id="corr_long_context",
+        )
+
+        self._assert_safe_validation(result, correlation_id="corr_long_context")
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_rejects_non_string_customer_context_before_ups(self) -> None:
+        bad_contexts = (None, 123, True, {}, [])
+
+        for customer_context in bad_contexts:
+            with self.subTest(customer_context=repr(customer_context)):
+                body = make_complete_body()
+                body["ShipmentRequest"]["Request"]["TransactionReference"] = {
+                    "CustomerContext": customer_context,
+                }
+
+                result = await server.create_shipment(
+                    request_body=body,
+                    response_format="shipagent_v1",
+                    idempotency_key="idem-valid",
+                    trans_id="corr_non_string_context",
+                )
+
+                self._assert_safe_validation(
+                    result,
+                    correlation_id="corr_non_string_context",
+                )
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_rejects_existing_customer_context_control_chars_before_ups(self) -> None:
+        bad_contexts = {
+            "newline": "caller\ncontext",
+            "carriage_return": "caller\rcontext",
+            "tab": "caller\tcontext",
+            "nul": "caller\x00context",
+            "del": f"caller{chr(127)}context",
+        }
+
+        for name, customer_context in bad_contexts.items():
+            with self.subTest(name=name):
+                body = make_complete_body()
+                body["ShipmentRequest"]["Request"]["TransactionReference"] = {
+                    "CustomerContext": customer_context,
+                }
+
+                result = await server.create_shipment(
+                    request_body=body,
+                    response_format="shipagent_v1",
+                    idempotency_key="idem-valid",
+                    trans_id="corr_bad_context",
+                )
+
+                self._assert_safe_validation(result, correlation_id="corr_bad_context")
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_does_not_elicit_missing_fields_or_call_ups(self) -> None:
+        ctx = MagicMock()
+        ctx.request_context.session.client_params = InitializeRequestParams(
+            protocolVersion="2025-03-26",
+            capabilities=ClientCapabilities(
+                elicitation=ElicitationCapability(form=FormElicitationCapability())
+            ),
+            clientInfo=Implementation(name="test", version="1.0"),
+        )
+        ctx.elicit = AsyncMock()
+
+        result = await server.create_shipment(
+            request_body={"ShipmentRequest": {}},
+            response_format="shipagent_v1",
+            idempotency_key="idem-missing-fields",
+            trans_id="corr_create_missing",
+            ctx=ctx,
+        )
+
+        self._assert_safe_validation(result, correlation_id="corr_create_missing")
+        ctx.elicit.assert_not_awaited()
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_normalizes_and_echoes_stripped_idempotency_key(self) -> None:
+        result = await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key=" idem-create-1 ",
+            trans_id=" corr_create ",
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "success": True,
+                "correlationId": "corr_create",
+                "idempotencyKey": "idem-create-1",
+                "shipmentIdentificationNumber": "1ZSHIP",
+                "trackingNumbers": ["1ZTRACK1"],
+                "totalCharges": {"monetaryValue": "20.00", "currencyCode": "USD"},
+                "labelData": [
+                    {
+                        "trackingNumber": "1ZTRACK1",
+                        "format": "ZPL",
+                        "encoding": "base64",
+                        "contentBase64": "QkFTRTY0UERG",
+                    }
+                ],
+            },
+        )
+        self.assertNotIn("contractVersion", result)
+        self.assertNotIn("contract_version", result)
+        call_args = self.fake_tool_manager.calls[0][1]
+        self.assertEqual(call_args["trans_id"], "corr_create")
+        self.assertEqual(call_args["idempotency_key"], "idem-create-1")
+        self.assertEqual(call_args["transaction_src"], "ups-mcp")
+
+    async def test_create_shipment_hosted_preserves_explicit_transaction_src(self) -> None:
+        await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key="idem-src",
+            trans_id="corr_create_src",
+            transaction_src="shipagent",
+        )
+
+        call_args = self.fake_tool_manager.calls[0][1]
+        self.assertEqual(call_args["transaction_src"], "shipagent")
+
+    async def test_create_shipment_hosted_generates_correlation_id_when_trans_id_missing(self) -> None:
+        result = await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key="idem-generated-corr",
+        )
+
+        self.assertTrue(result["success"])
+        call_args = self.fake_tool_manager.calls[0][1]
+        self._assert_corr_id(call_args["trans_id"])
+        self.assertEqual(result["correlationId"], call_args["trans_id"])
+
+    async def test_create_shipment_hosted_safe_error_and_normalization_error(self) -> None:
+        self.fake_tool_manager.create_shipment_exception = ToolError(
+            json.dumps({"status_code": 401, "code": "401"})
+        )
+
+        result = await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key="idem-error",
+            trans_id="corr_create_error",
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"]["code"], "UPS_AUTH_ERROR")
+        self.assertEqual(result["error"]["correlation_id"], "corr_create_error")
+        self.assertNotIn("idempotencyKey", result)
+
+        self.fake_tool_manager.create_shipment_exception = RuntimeError(
+            "stack path /tmp/create traceback token"
+        )
+        unknown = await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key="idem-unknown",
+            trans_id="corr_create_unknown",
+        )
+        self.assertFalse(unknown["success"])
+        self.assertEqual(unknown["error"]["code"], "UPS_UNKNOWN_ERROR")
+        self.assertEqual(unknown["error"]["category"], "unknown")
+        self.assertFalse(unknown["error"]["retryable"])
+        self.assertEqual(unknown["error"]["correlation_id"], "corr_create_unknown")
+        self.assertNotIn("idempotencyKey", unknown)
+        serialized = json.dumps(unknown).lower()
+        self.assertNotIn("traceback", serialized)
+        self.assertNotIn("/tmp/create", serialized)
+
+        self.fake_tool_manager.create_shipment_exception = None
+        self.fake_tool_manager.create_shipment_response = {
+            "ShipmentResponse": {"ShipmentResults": {}}
+        }
+        normalized = await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key="idem-normalization",
+            trans_id="corr_create_norm",
+        )
+        self.assertFalse(normalized["success"])
+        self.assertEqual(normalized["error"]["code"], "UPS_NORMALIZATION_ERROR")
+        self.assertEqual(normalized["error"]["category"], "normalization")
+        self.assertNotIn("idempotencyKey", normalized)
 
 
 if __name__ == "__main__":

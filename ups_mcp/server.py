@@ -16,6 +16,7 @@ from .shipagent_normalization import (
     ShipAgentNormalizationError,
     build_shipagent_capabilities,
     normalize_address_result,
+    normalize_create_shipment_result,
     normalize_rate_result,
     to_normalization_error,
     to_safe_error,
@@ -91,6 +92,19 @@ def _hosted_validation_error(correlation_id: str) -> dict[str, Any]:
     }
 
 
+def _hosted_unknown_error(correlation_id: str) -> dict[str, Any]:
+    return {
+        "success": False,
+        "error": {
+            "category": "unknown",
+            "code": "UPS_UNKNOWN_ERROR",
+            "message": "UPS request failed unexpectedly.",
+            "correlation_id": correlation_id,
+            "retryable": False,
+        },
+    }
+
+
 def _hosted_correlation_id(trans_id: str) -> tuple[str, dict[str, Any] | None]:
     if _has_ascii_control(trans_id):
         correlation_id = f"corr_{uuid.uuid4().hex}"
@@ -127,9 +141,9 @@ def _validate_hosted_customer_context(request_body: dict[str, Any]) -> None:
     transaction_reference = request.get("TransactionReference", {})
     if not isinstance(transaction_reference, dict):
         return
-    customer_context = transaction_reference.get("CustomerContext")
-    if customer_context is None:
+    if "CustomerContext" not in transaction_reference:
         return
+    customer_context = transaction_reference["CustomerContext"]
     if not isinstance(customer_context, str):
         raise ToolError(json.dumps({
             "code": "VALIDATION_ERROR",
@@ -546,6 +560,8 @@ async def create_shipment(
     additionaladdressvalidation: str = "",
     trans_id: str = "",
     transaction_src: str = "ups-mcp",
+    response_format: ResponseFormat = "raw",
+    idempotency_key: str = "",
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """
@@ -621,11 +637,86 @@ async def create_shipment(
         additionaladdressvalidation (str): Optional query param (for example `city`).
         trans_id (str): Optional request id.
         transaction_src (str): Optional caller source name. Default `ups-mcp`.
+        response_format (str): `raw` for the UPS payload, or `shipagent_v1`
+            for the hosted-safe normalized response.
+        idempotency_key (str): Required only for hosted create shipment.
+            Hosted mode strips this value, requires it to be non-empty, at
+            most 512 characters, and free of ASCII control characters.
         ctx: MCP Context (injected by FastMCP, not provided by callers).
 
     Returns:
-        dict[str, Any]: Raw UPS API response payload. On error, raises ToolError.
+        dict[str, Any]: Raw UPS API response payload, or hosted-safe normalized
+        payload when `response_format` is `shipagent_v1`. Raw errors raise
+        ToolError; hosted UPS and normalization errors return safe envelopes.
     """
+    validated_response_format = _validate_response_format(response_format)
+
+    if validated_response_format == RAW_RESPONSE_FORMAT:
+        return await _create_shipment_execute(
+            request_body=request_body,
+            version=version,
+            additionaladdressvalidation=additionaladdressvalidation,
+            trans_id=trans_id or None,
+            transaction_src=transaction_src,
+            idempotency_key=None,
+            ctx=ctx,
+            allow_elicitation=True,
+        )
+
+    correlation_id, correlation_error = _hosted_correlation_id(trans_id)
+    if correlation_error is not None:
+        return correlation_error
+
+    transaction_src_error = _hosted_transaction_src_error(
+        transaction_src,
+        correlation_id,
+    )
+    if transaction_src_error is not None:
+        return transaction_src_error
+
+    hosted_idempotency_key = idempotency_key.strip() if isinstance(idempotency_key, str) else ""
+    if not hosted_idempotency_key:
+        return _hosted_validation_error(correlation_id)
+    if len(hosted_idempotency_key) > MAX_IDEMPOTENCY_KEY_LENGTH:
+        return _hosted_validation_error(correlation_id)
+    if _has_ascii_control(hosted_idempotency_key):
+        return _hosted_validation_error(correlation_id)
+
+    try:
+        raw_result = await _create_shipment_execute(
+            request_body=request_body,
+            version=version,
+            additionaladdressvalidation=additionaladdressvalidation,
+            trans_id=correlation_id,
+            transaction_src=transaction_src,
+            idempotency_key=hosted_idempotency_key,
+            ctx=None,
+            allow_elicitation=False,
+        )
+        return normalize_create_shipment_result(
+            raw_result,
+            hosted_idempotency_key,
+            correlation_id,
+        )
+    except ShipAgentNormalizationError:
+        return to_normalization_error(correlation_id)
+    except ToolError as exc:
+        return to_safe_error(exc, correlation_id)
+    except Exception:
+        return _hosted_unknown_error(correlation_id)
+
+
+async def _create_shipment_execute(
+    *,
+    request_body: dict[str, Any],
+    version: str,
+    additionaladdressvalidation: str,
+    trans_id: str | None,
+    transaction_src: str,
+    idempotency_key: str | None,
+    ctx: Context | None,
+    allow_elicitation: bool,
+) -> dict[str, Any]:
     from .shipment_validator import (
         apply_defaults,
         find_missing_fields,
@@ -636,14 +727,15 @@ async def create_shipment(
     from .elicitation import elicit_and_rehydrate
 
     # Helper: canonicalize and send to UPS
-    def _send_to_ups(body):
+    def _send_to_ups(body: dict[str, Any]) -> dict[str, Any]:
         canonical = canonicalize_body(body)
         return _require_tool_manager().create_shipment(
             request_body=canonical,
             version=version,
             additionaladdressvalidation=additionaladdressvalidation or None,
-            trans_id=trans_id or None,
+            trans_id=trans_id,
             transaction_src=transaction_src,
+            idempotency_key=idempotency_key,
         )
 
     # 1. Canonicalize then apply 3-tier defaults (may raise TypeError on malformed bodies)
@@ -651,6 +743,8 @@ async def create_shipment(
     try:
         canonical_input = canonicalize_body(request_body)
         merged_body = apply_defaults(canonical_input, env_config)
+        if idempotency_key is not None:
+            _validate_hosted_customer_context(merged_body)
     except TypeError as exc:
         raise ToolError(json.dumps({
             "code": "MALFORMED_REQUEST",
@@ -673,6 +767,14 @@ async def create_shipment(
     # 3. Happy path — all fields present
     if not missing:
         return _send_to_ups(merged_body)
+
+    if not allow_elicitation:
+        raise ToolError(json.dumps({
+            "code": "VALIDATION_ERROR",
+            "message": "Missing required field(s) for shipment creation.",
+            "reason": "missing_shipment_required_fields",
+            "missing": [field.flat_key for field in missing],
+        }))
 
     # 4. Elicitation flow (checks support, builds schema, validates, rehydrates)
     merged_body = await elicit_and_rehydrate(
