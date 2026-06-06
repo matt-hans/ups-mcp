@@ -134,6 +134,25 @@ class ShipAgentCapabilitiesAndErrorTests(unittest.TestCase):
                     },
                 )
 
+    def test_to_safe_error_keeps_long_numeric_ups_codes_as_business_codes(self) -> None:
+        for code in ("120100", "250003"):
+            with self.subTest(code):
+                error = to_safe_error(ToolError(json.dumps({"code": code})), "corr_business")
+
+                self.assertEqual(
+                    error,
+                    {
+                        "success": False,
+                        "error": {
+                            "category": "unknown",
+                            "code": "UPS_UNKNOWN_ERROR",
+                            "message": "UPS request failed unexpectedly.",
+                            "correlation_id": "corr_business",
+                            "retryable": False,
+                        },
+                    },
+                )
+
     def test_to_safe_error_prioritizes_status_text_in_request_errors(self) -> None:
         cases = [
             (

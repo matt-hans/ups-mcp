@@ -122,7 +122,7 @@ def _classify_exception(exc: BaseException) -> str:
         return "normalization"
 
     payload = _parse_exception_payload(exc)
-    status_code = _coerce_int(
+    status_code = _coerce_http_status(
         payload.get("status_code")
         or payload.get("statusCode")
         or payload.get("status")
@@ -138,7 +138,7 @@ def _classify_exception(exc: BaseException) -> str:
         or payload.get("detail")
     )
     code_upper = (code or "").upper()
-    code_status = _coerce_int(code)
+    code_status = _coerce_http_status(code)
     if status_code is None:
         status_code = code_status
     if status_code is None:
@@ -195,6 +195,15 @@ def _coerce_int(value: Any) -> int | None:
             except ValueError:
                 return None
     return None
+
+
+def _coerce_http_status(value: Any) -> int | None:
+    if isinstance(value, str) and re.fullmatch(r"[1-5][0-9]{2}", value.strip()) is None:
+        return None
+    status = _coerce_int(value)
+    if status is None or status < 100 or status > 599:
+        return None
+    return status
 
 
 def _coerce_status_from_text(value: str | None) -> int | None:
