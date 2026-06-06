@@ -1,4 +1,5 @@
 import copy
+import json
 import unittest
 
 from mcp.server.fastmcp.exceptions import ToolError
@@ -13,6 +14,15 @@ class FakeHTTPClient:
     def call_operation(self, operation, **kwargs):  # noqa: ANN001
         self.calls.append({"operation": operation, "kwargs": kwargs})
         return {"mock": True}
+
+
+class FailingHTTPClient:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def call_operation(self, operation, **kwargs):  # noqa: ANN001
+        self.calls.append({"operation": operation, "kwargs": kwargs})
+        raise ToolError(json.dumps({"status_code": 503, "code": "503"}))
 
 
 class ToolMappingTests(unittest.TestCase):
@@ -180,6 +190,22 @@ class ToolMappingTests(unittest.TestCase):
             for call in self.fake_http_client.calls
         ]
         self.assertEqual(contexts, ["idem-repeat", "idem-repeat"])
+
+    def test_create_shipment_does_not_retry_after_http_error(self) -> None:
+        failing_http_client = FailingHTTPClient()
+        self.manager.http_client = failing_http_client
+
+        with self.assertRaises(ToolError):
+            self.manager.create_shipment(
+                request_body={"ShipmentRequest": {"Request": {}, "Shipment": {}}},
+                idempotency_key="idem-no-retry",
+            )
+
+        self.assertEqual(len(failing_http_client.calls), 1)
+        self.assertEqual(
+            failing_http_client.calls[0]["operation"].operation_id,
+            "Shipment",
+        )
 
 
 
