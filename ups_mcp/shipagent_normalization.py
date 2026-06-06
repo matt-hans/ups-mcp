@@ -253,13 +253,16 @@ def _classifier_text(*values: str | None) -> str:
 
 
 def _looks_like_validation_text(value: str) -> bool:
-    return (
-        "request_body must be a json object" in value
-        or "invalid requestoption" in value
-        or "must be a string or a list of strings" in value
-        or "is required via argument" in value
-        or "missing required key" in value
-        or "must be before" in value
+    return any(
+        re.search(pattern, value)
+        for pattern in (
+            r"\binvalid [a-z_]+",
+            r"\ballowed values:",
+            r"\bmust be (?:a |one of:|before\b)",
+            r"\bis required\b",
+            r"\brequires\b.*\bvia\b",
+            r"\bmissing required key\b",
+        )
     )
 
 

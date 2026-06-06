@@ -350,6 +350,15 @@ class ShipAgentCapabilitiesAndErrorTests(unittest.TestCase):
             "AccountNumber is required via argument or UPS_ACCOUNT_NUMBER env var",
             "missing required key ShipmentRequest",
             "pickup date must be before close time",
+            "Invalid file_format 'TXT'. Must be one of: pdf, png, gif",
+            "Invalid location_type 'bad'. Must be one of: retail, dropbox",
+            (
+                "PickupCreation requires a shipper account via "
+                "Shipper.Account.AccountNumber or UPS_ACCOUNT_NUMBER"
+            ),
+            "Invalid cancel_by 'bad'. Must be one of: prn, transactionId",
+            "prn is required when cancel_by='prn'",
+            "request_body is required for operation Shipment",
         ]
 
         for message in messages:
