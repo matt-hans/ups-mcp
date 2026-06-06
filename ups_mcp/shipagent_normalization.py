@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
 from collections.abc import Mapping
@@ -221,6 +223,53 @@ def normalize_address_result(raw: Mapping[str, Any], correlation_id: str) -> dic
         "correlationId": normalized_correlation_id,
         "status": status,
         "candidates": candidates,
+    }
+
+
+def normalize_create_shipment_result(
+    raw: Mapping[str, Any], idempotency_key: str, correlation_id: str
+) -> dict[str, Any]:
+    normalized_correlation_id = _required_hosted_string(correlation_id, "correlationId")
+    normalized_idempotency_key = _required_hosted_string(idempotency_key, "idempotencyKey")
+    shipment_results = _required_mapping(
+        _required_mapping(raw, "ShipmentResponse envelope").get("ShipmentResponse"),
+        "ShipmentResponse",
+    ).get("ShipmentResults")
+    shipment_results = _required_mapping(
+        shipment_results,
+        "ShipmentResponse.ShipmentResults",
+    )
+
+    shipment_id = _required_hosted_string(
+        shipment_results.get("ShipmentIdentificationNumber"),
+        "ShipmentResults.ShipmentIdentificationNumber",
+    )
+    total_charge = _extract_shipment_total_charge(shipment_results)
+    package_results = _shipment_package_results(shipment_results)
+
+    tracking_numbers: list[str] = []
+    label_data: list[dict[str, str]] = []
+    for package_result in package_results:
+        tracking_number = _required_hosted_string(
+            package_result.get("TrackingNumber"),
+            "PackageResults.TrackingNumber",
+        )
+        tracking_numbers.append(tracking_number)
+        label_data.append(
+            _normalize_shipping_label(
+                package_result.get("ShippingLabel"),
+                tracking_number,
+            )
+        )
+
+    return {
+        "success": True,
+        "correlationId": normalized_correlation_id,
+        "idempotencyKey": normalized_idempotency_key,
+        "shipmentIdentificationNumber": shipment_id,
+        "trackingNumbers": tracking_numbers,
+        "totalCharges": total_charge,
+        "labelData": label_data,
     }
 
 
@@ -509,6 +558,92 @@ def _extract_total_charge(rated: Mapping[str, Any]) -> dict[str, str] | None:
         "TotalCharges",
         require_complete=False,
     )
+
+
+def _extract_shipment_total_charge(shipment_results: Mapping[str, Any]) -> dict[str, str]:
+    if "NegotiatedRateCharges" in shipment_results:
+        negotiated = _required_mapping(
+            shipment_results.get("NegotiatedRateCharges"),
+            "NegotiatedRateCharges",
+        )
+        return _normalize_charge(
+            negotiated.get("TotalCharge"),
+            "NegotiatedRateCharges.TotalCharge",
+            require_complete=True,
+        )
+
+    shipment_charges = _required_mapping(
+        shipment_results.get("ShipmentCharges"),
+        "ShipmentCharges",
+    )
+    return _normalize_charge(
+        shipment_charges.get("TotalCharges"),
+        "ShipmentCharges.TotalCharges",
+        require_complete=True,
+    )
+
+
+def _shipment_package_results(shipment_results: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    value = shipment_results.get("PackageResults")
+    if isinstance(value, Mapping):
+        return [value]
+    if isinstance(value, list):
+        if not value:
+            raise ShipAgentNormalizationError("PackageResults is required.")
+        packages: list[Mapping[str, Any]] = []
+        for package_result in value:
+            if not isinstance(package_result, Mapping):
+                raise ShipAgentNormalizationError("PackageResults entries must be objects.")
+            packages.append(package_result)
+        return packages
+    raise ShipAgentNormalizationError("PackageResults must be an object or non-empty list.")
+
+
+def _normalize_shipping_label(value: Any, tracking_number: str) -> dict[str, str]:
+    shipping_label = _required_mapping(value, "PackageResults.ShippingLabel")
+    image_format = _required_mapping(
+        shipping_label.get("ImageFormat"),
+        "PackageResults.ShippingLabel.ImageFormat",
+    )
+    label_format = _required_hosted_string(
+        image_format.get("Code"),
+        "PackageResults.ShippingLabel.ImageFormat.Code",
+    ).upper()
+    if label_format not in SUPPORTED_CREATE_LABEL_FORMATS:
+        raise ShipAgentNormalizationError(
+            "PackageResults.ShippingLabel.ImageFormat.Code is unsupported."
+        )
+
+    content_base64 = _required_label_base64(
+        shipping_label.get("GraphicImage"),
+        "PackageResults.ShippingLabel.GraphicImage",
+    )
+    return {
+        "trackingNumber": tracking_number,
+        "format": label_format,
+        "encoding": "base64",
+        "contentBase64": content_base64,
+    }
+
+
+def _required_label_base64(value: Any, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ShipAgentNormalizationError(f"{field_name} must be a string.")
+    if _has_ascii_control(value):
+        raise ShipAgentNormalizationError(f"{field_name} contains ASCII control characters.")
+    if not _is_base64(value):
+        raise ShipAgentNormalizationError(f"{field_name} must be strict unwrapped base64.")
+    return value
+
+
+def _is_base64(value: str) -> bool:
+    if not value or any(char.isspace() for char in value):
+        return False
+    try:
+        base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    return True
 
 
 def _normalize_charge(

@@ -7,6 +7,7 @@ from ups_mcp.shipagent_normalization import (
     ShipAgentNormalizationError,
     build_shipagent_capabilities,
     normalize_address_result,
+    normalize_create_shipment_result,
     normalize_rate_result,
     to_normalization_error,
     to_safe_error,
@@ -764,6 +765,388 @@ class ShipAgentRateNormalizationTests(unittest.TestCase):
             with self.subTest(raw=raw, requestoption=requestoption, correlation_id=correlation_id):
                 with self.assertRaises(ShipAgentNormalizationError):
                     normalize_rate_result(raw, requestoption, correlation_id)
+
+
+class ShipAgentShipmentNormalizationTests(unittest.TestCase):
+    def _raw_shipment_response(self, shipment_results: object) -> dict[str, object]:
+        return {"ShipmentResponse": {"ShipmentResults": shipment_results}}
+
+    def _shipment_results(
+        self,
+        *,
+        shipment_id: object = "1ZSHIP",
+        monetary_value: object = "15.00",
+        currency_code: object = "USD",
+        shipment_charges: object = _MISSING,
+        negotiated_rate_charges: object = _MISSING,
+        package_results: object = _MISSING,
+    ) -> dict[str, object]:
+        shipment_results: dict[str, object] = {}
+        if shipment_id is not _MISSING:
+            shipment_results["ShipmentIdentificationNumber"] = shipment_id
+        if shipment_charges is _MISSING:
+            shipment_results["ShipmentCharges"] = {
+                "TotalCharges": {
+                    "MonetaryValue": monetary_value,
+                    "CurrencyCode": currency_code,
+                }
+            }
+        elif shipment_charges is not None:
+            shipment_results["ShipmentCharges"] = shipment_charges
+        if negotiated_rate_charges is not _MISSING:
+            shipment_results["NegotiatedRateCharges"] = negotiated_rate_charges
+        if package_results is _MISSING:
+            shipment_results["PackageResults"] = [self._package_result()]
+        elif package_results is not None:
+            shipment_results["PackageResults"] = package_results
+        return shipment_results
+
+    def _package_result(
+        self,
+        *,
+        tracking_number: object = "1ZTRACK1",
+        label_format: object = "ZPL",
+        label_content: object = "QkFTRTY0TEFCRUw=",
+        shipping_label: object = _MISSING,
+    ) -> dict[str, object]:
+        package_result: dict[str, object] = {}
+        if tracking_number is not _MISSING:
+            package_result["TrackingNumber"] = tracking_number
+        if shipping_label is _MISSING:
+            package_result["ShippingLabel"] = {
+                "ImageFormat": {"Code": label_format},
+                "GraphicImage": label_content,
+                "HTMLImage": "<html>unsafe</html>",
+                "URL": "https://unsafe.example/label",
+                "Receipt": {"GraphicImage": "UNSAFE"},
+            }
+        elif shipping_label is not None:
+            package_result["ShippingLabel"] = shipping_label
+        package_result["BillingWeight"] = {"Weight": "3"}
+        package_result["FRSShipmentData"] = {"FreightDensityInfo": "unsafe"}
+        return package_result
+
+    def test_create_extracts_safe_fields_and_prefers_negotiated_total(self) -> None:
+        raw = self._raw_shipment_response(
+            self._shipment_results(
+                shipment_id=" 1ZSHIP ",
+                monetary_value="99.99",
+                negotiated_rate_charges={
+                    "TotalCharge": {
+                        "MonetaryValue": " 10.50 ",
+                        "CurrencyCode": " USD ",
+                    }
+                },
+                package_results=[
+                    self._package_result(
+                        tracking_number=" 1ZTRACK1 ",
+                        label_format=" zpl ",
+                        label_content="QkFTRTY0TEFCRUw=",
+                    )
+                ],
+            )
+        )
+        raw["ShipmentResponse"]["ShipmentResults"].update(
+            {
+                "ControlLogReceipt": {"GraphicImage": "UNSAFE"},
+                "Form": {"Image": {"GraphicImage": "UNSAFE_FORM"}},
+                "FRSShipmentData": {"FreightDensityInfo": "unsafe"},
+                "BillingWeight": {"Weight": "99"},
+                "CustomsClearance": {"DutiesAndTaxes": "unsafe"},
+            }
+        )
+
+        result = normalize_create_shipment_result(raw, " idem-123 ", " corr_create_safe ")
+
+        self.assertEqual(
+            result,
+            {
+                "success": True,
+                "correlationId": "corr_create_safe",
+                "idempotencyKey": "idem-123",
+                "shipmentIdentificationNumber": "1ZSHIP",
+                "trackingNumbers": ["1ZTRACK1"],
+                "totalCharges": {"monetaryValue": "10.50", "currencyCode": "USD"},
+                "labelData": [
+                    {
+                        "trackingNumber": "1ZTRACK1",
+                        "format": "ZPL",
+                        "encoding": "base64",
+                        "contentBase64": "QkFTRTY0TEFCRUw=",
+                    }
+                ],
+            },
+        )
+        serialized = json.dumps(result)
+        for unsafe_fragment in (
+            "HTMLImage",
+            "URL",
+            "Receipt",
+            "ControlLogReceipt",
+            "Form",
+            "FRSShipmentData",
+            "BillingWeight",
+            "CustomsClearance",
+            "UNSAFE",
+            "unsafe",
+        ):
+            self.assertNotIn(unsafe_fragment, serialized)
+        self.assertNotIn("contractVersion", result)
+        self.assertNotIn("contract_version", result)
+        self.assertNotIn("correlation_id", result)
+
+    def test_create_accepts_object_package_results_and_uses_standard_total(self) -> None:
+        raw = self._raw_shipment_response(
+            self._shipment_results(
+                package_results=self._package_result(
+                    tracking_number="1ZTRACK1",
+                    label_format="gif",
+                    label_content="R0lGODdh",
+                )
+            )
+        )
+
+        result = normalize_create_shipment_result(raw, "idem-123", "corr_create")
+
+        self.assertEqual(result["trackingNumbers"], ["1ZTRACK1"])
+        self.assertEqual(
+            result["totalCharges"], {"monetaryValue": "15.00", "currencyCode": "USD"}
+        )
+        self.assertEqual(
+            result["labelData"],
+            [
+                {
+                    "trackingNumber": "1ZTRACK1",
+                    "format": "GIF",
+                    "encoding": "base64",
+                    "contentBase64": "R0lGODdh",
+                }
+            ],
+        )
+
+    def test_create_rejects_malformed_currency_codes(self) -> None:
+        for currency_code in ("usd", "US", "US1", "US$", "ØSD", "   "):
+            with self.subTest(currency_code=currency_code):
+                raw = self._raw_shipment_response(
+                    self._shipment_results(currency_code=currency_code)
+                )
+
+                with self.assertRaises(ShipAgentNormalizationError):
+                    normalize_create_shipment_result(raw, "idem-123", "corr_create")
+
+    def test_create_rejects_ascii_control_characters_in_success_strings(self) -> None:
+        cases = [
+            self._shipment_results(shipment_id="1ZSHIP\n"),
+            self._shipment_results(monetary_value="15.00\x7f"),
+            self._shipment_results(currency_code="USD\r"),
+            self._shipment_results(
+                package_results=[
+                    self._package_result(tracking_number="1ZTRACK\t1")
+                ]
+            ),
+            self._shipment_results(
+                package_results=[self._package_result(label_format="ZPL\n")]
+            ),
+            self._shipment_results(
+                package_results=[
+                    self._package_result(label_content="QkFTRTY0\nTEFCRUw=")
+                ]
+            ),
+        ]
+
+        for shipment_results in cases:
+            with self.subTest(shipment_results=shipment_results):
+                raw = self._raw_shipment_response(shipment_results)
+
+                with self.assertRaises(ShipAgentNormalizationError):
+                    normalize_create_shipment_result(raw, "idem-123", "corr_create")
+
+    def test_create_rejects_non_string_success_fields(self) -> None:
+        cases = [
+            self._shipment_results(shipment_id=123),
+            self._shipment_results(monetary_value=15.0),
+            self._shipment_results(currency_code=["USD"]),
+            self._shipment_results(
+                package_results=[self._package_result(tracking_number=True)]
+            ),
+            self._shipment_results(
+                package_results=[self._package_result(label_format={"code": "ZPL"})]
+            ),
+            self._shipment_results(
+                package_results=[self._package_result(label_content=b"QkFTRTY0")]
+            ),
+        ]
+
+        for shipment_results in cases:
+            with self.subTest(shipment_results=shipment_results):
+                raw = self._raw_shipment_response(shipment_results)
+
+                with self.assertRaises(ShipAgentNormalizationError):
+                    normalize_create_shipment_result(raw, "idem-123", "corr_create")
+
+    def test_create_rejects_bad_negotiated_total_without_standard_fallback(self) -> None:
+        cases = [
+            None,
+            {},
+            {"TotalCharge": None},
+            {"TotalCharge": {"MonetaryValue": "10.50"}},
+            {"TotalCharge": {"CurrencyCode": "USD"}},
+            {"TotalCharge": []},
+        ]
+
+        for negotiated_rate_charges in cases:
+            with self.subTest(negotiated_rate_charges=negotiated_rate_charges):
+                raw = self._raw_shipment_response(
+                    self._shipment_results(
+                        monetary_value="99.99",
+                        negotiated_rate_charges=negotiated_rate_charges,
+                    )
+                )
+
+                with self.assertRaises(ShipAgentNormalizationError):
+                    normalize_create_shipment_result(raw, "idem-123", "corr_create")
+
+    def test_create_includes_tracking_numbers_for_all_package_labels(self) -> None:
+        raw = self._raw_shipment_response(
+            self._shipment_results(
+                package_results=[
+                    self._package_result(
+                        tracking_number="1ZTRACK1",
+                        label_format="zpl",
+                        label_content="WlBMMQ==",
+                    ),
+                    self._package_result(
+                        tracking_number="1ZTRACK2",
+                        label_format="epl",
+                        label_content="RVBMMg==",
+                    ),
+                ]
+            )
+        )
+
+        result = normalize_create_shipment_result(raw, "idem-123", "corr_create")
+
+        self.assertEqual(result["trackingNumbers"], ["1ZTRACK1", "1ZTRACK2"])
+        self.assertEqual(
+            result["labelData"],
+            [
+                {
+                    "trackingNumber": "1ZTRACK1",
+                    "format": "ZPL",
+                    "encoding": "base64",
+                    "contentBase64": "WlBMMQ==",
+                },
+                {
+                    "trackingNumber": "1ZTRACK2",
+                    "format": "EPL",
+                    "encoding": "base64",
+                    "contentBase64": "RVBMMg==",
+                },
+            ],
+        )
+
+    def test_create_rejects_invalid_unwrapped_or_whitespace_base64_labels(self) -> None:
+        cases = [
+            "not_base64!",
+            "QkFTRTY0 TEFCRUw=",
+            " QkFTRTY0TEFCRUw=",
+            "data:image/gif;base64,QkFTRTY0TEFCRUw=",
+            "QkFTRTY0TEFCRUw",
+        ]
+
+        for label_content in cases:
+            with self.subTest(label_content=label_content):
+                raw = self._raw_shipment_response(
+                    self._shipment_results(
+                        package_results=[
+                            self._package_result(label_content=label_content)
+                        ]
+                    )
+                )
+
+                with self.assertRaises(ShipAgentNormalizationError):
+                    normalize_create_shipment_result(raw, "idem-123", "corr_create")
+
+    def test_create_rejects_unsupported_label_formats(self) -> None:
+        for label_format in ("PDF", "PNG", "HTML", "JPG"):
+            with self.subTest(label_format=label_format):
+                raw = self._raw_shipment_response(
+                    self._shipment_results(
+                        package_results=[
+                            self._package_result(label_format=label_format)
+                        ]
+                    )
+                )
+
+                with self.assertRaises(ShipAgentNormalizationError):
+                    normalize_create_shipment_result(raw, "idem-123", "corr_create")
+
+    def test_create_requires_core_shipment_and_label_fields(self) -> None:
+        cases = [
+            {},
+            {"ShipmentResponse": {}},
+            self._raw_shipment_response(None),
+            self._raw_shipment_response(
+                self._shipment_results(shipment_id=_MISSING)
+            ),
+            self._raw_shipment_response(
+                self._shipment_results(shipment_charges=None)
+            ),
+            self._raw_shipment_response(
+                self._shipment_results(package_results=[])
+            ),
+            self._raw_shipment_response(
+                self._shipment_results(package_results=None)
+            ),
+            self._raw_shipment_response(
+                self._shipment_results(
+                    package_results=[self._package_result(tracking_number=_MISSING)]
+                )
+            ),
+            self._raw_shipment_response(
+                self._shipment_results(
+                    package_results=[self._package_result(shipping_label=None)]
+                )
+            ),
+            self._raw_shipment_response(
+                self._shipment_results(
+                    package_results=[
+                        self._package_result(
+                            shipping_label={"GraphicImage": "QkFTRTY0TEFCRUw="}
+                        )
+                    ]
+                )
+            ),
+            self._raw_shipment_response(
+                self._shipment_results(
+                    package_results=[
+                        self._package_result(
+                            shipping_label={
+                                "ImageFormat": {},
+                                "GraphicImage": "QkFTRTY0TEFCRUw=",
+                            }
+                        )
+                    ]
+                )
+            ),
+            self._raw_shipment_response(
+                self._shipment_results(
+                    package_results=[
+                        self._package_result(
+                            shipping_label={"ImageFormat": {"Code": "ZPL"}}
+                        )
+                    ]
+                )
+            ),
+            self._raw_shipment_response(
+                self._shipment_results(package_results=["not-a-package"])
+            ),
+        ]
+
+        for raw in cases:
+            with self.subTest(raw=raw):
+                with self.assertRaises(ShipAgentNormalizationError):
+                    normalize_create_shipment_result(raw, "idem-123", "corr_create")
 
 
 class ShipAgentAddressNormalizationTests(unittest.TestCase):
