@@ -106,19 +106,20 @@ class ShipAgentHostedServerTests(unittest.IsolatedAsyncioTestCase):
         result: dict,
         *,
         correlation_id: str | None = None,
-        reason: str | None = None,
     ) -> None:
         self.assertEqual(set(result), {"success", "error"})
         self.assertIs(result["success"], False)
         error = result["error"]
+        self.assertEqual(
+            set(error),
+            {"category", "code", "message", "correlation_id", "retryable"},
+        )
         self.assertEqual(error["category"], "validation")
         self.assertEqual(error["code"], "UPS_VALIDATION_ERROR")
         self.assertEqual(error["message"], "UPS request validation failed.")
         self.assertIs(error["retryable"], False)
         if correlation_id is not None:
             self.assertEqual(error["correlation_id"], correlation_id)
-        if reason is not None:
-            self.assertEqual(error["reason"], reason)
 
     async def test_shipagent_capabilities_returns_metadata_without_tool_manager(self) -> None:
         server.tool_manager = None
@@ -186,7 +187,6 @@ class ShipAgentHostedServerTests(unittest.IsolatedAsyncioTestCase):
 
         self._assert_safe_validation(
             result,
-            reason="trans_id_contains_ascii_control",
         )
         self._assert_corr_id(result["error"]["correlation_id"])
         self.assertEqual(self.fake_tool_manager.calls, [])
@@ -240,7 +240,6 @@ class ShipAgentHostedServerTests(unittest.IsolatedAsyncioTestCase):
         self._assert_safe_validation(
             result,
             correlation_id="corr_existing",
-            reason="transaction_src_contains_ascii_control",
         )
         self.assertEqual(self.fake_tool_manager.calls, [])
 

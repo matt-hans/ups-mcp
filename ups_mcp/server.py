@@ -77,7 +77,7 @@ def _is_ascii_country_code(value: str) -> bool:
     return len(value) == 2 and value.isascii() and value.isalpha()
 
 
-def _hosted_validation_error(correlation_id: str, reason: str) -> dict[str, Any]:
+def _hosted_validation_error(correlation_id: str) -> dict[str, Any]:
     return {
         "success": False,
         "error": {
@@ -86,7 +86,6 @@ def _hosted_validation_error(correlation_id: str, reason: str) -> dict[str, Any]
             "message": "UPS request validation failed.",
             "correlation_id": correlation_id,
             "retryable": False,
-            "reason": reason,
         },
     }
 
@@ -96,10 +95,7 @@ def _hosted_correlation_id(trans_id: str) -> tuple[str, dict[str, Any] | None]:
         correlation_id = f"corr_{uuid.uuid4().hex}"
         return (
             correlation_id,
-            _hosted_validation_error(
-                correlation_id,
-                "trans_id_contains_ascii_control",
-            ),
+            _hosted_validation_error(correlation_id),
         )
 
     stripped_trans_id = trans_id.strip()
@@ -113,10 +109,7 @@ def _hosted_transaction_src_error(
     correlation_id: str,
 ) -> dict[str, Any] | None:
     if _has_ascii_control(transaction_src):
-        return _hosted_validation_error(
-            correlation_id,
-            "transaction_src_contains_ascii_control",
-        )
+        return _hosted_validation_error(correlation_id)
     return None
 
 
