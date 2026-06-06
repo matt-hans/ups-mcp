@@ -15,6 +15,7 @@ from .shipagent_normalization import (
     RAW_RESPONSE_FORMAT,
     ShipAgentNormalizationError,
     build_shipagent_capabilities,
+    normalize_address_result,
     normalize_rate_result,
     to_normalization_error,
     to_safe_error,
@@ -213,6 +214,7 @@ async def validate_address(
     zipExtended: str = "",
     trans_id: str = "",
     transaction_src: str = "ups-mcp",
+    response_format: ResponseFormat = "raw",
 ) -> dict[str, Any]:
     """
     Checks addresses against the United States Postal Service database of valid addresses in the U.S. and Puerto Rico.
@@ -228,15 +230,111 @@ async def validate_address(
         countryCode (str): The country code, e.g. US. Required.
         trans_id (str): Optional request id. If omitted, a UUID is generated.
         transaction_src (str): Optional caller source name. Default 'ups-mcp'.
+        response_format (str): `raw` for the UPS payload, or `shipagent_v1`
+            for the hosted-safe normalized response.
 
     Returns:
-        dict[str, Any]: Raw UPS Address Validation response containing one of three indicators:
+        dict[str, Any]: Raw UPS Address Validation response, or hosted-safe
+        normalized payload when `response_format` is `shipagent_v1`. Raw UPS
+        responses contain one of three indicators:
         - ValidAddressIndicator: Address is valid. Contains a 'Candidate' object with the corrected/standardized address.
         - AmbiguousAddressIndicator: Multiple possible address matches found. Review candidates.
         - NoCandidatesIndicator: Address could not be validated or does not exist in the USPS database.
-        On error, raises ToolError with JSON containing status_code, code, message, details.
+        Raw errors raise ToolError. Hosted UPS and normalization errors return
+        safe envelopes.
     """
-    validation_data = _require_tool_manager().validate_address(
+    validated_response_format = _validate_response_format(response_format)
+
+    if validated_response_format == RAW_RESPONSE_FORMAT:
+        return _validate_address_execute(
+            addressLine1=addressLine1,
+            addressLine2=addressLine2,
+            politicalDivision1=politicalDivision1,
+            politicalDivision2=politicalDivision2,
+            zipPrimary=zipPrimary,
+            zipExtended=zipExtended,
+            urbanization=urbanization,
+            countryCode=countryCode,
+            trans_id=trans_id or None,
+            transaction_src=transaction_src,
+        )
+
+    correlation_id, correlation_error = _hosted_correlation_id(trans_id)
+    if correlation_error is not None:
+        return correlation_error
+
+    transaction_src_error = _hosted_transaction_src_error(
+        transaction_src,
+        correlation_id,
+    )
+    if transaction_src_error is not None:
+        return transaction_src_error
+
+    hosted_country_code = countryCode.strip().upper()
+    if not hosted_country_code or not _is_ascii_country_code(hosted_country_code):
+        return _hosted_validation_error(correlation_id)
+    if hosted_country_code not in {"US", "PR"}:
+        return {
+            "success": True,
+            "correlationId": correlation_id,
+            "status": "unsupported",
+            "candidates": [],
+        }
+
+    required_fields = (
+        addressLine1,
+        politicalDivision1,
+        politicalDivision2,
+        zipPrimary,
+    )
+    if any(not value.strip() for value in required_fields):
+        return _hosted_validation_error(correlation_id)
+
+    try:
+        raw_result = _validate_address_execute(
+            addressLine1=addressLine1,
+            addressLine2=addressLine2,
+            politicalDivision1=politicalDivision1,
+            politicalDivision2=politicalDivision2,
+            zipPrimary=zipPrimary,
+            zipExtended=zipExtended,
+            urbanization=urbanization,
+            countryCode=countryCode,
+            trans_id=correlation_id,
+            transaction_src=transaction_src,
+        )
+        return normalize_address_result(raw_result, correlation_id)
+    except ShipAgentNormalizationError:
+        return to_normalization_error(correlation_id)
+    except ToolError as exc:
+        return to_safe_error(exc, correlation_id)
+    except Exception:
+        return {
+            "success": False,
+            "error": {
+                "category": "unknown",
+                "code": "UPS_UNKNOWN_ERROR",
+                "message": "UPS request failed unexpectedly.",
+                "correlation_id": correlation_id,
+                "retryable": False,
+            },
+        }
+
+
+def _validate_address_execute(
+    *,
+    addressLine1: str,
+    addressLine2: str,
+    politicalDivision1: str,
+    politicalDivision2: str,
+    zipPrimary: str,
+    zipExtended: str,
+    urbanization: str,
+    countryCode: str,
+    trans_id: str | None,
+    transaction_src: str,
+) -> dict[str, Any]:
+    return _require_tool_manager().validate_address(
         addressLine1=addressLine1,
         addressLine2=addressLine2,
         politicalDivision1=politicalDivision1,
@@ -248,8 +346,6 @@ async def validate_address(
         trans_id=trans_id or None,
         transaction_src=transaction_src,
     )
-
-    return validation_data
 
 @mcp.tool()
 async def rate_shipment(

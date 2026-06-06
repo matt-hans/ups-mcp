@@ -21,10 +21,14 @@ class _FakeToolManager:
         *,
         rate_response: dict | None = None,
         rate_exception: BaseException | None = None,
+        validate_address_response: dict | None = None,
+        validate_address_exception: BaseException | None = None,
     ) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.rate_response = rate_response or _rate_quote_response()
         self.rate_exception = rate_exception
+        self.validate_address_response = validate_address_response or _address_valid_response()
+        self.validate_address_exception = validate_address_exception
 
     def rate_shipment(self, **kwargs):  # noqa: ANN003
         self.calls.append(("rate_shipment", kwargs))
@@ -34,7 +38,9 @@ class _FakeToolManager:
 
     def validate_address(self, **kwargs):  # noqa: ANN003
         self.calls.append(("validate_address", kwargs))
-        return {"XAVResponse": {"ValidAddressIndicator": ""}}
+        if self.validate_address_exception is not None:
+            raise self.validate_address_exception
+        return self.validate_address_response
 
     def create_shipment(self, **kwargs):  # noqa: ANN003
         self.calls.append(("create_shipment", kwargs))
@@ -83,6 +89,26 @@ def _rate_shop_response() -> dict:
     }
 
 
+def _address_valid_response(
+    *,
+    country_code: str = "US",
+) -> dict:
+    return {
+        "XAVResponse": {
+            "ValidAddressIndicator": "",
+            "Candidate": {
+                "AddressKeyFormat": {
+                    "AddressLine": ["123 MAIN ST"],
+                    "PoliticalDivision2": "ATLANTA",
+                    "PoliticalDivision1": "GA",
+                    "PostcodePrimaryLow": "30301",
+                    "CountryCode": country_code,
+                }
+            },
+        }
+    }
+
+
 class ShipAgentHostedServerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.original_tool_manager = server.tool_manager
@@ -119,6 +145,16 @@ class ShipAgentHostedServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(error["retryable"], False)
         if correlation_id is not None:
             self.assertEqual(error["correlation_id"], correlation_id)
+
+    def _assert_closed_error(self, result: dict) -> dict:
+        self.assertEqual(set(result), {"success", "error"})
+        self.assertIs(result["success"], False)
+        error = result["error"]
+        self.assertEqual(
+            set(error),
+            {"category", "code", "message", "correlation_id", "retryable"},
+        )
+        return error
 
     async def test_shipagent_capabilities_returns_metadata_without_tool_manager(self) -> None:
         server.tool_manager = None
@@ -404,6 +440,320 @@ class ShipAgentHostedServerTests(unittest.IsolatedAsyncioTestCase):
         self._assert_safe_validation(result, correlation_id="corr_missing")
         ctx.elicit.assert_not_awaited()
         self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_validate_address_raw_is_default(self) -> None:
+        result = await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="US",
+        )
+
+        self.assertIn("XAVResponse", result)
+        call_args = self.fake_tool_manager.calls[0][1]
+        self.assertIsNone(call_args["trans_id"])
+
+    async def test_validate_address_invalid_response_format_raises_tool_error_before_ups(self) -> None:
+        for invalid_format in ("xml", "ShipAgent_V1", "RAW", "shipagent-v1"):
+            with self.subTest(response_format=invalid_format):
+                fake = self._install_fake_tool_manager(_FakeToolManager())
+
+                with self.assertRaises(ToolError) as ctx:
+                    await server.validate_address(
+                        addressLine1="123 Main St",
+                        politicalDivision1="GA",
+                        politicalDivision2="Atlanta",
+                        zipPrimary="30301",
+                        countryCode="US",
+                        response_format=invalid_format,
+                    )
+
+                self.assertEqual(
+                    json.loads(str(ctx.exception)),
+                    {
+                        "code": "INVALID_RESPONSE_FORMAT",
+                        "allowed": ["raw", "shipagent_v1"],
+                    },
+                )
+                self.assertEqual(fake.calls, [])
+
+    async def test_validate_address_hosted_rejects_trans_id_control_chars_before_ups(self) -> None:
+        result = await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="US",
+            response_format="shipagent_v1",
+            trans_id="corr\nbad",
+        )
+
+        self._assert_safe_validation(result)
+        self._assert_corr_id(result["error"]["correlation_id"])
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_validate_address_hosted_unsupported_country_precedes_blank_address_fields(self) -> None:
+        result = await server.validate_address(
+            addressLine1="",
+            politicalDivision1="",
+            politicalDivision2="London",
+            zipPrimary="",
+            countryCode="GB",
+            response_format="shipagent_v1",
+            trans_id="corr_address",
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "success": True,
+                "correlationId": "corr_address",
+                "status": "unsupported",
+                "candidates": [],
+            },
+        )
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_validate_address_hosted_blank_country_returns_validation_error_before_ups(self) -> None:
+        for country_code in ("", "   "):
+            with self.subTest(countryCode=country_code):
+                result = await server.validate_address(
+                    addressLine1="123 Main St",
+                    politicalDivision1="GA",
+                    politicalDivision2="Atlanta",
+                    zipPrimary="30301",
+                    countryCode=country_code,
+                    response_format="shipagent_v1",
+                    trans_id="corr_blank_country",
+                )
+
+                self._assert_safe_validation(
+                    result,
+                    correlation_id="corr_blank_country",
+                )
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_validate_address_hosted_malformed_country_returns_validation_error_before_ups(self) -> None:
+        for country_code in ("USA", "U1", "U-", "\u00e9S"):
+            with self.subTest(countryCode=country_code):
+                result = await server.validate_address(
+                    addressLine1="123 Main St",
+                    politicalDivision1="GA",
+                    politicalDivision2="Atlanta",
+                    zipPrimary="30301",
+                    countryCode=country_code,
+                    response_format="shipagent_v1",
+                    trans_id="corr_bad_country",
+                )
+
+                self._assert_safe_validation(
+                    result,
+                    correlation_id="corr_bad_country",
+                )
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_validate_address_hosted_blank_required_fields_return_validation_error_before_ups(self) -> None:
+        valid_args = {
+            "addressLine1": "123 Main St",
+            "politicalDivision1": "GA",
+            "politicalDivision2": "Atlanta",
+            "zipPrimary": "30301",
+            "countryCode": "US",
+        }
+
+        for field in ("addressLine1", "politicalDivision1", "politicalDivision2", "zipPrimary"):
+            for blank_value in ("", "   "):
+                with self.subTest(field=field, blank_value=repr(blank_value)):
+                    args = {**valid_args, field: blank_value}
+                    result = await server.validate_address(
+                        **args,
+                        response_format="shipagent_v1",
+                        trans_id="corr_blank_address_field",
+                    )
+
+                    self._assert_safe_validation(
+                        result,
+                        correlation_id="corr_blank_address_field",
+                    )
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_validate_address_hosted_normalizes_us_result_and_passes_original_country_to_ups(self) -> None:
+        fake = self._install_fake_tool_manager(
+            _FakeToolManager(validate_address_response=_address_valid_response())
+        )
+
+        result = await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="us",
+            response_format="shipagent_v1",
+            trans_id="corr_address_valid",
+        )
+
+        self.assertEqual(result["status"], "valid")
+        self.assertEqual(result["correlationId"], "corr_address_valid")
+        self.assertNotIn("contractVersion", result)
+        self.assertNotIn("contract_version", result)
+        self.assertEqual(result["candidates"][0]["postalCode"], "30301")
+        call_args = fake.calls[0][1]
+        self.assertEqual(call_args["countryCode"], "us")
+        self.assertEqual(call_args["trans_id"], "corr_address_valid")
+        self.assertEqual(call_args["transaction_src"], "ups-mcp")
+
+    async def test_validate_address_hosted_treats_pr_as_supported_for_boundary_only(self) -> None:
+        fake = self._install_fake_tool_manager(
+            _FakeToolManager(validate_address_response=_address_valid_response(country_code="PR"))
+        )
+
+        result = await server.validate_address(
+            addressLine1="123 Calle Uno",
+            politicalDivision1="PR",
+            politicalDivision2="San Juan",
+            zipPrimary="00901",
+            countryCode=" pr ",
+            response_format="shipagent_v1",
+            trans_id="corr_address_pr",
+        )
+
+        self.assertEqual(result["status"], "valid")
+        self.assertEqual(result["correlationId"], "corr_address_pr")
+        self.assertEqual(fake.calls[0][1]["countryCode"], " pr ")
+
+    async def test_validate_address_hosted_preserves_explicit_transaction_src(self) -> None:
+        fake = self._install_fake_tool_manager(_FakeToolManager())
+
+        await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="US",
+            response_format="shipagent_v1",
+            trans_id="corr_address_src",
+            transaction_src="shipagent",
+        )
+
+        self.assertEqual(fake.calls[0][1]["transaction_src"], "shipagent")
+
+    async def test_validate_address_hosted_rejects_transaction_src_control_chars_before_ups(self) -> None:
+        result = await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="US",
+            response_format="shipagent_v1",
+            trans_id="corr_address_tx_src",
+            transaction_src="ship\nagent",
+        )
+
+        self._assert_safe_validation(result, correlation_id="corr_address_tx_src")
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_validate_address_hosted_generates_correlation_id_when_trans_id_missing(self) -> None:
+        result = await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="US",
+            response_format="shipagent_v1",
+        )
+
+        self.assertTrue(result["success"])
+        call_args = self.fake_tool_manager.calls[0][1]
+        self._assert_corr_id(call_args["trans_id"])
+        self.assertEqual(result["correlationId"], call_args["trans_id"])
+
+    async def test_validate_address_hosted_tool_error_returns_safe_error(self) -> None:
+        exc = ToolError(json.dumps({"status_code": 503, "code": "503"}))
+        self._install_fake_tool_manager(
+            _FakeToolManager(validate_address_exception=exc)
+        )
+
+        result = await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="US",
+            response_format="shipagent_v1",
+            trans_id="corr_address_error",
+        )
+
+        error = self._assert_closed_error(result)
+        self.assertEqual(error["code"], "UPS_SERVICE_UNAVAILABLE")
+        self.assertEqual(error["category"], "service_unavailable")
+        self.assertEqual(error["correlation_id"], "corr_address_error")
+
+    async def test_validate_address_hosted_unexpected_exception_returns_unknown_error(self) -> None:
+        self._install_fake_tool_manager(
+            _FakeToolManager(
+                validate_address_exception=RuntimeError(
+                    "connection timeout traceback path /tmp/address"
+                )
+            )
+        )
+
+        result = await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="US",
+            response_format="shipagent_v1",
+            trans_id="corr_address_unknown",
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "success": False,
+                "error": {
+                    "category": "unknown",
+                    "code": "UPS_UNKNOWN_ERROR",
+                    "message": "UPS request failed unexpectedly.",
+                    "correlation_id": "corr_address_unknown",
+                    "retryable": False,
+                },
+            },
+        )
+        serialized = json.dumps(result).lower()
+        self.assertNotIn("traceback", serialized)
+        self.assertNotIn("/tmp/address", serialized)
+        self.assertNotIn("timeout", serialized)
+
+    async def test_validate_address_hosted_normalization_failure_returns_normalization_error(self) -> None:
+        self._install_fake_tool_manager(
+            _FakeToolManager(validate_address_response={"bad": "shape"})
+        )
+
+        result = await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="US",
+            response_format="shipagent_v1",
+            trans_id="corr_address_norm",
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "success": False,
+                "error": {
+                    "category": "normalization",
+                    "code": "UPS_NORMALIZATION_ERROR",
+                    "message": "UPS response could not be normalized.",
+                    "correlation_id": "corr_address_norm",
+                    "retryable": False,
+                },
+            },
+        )
 
 
 if __name__ == "__main__":
