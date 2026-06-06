@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import uuid
 from typing import Any
 
@@ -60,6 +61,33 @@ ADDRESS_VALIDATION_OPERATION = OperationSpec(
     query_params=(),
     header_params=(),
 )
+
+
+def _with_idempotency_customer_context(
+    request_body: dict[str, Any],
+    idempotency_key: str | None,
+) -> dict[str, Any]:
+    key = idempotency_key.strip() if idempotency_key else ""
+    result = copy.deepcopy(request_body)
+    if not key:
+        return result
+
+    shipment_request = result.setdefault("ShipmentRequest", {})
+    request = shipment_request.setdefault("Request", {})
+    transaction_reference = request.setdefault("TransactionReference", {})
+    if not isinstance(transaction_reference, dict):
+        raise ToolError("ShipmentRequest.Request.TransactionReference must be a JSON object")
+    existing_value = transaction_reference.get("CustomerContext")
+    existing_context = str(existing_value) if existing_value is not None else ""
+
+    if not existing_context.strip():
+        transaction_reference["CustomerContext"] = key
+        return result
+
+    appended = f"{existing_context}; idempotency_key={key}"
+    if len(appended) <= 512:
+        transaction_reference["CustomerContext"] = appended
+    return result
 
 
 class ToolManager:
@@ -198,15 +226,20 @@ class ToolManager:
         additionaladdressvalidation: str | None = None,
         trans_id: str | None = None,
         transaction_src: str = "ups-mcp",
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(request_body, dict):
             raise ToolError("request_body must be a JSON object")
+        request_body_with_metadata = _with_idempotency_customer_context(
+            request_body,
+            idempotency_key,
+        )
         return self._execute_operation(
             operation_id=SHIPMENT_OPERATION_ID,
             operation_name="create_shipment",
             path_params={"version": version},
             query_params={"additionaladdressvalidation": additionaladdressvalidation},
-            request_body=request_body,
+            request_body=request_body_with_metadata,
             trans_id=trans_id,
             transaction_src=transaction_src,
         )

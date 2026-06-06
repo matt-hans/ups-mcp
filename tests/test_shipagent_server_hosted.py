@@ -1,0 +1,1189 @@
+import json
+import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import (
+    ClientCapabilities,
+    ElicitationCapability,
+    FormElicitationCapability,
+    Implementation,
+    InitializeRequestParams,
+)
+
+import ups_mcp.server as server
+from tests.rating_fixtures import make_complete_rate_body
+from tests.shipment_fixtures import make_complete_body
+
+
+class _FakeToolManager:
+    def __init__(
+        self,
+        *,
+        rate_response: dict | None = None,
+        rate_exception: BaseException | None = None,
+        validate_address_response: dict | None = None,
+        validate_address_exception: BaseException | None = None,
+    ) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        self.rate_response = rate_response or _rate_quote_response()
+        self.rate_exception = rate_exception
+        self.validate_address_response = validate_address_response or _address_valid_response()
+        self.validate_address_exception = validate_address_exception
+        self.create_shipment_response: dict = {
+            "ShipmentResponse": {
+                "ShipmentResults": {
+                    "ShipmentIdentificationNumber": "1ZSHIP",
+                    "ShipmentCharges": {
+                        "TotalCharges": {
+                            "CurrencyCode": "USD",
+                            "MonetaryValue": "20.00",
+                        }
+                    },
+                    "PackageResults": {
+                        "TrackingNumber": "1ZTRACK1",
+                        "ShippingLabel": {
+                            "ImageFormat": {"Code": "ZPL"},
+                            "GraphicImage": "QkFTRTY0UERG",
+                        },
+                    },
+                }
+            }
+        }
+        self.create_shipment_exception: BaseException | None = None
+
+    def rate_shipment(self, **kwargs):  # noqa: ANN003
+        self.calls.append(("rate_shipment", kwargs))
+        if self.rate_exception is not None:
+            raise self.rate_exception
+        return self.rate_response
+
+    def validate_address(self, **kwargs):  # noqa: ANN003
+        self.calls.append(("validate_address", kwargs))
+        if self.validate_address_exception is not None:
+            raise self.validate_address_exception
+        return self.validate_address_response
+
+    def create_shipment(self, **kwargs):  # noqa: ANN003
+        self.calls.append(("create_shipment", kwargs))
+        if self.create_shipment_exception is not None:
+            raise self.create_shipment_exception
+        return self.create_shipment_response
+
+
+def _rate_quote_response(
+    *,
+    service_code: str = "03",
+    service_description: str = "UPS Ground",
+    monetary_value: str = "12.34",
+    currency_code: str = "USD",
+) -> dict:
+    return {
+        "RateResponse": {
+            "RatedShipment": [
+                {
+                    "Service": {
+                        "Code": service_code,
+                        "Description": service_description,
+                    },
+                    "TotalCharges": {
+                        "MonetaryValue": monetary_value,
+                        "CurrencyCode": currency_code,
+                    },
+                }
+            ]
+        }
+    }
+
+
+def _rate_shop_response() -> dict:
+    return {
+        "RateResponse": {
+            "RatedShipment": [
+                {
+                    "Service": {"Code": "03", "Description": "UPS Ground"},
+                    "TotalCharges": {"MonetaryValue": "12.34", "CurrencyCode": "USD"},
+                },
+                {
+                    "Service": {"Code": "02"},
+                    "TotalCharges": {"MonetaryValue": "20.00", "CurrencyCode": "USD"},
+                },
+            ]
+        }
+    }
+
+
+def _address_valid_response(
+    *,
+    country_code: str = "US",
+) -> dict:
+    return {
+        "XAVResponse": {
+            "ValidAddressIndicator": "",
+            "Candidate": {
+                "AddressKeyFormat": {
+                    "AddressLine": ["123 MAIN ST"],
+                    "PoliticalDivision2": "ATLANTA",
+                    "PoliticalDivision1": "GA",
+                    "PostcodePrimaryLow": "30301",
+                    "CountryCode": country_code,
+                }
+            },
+        }
+    }
+
+
+class ShipAgentHostedServerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.original_tool_manager = server.tool_manager
+        self.fake_tool_manager = _FakeToolManager()
+        server.tool_manager = self.fake_tool_manager
+
+    def tearDown(self) -> None:
+        server.tool_manager = self.original_tool_manager
+
+    def _install_fake_tool_manager(self, fake: _FakeToolManager) -> _FakeToolManager:
+        self.fake_tool_manager = fake
+        server.tool_manager = fake
+        return fake
+
+    def _assert_corr_id(self, value: str) -> None:
+        self.assertRegex(value, r"^corr_[0-9a-f]{32}$")
+
+    def _assert_safe_validation(
+        self,
+        result: dict,
+        *,
+        correlation_id: str | None = None,
+    ) -> None:
+        self.assertEqual(set(result), {"success", "error"})
+        self.assertIs(result["success"], False)
+        error = result["error"]
+        self.assertEqual(
+            set(error),
+            {"category", "code", "message", "correlation_id", "retryable"},
+        )
+        self.assertEqual(error["category"], "validation")
+        self.assertEqual(error["code"], "UPS_VALIDATION_ERROR")
+        self.assertEqual(error["message"], "UPS request validation failed.")
+        self.assertIs(error["retryable"], False)
+        if correlation_id is not None:
+            self.assertEqual(error["correlation_id"], correlation_id)
+
+    def _assert_closed_error(self, result: dict) -> dict:
+        self.assertEqual(set(result), {"success", "error"})
+        self.assertIs(result["success"], False)
+        error = result["error"]
+        self.assertEqual(
+            set(error),
+            {"category", "code", "message", "correlation_id", "retryable"},
+        )
+        return error
+
+    async def test_shipagent_capabilities_returns_metadata_without_tool_manager(self) -> None:
+        server.tool_manager = None
+
+        with patch.object(server.metadata, "version", return_value="9.8.7-test"):
+            result = await server.shipagent_capabilities()
+
+        self.assertEqual(result["contract_version"], "hosted-v1")
+        self.assertEqual(result["server_version"], "9.8.7-test")
+        self.assertEqual(result["response_formats"], ["raw", "shipagent_v1"])
+        self.assertIn("rate_quote", result["capabilities"])
+
+    async def test_shipagent_capabilities_version_falls_back_to_unknown(self) -> None:
+        with patch.object(server.metadata, "version", side_effect=RuntimeError("boom")):
+            result = await server.shipagent_capabilities()
+
+        self.assertEqual(result["server_version"], "unknown")
+
+    async def test_shipagent_capabilities_is_registered_as_mcp_tool(self) -> None:
+        tools = await server.mcp.list_tools()
+
+        self.assertIn("shipagent_capabilities", {tool.name for tool in tools})
+
+    async def test_response_format_schema_exposes_hosted_choices(self) -> None:
+        tools = {tool.name: tool for tool in await server.mcp.list_tools()}
+
+        for tool_name in ("rate_shipment", "validate_address", "create_shipment"):
+            with self.subTest(tool_name=tool_name):
+                response_format_schema = (
+                    tools[tool_name]
+                    .inputSchema["properties"]["response_format"]
+                )
+
+                self.assertEqual(response_format_schema["default"], "raw")
+                self.assertEqual(
+                    response_format_schema["enum"],
+                    ["raw", "shipagent_v1"],
+                )
+
+    async def test_rate_shipment_raw_default_preserves_raw_response_and_omitted_trans_id(self) -> None:
+        raw_response = {"RateResponse": {"RatedShipment": []}}
+        fake = self._install_fake_tool_manager(
+            _FakeToolManager(rate_response=raw_response)
+        )
+
+        result = await server.rate_shipment(
+            requestoption="Rate",
+            request_body=make_complete_rate_body(),
+        )
+
+        self.assertIs(result, raw_response)
+        self.assertEqual(fake.calls[0][1]["trans_id"], None)
+
+    async def test_invalid_response_format_raises_direct_tool_error_before_ups(self) -> None:
+        for response_format in ("xml", "ShipAgent_V1", "RAW", "shipagent-v1"):
+            with self.subTest(response_format=response_format):
+                fake = self._install_fake_tool_manager(_FakeToolManager())
+
+                with self.assertRaises(ToolError) as cm:
+                    await server.rate_shipment(
+                        requestoption="Rate",
+                        request_body=make_complete_rate_body(),
+                        response_format=response_format,
+                    )
+
+                self.assertEqual(
+                    json.loads(str(cm.exception)),
+                    {
+                        "code": "INVALID_RESPONSE_FORMAT",
+                        "allowed": ["raw", "shipagent_v1"],
+                    },
+                )
+                self.assertEqual(fake.calls, [])
+
+    async def test_invalid_response_format_mcp_call_tool_uses_custom_validator(self) -> None:
+        cases = [
+            (
+                "rate_shipment",
+                {
+                    "requestoption": "Rate",
+                    "request_body": make_complete_rate_body(),
+                    "response_format": "xml",
+                },
+            ),
+            (
+                "validate_address",
+                {
+                    "addressLine1": "123 Main St",
+                    "politicalDivision1": "GA",
+                    "politicalDivision2": "Atlanta",
+                    "zipPrimary": "30301",
+                    "countryCode": "US",
+                    "response_format": "xml",
+                },
+            ),
+            (
+                "create_shipment",
+                {
+                    "request_body": make_complete_body(),
+                    "response_format": "xml",
+                    "idempotency_key": "idem-invalid-format",
+                },
+            ),
+        ]
+
+        for tool_name, arguments in cases:
+            with self.subTest(tool_name=tool_name):
+                fake = self._install_fake_tool_manager(_FakeToolManager())
+
+                with self.assertRaises(ToolError) as ctx:
+                    await server.mcp.call_tool(tool_name, arguments)
+
+                message = str(ctx.exception)
+                self.assertIn("INVALID_RESPONSE_FORMAT", message)
+                self.assertIn("shipagent_v1", message)
+                self.assertNotIn("literal_error", message)
+                self.assertEqual(fake.calls, [])
+
+    async def test_hosted_rate_rejects_trans_id_control_chars_before_ups(self) -> None:
+        result = await server.rate_shipment(
+            requestoption="Rate",
+            request_body=make_complete_rate_body(),
+            trans_id="bad\nid",
+            response_format="shipagent_v1",
+        )
+
+        self._assert_safe_validation(
+            result,
+        )
+        self._assert_corr_id(result["error"]["correlation_id"])
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_hosted_quote_normalizes_and_passes_stripped_correlation_id_to_ups(self) -> None:
+        fake = self._install_fake_tool_manager(
+            _FakeToolManager(rate_response=_rate_quote_response())
+        )
+
+        result = await server.rate_shipment(
+            requestoption="Rate",
+            request_body=make_complete_rate_body(),
+            trans_id=" corr_quote_123 ",
+            response_format="shipagent_v1",
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "success": True,
+                "correlationId": "corr_quote_123",
+                "serviceCode": "03",
+                "serviceDescription": "UPS Ground",
+                "totalCharges": {"monetaryValue": "12.34", "currencyCode": "USD"},
+            },
+        )
+        self.assertEqual(fake.calls[0][1]["trans_id"], "corr_quote_123")
+
+    async def test_hosted_preserves_explicit_printable_transaction_src(self) -> None:
+        fake = self._install_fake_tool_manager(_FakeToolManager())
+
+        await server.rate_shipment(
+            requestoption="Rate",
+            request_body=make_complete_rate_body(),
+            trans_id="corr_src_preserved",
+            transaction_src="caller src=abc",
+            response_format="shipagent_v1",
+        )
+
+        self.assertEqual(fake.calls[0][1]["transaction_src"], "caller src=abc")
+
+    async def test_hosted_rejects_transaction_src_control_chars_before_ups(self) -> None:
+        result = await server.rate_shipment(
+            requestoption="Rate",
+            request_body=make_complete_rate_body(),
+            trans_id="corr_existing",
+            transaction_src="bad\rsrc",
+            response_format="shipagent_v1",
+        )
+
+        self._assert_safe_validation(
+            result,
+            correlation_id="corr_existing",
+        )
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_hosted_shop_normalizes_shop_result(self) -> None:
+        self._install_fake_tool_manager(
+            _FakeToolManager(rate_response=_rate_shop_response())
+        )
+
+        result = await server.rate_shipment(
+            requestoption="Shop",
+            request_body=make_complete_rate_body(),
+            trans_id="corr_shop",
+            response_format="shipagent_v1",
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "success": True,
+                "correlationId": "corr_shop",
+                "ratedShipments": [
+                    {
+                        "serviceCode": "03",
+                        "serviceDescription": "UPS Ground",
+                        "totalCharges": {"monetaryValue": "12.34", "currencyCode": "USD"},
+                    },
+                    {
+                        "serviceCode": "02",
+                        "totalCharges": {"monetaryValue": "20.00", "currencyCode": "USD"},
+                    },
+                ],
+            },
+        )
+
+    async def test_hosted_tool_error_returns_safe_envelope_without_raw_details(self) -> None:
+        exc = ToolError(
+            json.dumps(
+                {
+                    "status_code": 400,
+                    "code": "250003",
+                    "message": "Invalid account secret-token",
+                    "details": {"path": "/Users/matthewhans/Desktop/ups.py"},
+                }
+            )
+        )
+        self._install_fake_tool_manager(_FakeToolManager(rate_exception=exc))
+
+        result = await server.rate_shipment(
+            requestoption="Rate",
+            request_body=make_complete_rate_body(),
+            trans_id="corr_tool_error",
+            response_format="shipagent_v1",
+        )
+
+        self._assert_safe_validation(result, correlation_id="corr_tool_error")
+        serialized = json.dumps(result)
+        self.assertNotIn("250003", serialized)
+        self.assertNotIn("secret-token", serialized)
+        self.assertNotIn("/Users/matthewhans/Desktop/ups.py", serialized)
+
+    async def test_hosted_unexpected_exception_returns_unknown_safe_envelope(self) -> None:
+        self._install_fake_tool_manager(
+            _FakeToolManager(
+                rate_exception=RuntimeError("connection timeout")
+            )
+        )
+
+        result = await server.rate_shipment(
+            requestoption="Rate",
+            request_body=make_complete_rate_body(),
+            trans_id="corr_unknown",
+            response_format="shipagent_v1",
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "success": False,
+                "error": {
+                    "category": "unknown",
+                    "code": "UPS_UNKNOWN_ERROR",
+                    "message": "UPS request failed unexpectedly.",
+                    "correlation_id": "corr_unknown",
+                    "retryable": False,
+                },
+            },
+        )
+        self.assertNotIn("/Users/", json.dumps(result))
+        self.assertNotIn("Traceback", json.dumps(result))
+        self.assertNotIn("connection timeout", json.dumps(result))
+
+    async def test_raw_mode_still_raises_tool_error(self) -> None:
+        exc = ToolError(json.dumps({"status_code": 429, "message": "rate limit"}))
+        self._install_fake_tool_manager(_FakeToolManager(rate_exception=exc))
+
+        with self.assertRaises(ToolError) as cm:
+            await server.rate_shipment(
+                requestoption="Rate",
+                request_body=make_complete_rate_body(),
+            )
+
+        self.assertIs(cm.exception, exc)
+
+    async def test_hosted_normalization_failure_returns_normalization_safe_envelope(self) -> None:
+        self._install_fake_tool_manager(
+            _FakeToolManager(rate_response={"RateResponse": {"RatedShipment": []}})
+        )
+
+        result = await server.rate_shipment(
+            requestoption="Rate",
+            request_body=make_complete_rate_body(),
+            trans_id="corr_bad_ups_payload",
+            response_format="shipagent_v1",
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "success": False,
+                "error": {
+                    "category": "normalization",
+                    "code": "UPS_NORMALIZATION_ERROR",
+                    "message": "UPS response could not be normalized.",
+                    "correlation_id": "corr_bad_ups_payload",
+                    "retryable": False,
+                },
+            },
+        )
+
+    async def test_hosted_generates_correlation_id_when_trans_id_missing_and_passes_same_id(self) -> None:
+        fake = self._install_fake_tool_manager(_FakeToolManager())
+
+        result = await server.rate_shipment(
+            requestoption="Rate",
+            request_body=make_complete_rate_body(),
+            response_format="shipagent_v1",
+        )
+
+        correlation_id = result["correlationId"]
+        self._assert_corr_id(correlation_id)
+        self.assertEqual(fake.calls[0][1]["trans_id"], correlation_id)
+
+    async def test_hosted_does_not_elicit_missing_fields_or_call_ups(self) -> None:
+        ctx = MagicMock()
+        ctx.request_context.session.client_params = InitializeRequestParams(
+            protocolVersion="2025-03-26",
+            capabilities=ClientCapabilities(
+                elicitation=ElicitationCapability(form=FormElicitationCapability())
+            ),
+            clientInfo=Implementation(name="test", version="1.0"),
+        )
+        ctx.elicit = AsyncMock()
+
+        result = await server.rate_shipment(
+            requestoption="Rate",
+            request_body={"RateRequest": {}},
+            trans_id="corr_missing",
+            response_format="shipagent_v1",
+            ctx=ctx,
+        )
+
+        self._assert_safe_validation(result, correlation_id="corr_missing")
+        ctx.elicit.assert_not_awaited()
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_validate_address_raw_is_default(self) -> None:
+        result = await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="US",
+        )
+
+        self.assertIn("XAVResponse", result)
+        call_args = self.fake_tool_manager.calls[0][1]
+        self.assertIsNone(call_args["trans_id"])
+
+    async def test_validate_address_invalid_response_format_raises_tool_error_before_ups(self) -> None:
+        for invalid_format in ("xml", "ShipAgent_V1", "RAW", "shipagent-v1"):
+            with self.subTest(response_format=invalid_format):
+                fake = self._install_fake_tool_manager(_FakeToolManager())
+
+                with self.assertRaises(ToolError) as ctx:
+                    await server.validate_address(
+                        addressLine1="123 Main St",
+                        politicalDivision1="GA",
+                        politicalDivision2="Atlanta",
+                        zipPrimary="30301",
+                        countryCode="US",
+                        response_format=invalid_format,
+                    )
+
+                self.assertEqual(
+                    json.loads(str(ctx.exception)),
+                    {
+                        "code": "INVALID_RESPONSE_FORMAT",
+                        "allowed": ["raw", "shipagent_v1"],
+                    },
+                )
+                self.assertEqual(fake.calls, [])
+
+    async def test_validate_address_hosted_rejects_trans_id_control_chars_before_ups(self) -> None:
+        result = await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="US",
+            response_format="shipagent_v1",
+            trans_id="corr\nbad",
+        )
+
+        self._assert_safe_validation(result)
+        self._assert_corr_id(result["error"]["correlation_id"])
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_validate_address_hosted_unsupported_country_precedes_blank_address_fields(self) -> None:
+        result = await server.validate_address(
+            addressLine1="",
+            politicalDivision1="",
+            politicalDivision2="London",
+            zipPrimary="",
+            countryCode="GB",
+            response_format="shipagent_v1",
+            trans_id="corr_address",
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "success": True,
+                "correlationId": "corr_address",
+                "status": "unsupported",
+                "candidates": [],
+            },
+        )
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_validate_address_hosted_blank_country_returns_validation_error_before_ups(self) -> None:
+        for country_code in ("", "   "):
+            with self.subTest(countryCode=country_code):
+                result = await server.validate_address(
+                    addressLine1="123 Main St",
+                    politicalDivision1="GA",
+                    politicalDivision2="Atlanta",
+                    zipPrimary="30301",
+                    countryCode=country_code,
+                    response_format="shipagent_v1",
+                    trans_id="corr_blank_country",
+                )
+
+                self._assert_safe_validation(
+                    result,
+                    correlation_id="corr_blank_country",
+                )
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_validate_address_hosted_malformed_country_returns_validation_error_before_ups(self) -> None:
+        for country_code in ("USA", "U1", "U-", "\u00e9S"):
+            with self.subTest(countryCode=country_code):
+                result = await server.validate_address(
+                    addressLine1="123 Main St",
+                    politicalDivision1="GA",
+                    politicalDivision2="Atlanta",
+                    zipPrimary="30301",
+                    countryCode=country_code,
+                    response_format="shipagent_v1",
+                    trans_id="corr_bad_country",
+                )
+
+                self._assert_safe_validation(
+                    result,
+                    correlation_id="corr_bad_country",
+                )
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_validate_address_hosted_blank_required_fields_return_validation_error_before_ups(self) -> None:
+        valid_args = {
+            "addressLine1": "123 Main St",
+            "politicalDivision1": "GA",
+            "politicalDivision2": "Atlanta",
+            "zipPrimary": "30301",
+            "countryCode": "US",
+        }
+
+        for field in ("addressLine1", "politicalDivision1", "politicalDivision2", "zipPrimary"):
+            for blank_value in ("", "   "):
+                with self.subTest(field=field, blank_value=repr(blank_value)):
+                    args = {**valid_args, field: blank_value}
+                    result = await server.validate_address(
+                        **args,
+                        response_format="shipagent_v1",
+                        trans_id="corr_blank_address_field",
+                    )
+
+                    self._assert_safe_validation(
+                        result,
+                        correlation_id="corr_blank_address_field",
+                    )
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_validate_address_hosted_normalizes_us_result_and_passes_original_country_to_ups(self) -> None:
+        fake = self._install_fake_tool_manager(
+            _FakeToolManager(validate_address_response=_address_valid_response())
+        )
+
+        result = await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="us",
+            response_format="shipagent_v1",
+            trans_id="corr_address_valid",
+        )
+
+        self.assertEqual(result["status"], "valid")
+        self.assertEqual(result["correlationId"], "corr_address_valid")
+        self.assertNotIn("contractVersion", result)
+        self.assertNotIn("contract_version", result)
+        self.assertEqual(result["candidates"][0]["postalCode"], "30301")
+        call_args = fake.calls[0][1]
+        self.assertEqual(call_args["countryCode"], "us")
+        self.assertEqual(call_args["trans_id"], "corr_address_valid")
+        self.assertEqual(call_args["transaction_src"], "ups-mcp")
+
+    async def test_validate_address_hosted_treats_pr_as_supported_for_boundary_only(self) -> None:
+        fake = self._install_fake_tool_manager(
+            _FakeToolManager(validate_address_response=_address_valid_response(country_code="PR"))
+        )
+
+        result = await server.validate_address(
+            addressLine1="123 Calle Uno",
+            politicalDivision1="PR",
+            politicalDivision2="San Juan",
+            zipPrimary="00901",
+            countryCode=" pr ",
+            response_format="shipagent_v1",
+            trans_id="corr_address_pr",
+        )
+
+        self.assertEqual(result["status"], "valid")
+        self.assertEqual(result["correlationId"], "corr_address_pr")
+        self.assertEqual(fake.calls[0][1]["countryCode"], " pr ")
+
+    async def test_validate_address_hosted_preserves_explicit_transaction_src(self) -> None:
+        fake = self._install_fake_tool_manager(_FakeToolManager())
+
+        await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="US",
+            response_format="shipagent_v1",
+            trans_id="corr_address_src",
+            transaction_src="shipagent",
+        )
+
+        self.assertEqual(fake.calls[0][1]["transaction_src"], "shipagent")
+
+    async def test_validate_address_hosted_rejects_transaction_src_control_chars_before_ups(self) -> None:
+        result = await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="US",
+            response_format="shipagent_v1",
+            trans_id="corr_address_tx_src",
+            transaction_src="ship\nagent",
+        )
+
+        self._assert_safe_validation(result, correlation_id="corr_address_tx_src")
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_validate_address_hosted_generates_correlation_id_when_trans_id_missing(self) -> None:
+        result = await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="US",
+            response_format="shipagent_v1",
+        )
+
+        self.assertTrue(result["success"])
+        call_args = self.fake_tool_manager.calls[0][1]
+        self._assert_corr_id(call_args["trans_id"])
+        self.assertEqual(result["correlationId"], call_args["trans_id"])
+
+    async def test_validate_address_hosted_tool_error_returns_safe_error(self) -> None:
+        exc = ToolError(json.dumps({"status_code": 503, "code": "503"}))
+        self._install_fake_tool_manager(
+            _FakeToolManager(validate_address_exception=exc)
+        )
+
+        result = await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="US",
+            response_format="shipagent_v1",
+            trans_id="corr_address_error",
+        )
+
+        error = self._assert_closed_error(result)
+        self.assertEqual(error["code"], "UPS_SERVICE_UNAVAILABLE")
+        self.assertEqual(error["category"], "service_unavailable")
+        self.assertEqual(error["correlation_id"], "corr_address_error")
+
+    async def test_validate_address_hosted_unexpected_exception_returns_unknown_error(self) -> None:
+        self._install_fake_tool_manager(
+            _FakeToolManager(
+                validate_address_exception=RuntimeError(
+                    "connection timeout traceback path /tmp/address"
+                )
+            )
+        )
+
+        result = await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="US",
+            response_format="shipagent_v1",
+            trans_id="corr_address_unknown",
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "success": False,
+                "error": {
+                    "category": "unknown",
+                    "code": "UPS_UNKNOWN_ERROR",
+                    "message": "UPS request failed unexpectedly.",
+                    "correlation_id": "corr_address_unknown",
+                    "retryable": False,
+                },
+            },
+        )
+        serialized = json.dumps(result).lower()
+        self.assertNotIn("traceback", serialized)
+        self.assertNotIn("/tmp/address", serialized)
+        self.assertNotIn("timeout", serialized)
+
+    async def test_validate_address_hosted_normalization_failure_returns_normalization_error(self) -> None:
+        self._install_fake_tool_manager(
+            _FakeToolManager(validate_address_response={"bad": "shape"})
+        )
+
+        result = await server.validate_address(
+            addressLine1="123 Main St",
+            politicalDivision1="GA",
+            politicalDivision2="Atlanta",
+            zipPrimary="30301",
+            countryCode="US",
+            response_format="shipagent_v1",
+            trans_id="corr_address_norm",
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "success": False,
+                "error": {
+                    "category": "normalization",
+                    "code": "UPS_NORMALIZATION_ERROR",
+                    "message": "UPS response could not be normalized.",
+                    "correlation_id": "corr_address_norm",
+                    "retryable": False,
+                },
+            },
+        )
+
+    async def test_create_shipment_raw_is_default_and_does_not_require_idempotency_key(self) -> None:
+        result = await server.create_shipment(request_body=make_complete_body())
+
+        self.assertIn("ShipmentResponse", result)
+        call_args = self.fake_tool_manager.calls[0][1]
+        self.assertIsNone(call_args["trans_id"])
+        self.assertIsNone(call_args.get("idempotency_key"))
+
+    async def test_create_shipment_invalid_response_format_raises_tool_error(self) -> None:
+        for invalid_format in ("xml", "ShipAgent_V1", "RAW", "shipagent-v1"):
+            with self.subTest(response_format=invalid_format):
+                with self.assertRaises(ToolError) as ctx:
+                    await server.create_shipment(
+                        request_body=make_complete_body(),
+                        response_format=invalid_format,
+                    )
+
+                payload = json.loads(str(ctx.exception))
+                self.assertEqual(payload["code"], "INVALID_RESPONSE_FORMAT")
+                self.assertEqual(payload["allowed"], ["raw", "shipagent_v1"])
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_rejects_trans_id_control_chars_before_ups(self) -> None:
+        result = await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key="idem-valid",
+            trans_id="corr\nbad",
+        )
+
+        self._assert_safe_validation(result)
+        self._assert_corr_id(result["error"]["correlation_id"])
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_rejects_transaction_src_control_chars_before_ups(self) -> None:
+        result = await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key="idem-valid",
+            trans_id="corr_create_tx_src",
+            transaction_src="ship\nagent",
+        )
+
+        self._assert_safe_validation(result, correlation_id="corr_create_tx_src")
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_requires_non_empty_idempotency_key_before_ups(self) -> None:
+        for key in ("", "   "):
+            with self.subTest(key=repr(key)):
+                result = await server.create_shipment(
+                    request_body=make_complete_body(),
+                    response_format="shipagent_v1",
+                    idempotency_key=key,
+                    trans_id="corr_missing_key",
+                )
+
+                self._assert_safe_validation(result, correlation_id="corr_missing_key")
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_rejects_idempotency_key_over_512_chars_before_ups(self) -> None:
+        result = await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key="k" * 513,
+            trans_id="corr_long_key",
+        )
+
+        self._assert_safe_validation(result, correlation_id="corr_long_key")
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_rejects_idempotency_key_control_chars_before_ups(self) -> None:
+        bad_keys = {
+            "newline": "idem\nkey",
+            "carriage_return": "idem\rkey",
+            "tab": "idem\tkey",
+            "nul": "idem\x00key",
+            "del": f"idem{chr(127)}key",
+        }
+
+        for name, key in bad_keys.items():
+            with self.subTest(name=name):
+                result = await server.create_shipment(
+                    request_body=make_complete_body(),
+                    response_format="shipagent_v1",
+                    idempotency_key=key,
+                    trans_id="corr_control_key",
+                )
+
+                self._assert_safe_validation(result, correlation_id="corr_control_key")
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_rejects_existing_customer_context_over_512_chars_before_ups(self) -> None:
+        body = make_complete_body()
+        body["ShipmentRequest"]["Request"]["TransactionReference"] = {
+            "CustomerContext": "x" * 513,
+        }
+
+        result = await server.create_shipment(
+            request_body=body,
+            response_format="shipagent_v1",
+            idempotency_key="idem-valid",
+            trans_id="corr_long_context",
+        )
+
+        self._assert_safe_validation(result, correlation_id="corr_long_context")
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_rejects_non_string_customer_context_before_ups(self) -> None:
+        bad_contexts = (None, 123, True, {}, [])
+
+        for customer_context in bad_contexts:
+            with self.subTest(customer_context=repr(customer_context)):
+                body = make_complete_body()
+                body["ShipmentRequest"]["Request"]["TransactionReference"] = {
+                    "CustomerContext": customer_context,
+                }
+
+                result = await server.create_shipment(
+                    request_body=body,
+                    response_format="shipagent_v1",
+                    idempotency_key="idem-valid",
+                    trans_id="corr_non_string_context",
+                )
+
+                self._assert_safe_validation(
+                    result,
+                    correlation_id="corr_non_string_context",
+                )
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_rejects_malformed_transaction_reference_before_ups(self) -> None:
+        body = make_complete_body()
+        body["ShipmentRequest"]["Request"]["TransactionReference"] = "bad"
+
+        result = await server.create_shipment(
+            request_body=body,
+            response_format="shipagent_v1",
+            idempotency_key="idem-valid",
+            trans_id="corr_bad_transaction_reference",
+        )
+
+        self._assert_safe_validation(
+            result,
+            correlation_id="corr_bad_transaction_reference",
+        )
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_rejects_existing_customer_context_control_chars_before_ups(self) -> None:
+        bad_contexts = {
+            "newline": "caller\ncontext",
+            "carriage_return": "caller\rcontext",
+            "tab": "caller\tcontext",
+            "nul": "caller\x00context",
+            "del": f"caller{chr(127)}context",
+        }
+
+        for name, customer_context in bad_contexts.items():
+            with self.subTest(name=name):
+                body = make_complete_body()
+                body["ShipmentRequest"]["Request"]["TransactionReference"] = {
+                    "CustomerContext": customer_context,
+                }
+
+                result = await server.create_shipment(
+                    request_body=body,
+                    response_format="shipagent_v1",
+                    idempotency_key="idem-valid",
+                    trans_id="corr_bad_context",
+                )
+
+                self._assert_safe_validation(result, correlation_id="corr_bad_context")
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_does_not_elicit_missing_fields_or_call_ups(self) -> None:
+        ctx = MagicMock()
+        ctx.request_context.session.client_params = InitializeRequestParams(
+            protocolVersion="2025-03-26",
+            capabilities=ClientCapabilities(
+                elicitation=ElicitationCapability(form=FormElicitationCapability())
+            ),
+            clientInfo=Implementation(name="test", version="1.0"),
+        )
+        ctx.elicit = AsyncMock()
+
+        result = await server.create_shipment(
+            request_body={"ShipmentRequest": {}},
+            response_format="shipagent_v1",
+            idempotency_key="idem-missing-fields",
+            trans_id="corr_create_missing",
+            ctx=ctx,
+        )
+
+        self._assert_safe_validation(result, correlation_id="corr_create_missing")
+        ctx.elicit.assert_not_awaited()
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
+    async def test_create_shipment_hosted_normalizes_and_echoes_stripped_idempotency_key(self) -> None:
+        result = await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key=" idem-create-1 ",
+            trans_id=" corr_create ",
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "success": True,
+                "correlationId": "corr_create",
+                "idempotencyKey": "idem-create-1",
+                "shipmentIdentificationNumber": "1ZSHIP",
+                "trackingNumbers": ["1ZTRACK1"],
+                "totalCharges": {"monetaryValue": "20.00", "currencyCode": "USD"},
+                "labelData": [
+                    {
+                        "trackingNumber": "1ZTRACK1",
+                        "format": "ZPL",
+                        "encoding": "base64",
+                        "contentBase64": "QkFTRTY0UERG",
+                    }
+                ],
+            },
+        )
+        self.assertNotIn("contractVersion", result)
+        self.assertNotIn("contract_version", result)
+        call_args = self.fake_tool_manager.calls[0][1]
+        self.assertEqual(call_args["trans_id"], "corr_create")
+        self.assertEqual(call_args["idempotency_key"], "idem-create-1")
+        self.assertEqual(call_args["transaction_src"], "ups-mcp")
+
+    async def test_create_shipment_hosted_preserves_explicit_transaction_src(self) -> None:
+        await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key="idem-src",
+            trans_id="corr_create_src",
+            transaction_src="shipagent",
+        )
+
+        call_args = self.fake_tool_manager.calls[0][1]
+        self.assertEqual(call_args["transaction_src"], "shipagent")
+
+    async def test_create_shipment_hosted_generates_correlation_id_when_trans_id_missing(self) -> None:
+        result = await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key="idem-generated-corr",
+        )
+
+        self.assertTrue(result["success"])
+        call_args = self.fake_tool_manager.calls[0][1]
+        self._assert_corr_id(call_args["trans_id"])
+        self.assertEqual(result["correlationId"], call_args["trans_id"])
+
+    async def test_create_shipment_hosted_safe_error_and_normalization_error(self) -> None:
+        self.fake_tool_manager.create_shipment_exception = ToolError(
+            json.dumps({"status_code": 401, "code": "401"})
+        )
+
+        result = await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key="idem-error",
+            trans_id="corr_create_error",
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"]["code"], "UPS_AUTH_ERROR")
+        self.assertEqual(result["error"]["correlation_id"], "corr_create_error")
+        self.assertNotIn("idempotencyKey", result)
+
+        self.fake_tool_manager.create_shipment_exception = RuntimeError(
+            "stack path /tmp/create traceback token"
+        )
+        unknown = await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key="idem-unknown",
+            trans_id="corr_create_unknown",
+        )
+        self.assertFalse(unknown["success"])
+        self.assertEqual(unknown["error"]["code"], "UPS_UNKNOWN_ERROR")
+        self.assertEqual(unknown["error"]["category"], "unknown")
+        self.assertFalse(unknown["error"]["retryable"])
+        self.assertEqual(unknown["error"]["correlation_id"], "corr_create_unknown")
+        self.assertNotIn("idempotencyKey", unknown)
+        serialized = json.dumps(unknown).lower()
+        self.assertNotIn("traceback", serialized)
+        self.assertNotIn("/tmp/create", serialized)
+
+        self.fake_tool_manager.create_shipment_exception = None
+        self.fake_tool_manager.create_shipment_response = {
+            "ShipmentResponse": {"ShipmentResults": {}}
+        }
+        normalized = await server.create_shipment(
+            request_body=make_complete_body(),
+            response_format="shipagent_v1",
+            idempotency_key="idem-normalization",
+            trans_id="corr_create_norm",
+        )
+        self.assertFalse(normalized["success"])
+        self.assertEqual(normalized["error"]["code"], "UPS_NORMALIZATION_ERROR")
+        self.assertEqual(normalized["error"]["category"], "normalization")
+        self.assertNotIn("idempotencyKey", normalized)
+
+    async def test_create_shipment_hosted_ambiguous_mutating_failures_are_not_retryable(self) -> None:
+        cases = [
+            (
+                "service_unavailable",
+                ToolError(json.dumps({"status_code": 503, "code": "503"})),
+                "UPS_SERVICE_UNAVAILABLE",
+                "service_unavailable",
+            ),
+            (
+                "request_error",
+                ToolError(json.dumps({"code": "REQUEST_ERROR", "message": "connection reset"})),
+                "UPS_TRANSPORT_ERROR",
+                "transport",
+            ),
+            (
+                "timeout",
+                ToolError(json.dumps({"status_code": 408, "code": "REQUEST_TIMEOUT"})),
+                "UPS_TRANSPORT_ERROR",
+                "transport",
+            ),
+        ]
+
+        for name, exc, code, category in cases:
+            with self.subTest(name=name):
+                self.fake_tool_manager.create_shipment_exception = exc
+
+                result = await server.create_shipment(
+                    request_body=make_complete_body(),
+                    response_format="shipagent_v1",
+                    idempotency_key=f"idem-{name}",
+                    trans_id=f"corr_create_{name}",
+                )
+
+                error = self._assert_closed_error(result)
+                self.assertEqual(error["code"], code)
+                self.assertEqual(error["category"], category)
+                self.assertEqual(error["correlation_id"], f"corr_create_{name}")
+                self.assertIs(error["retryable"], False)
+                self.assertNotIn("idempotencyKey", result)
+
+
+if __name__ == "__main__":
+    unittest.main()
