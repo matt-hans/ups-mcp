@@ -1,3 +1,4 @@
+from importlib import metadata
 from typing import Any, Literal
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.fastmcp.exceptions import ToolError
@@ -5,9 +6,23 @@ from dotenv import load_dotenv
 import json
 import os
 import sys
+import uuid
 from . import tools
 from . import constants
 from .openapi_registry import OpenAPISpecLoadError
+from .shipagent_normalization import (
+    HOSTED_RESPONSE_FORMAT,
+    RAW_RESPONSE_FORMAT,
+    ShipAgentNormalizationError,
+    build_shipagent_capabilities,
+    normalize_rate_result,
+    to_normalization_error,
+    to_safe_error,
+)
+
+ResponseFormat = Literal["raw", "shipagent_v1"]
+MAX_IDEMPOTENCY_KEY_LENGTH = 512
+MAX_CUSTOMER_CONTEXT_LENGTH = 512
 
 # Initialize FastMCP server
 mcp = FastMCP("ups-mcp")
@@ -43,6 +58,112 @@ def _require_tool_manager() -> tools.ToolManager:
     if tool_manager is None:
         raise RuntimeError("Tool manager is not initialized. Start UPS MCP via server.main().")
     return tool_manager
+
+
+def _validate_response_format(response_format: str) -> ResponseFormat:
+    if response_format not in (RAW_RESPONSE_FORMAT, HOSTED_RESPONSE_FORMAT):
+        raise ToolError(json.dumps({
+            "code": "INVALID_RESPONSE_FORMAT",
+            "allowed": [RAW_RESPONSE_FORMAT, HOSTED_RESPONSE_FORMAT],
+        }))
+    return response_format  # type: ignore[return-value]
+
+
+def _has_ascii_control(value: str) -> bool:
+    return any(ord(char) < 32 or ord(char) == 127 for char in value)
+
+
+def _is_ascii_country_code(value: str) -> bool:
+    return len(value) == 2 and value.isascii() and value.isalpha()
+
+
+def _hosted_validation_error(correlation_id: str, reason: str) -> dict[str, Any]:
+    return {
+        "success": False,
+        "error": {
+            "category": "validation",
+            "code": "UPS_VALIDATION_ERROR",
+            "message": "UPS request validation failed.",
+            "correlation_id": correlation_id,
+            "retryable": False,
+            "reason": reason,
+        },
+    }
+
+
+def _hosted_correlation_id(trans_id: str) -> tuple[str, dict[str, Any] | None]:
+    if _has_ascii_control(trans_id):
+        correlation_id = f"corr_{uuid.uuid4().hex}"
+        return (
+            correlation_id,
+            _hosted_validation_error(
+                correlation_id,
+                "trans_id_contains_ascii_control",
+            ),
+        )
+
+    stripped_trans_id = trans_id.strip()
+    if stripped_trans_id:
+        return stripped_trans_id, None
+    return f"corr_{uuid.uuid4().hex}", None
+
+
+def _hosted_transaction_src_error(
+    transaction_src: str,
+    correlation_id: str,
+) -> dict[str, Any] | None:
+    if _has_ascii_control(transaction_src):
+        return _hosted_validation_error(
+            correlation_id,
+            "transaction_src_contains_ascii_control",
+        )
+    return None
+
+
+def _validate_hosted_customer_context(request_body: dict[str, Any]) -> None:
+    if not isinstance(request_body, dict):
+        return
+    request = (
+        request_body
+        .get("ShipmentRequest", {})
+        .get("Request", {})
+    )
+    if not isinstance(request, dict):
+        return
+    transaction_reference = request.get("TransactionReference", {})
+    if not isinstance(transaction_reference, dict):
+        return
+    customer_context = transaction_reference.get("CustomerContext")
+    if customer_context is None:
+        return
+    if not isinstance(customer_context, str):
+        raise ToolError(json.dumps({
+            "code": "VALIDATION_ERROR",
+            "reason": "customer_context_must_be_string",
+        }))
+    if _has_ascii_control(customer_context):
+        raise ToolError(json.dumps({
+            "code": "VALIDATION_ERROR",
+            "reason": "customer_context_contains_ascii_control",
+        }))
+    if len(customer_context) > MAX_CUSTOMER_CONTEXT_LENGTH:
+        raise ToolError(json.dumps({
+            "code": "VALIDATION_ERROR",
+            "reason": "customer_context_too_long",
+        }))
+
+
+def _installed_server_version() -> str:
+    try:
+        return metadata.version("ups-mcp")
+    except Exception:
+        return "unknown"
+
+
+@mcp.tool()
+async def shipagent_capabilities() -> dict[str, Any]:
+    """Return hosted ShipAgent capability metadata without requiring UPS credentials."""
+    return build_shipagent_capabilities(_installed_server_version())
 
 
 
@@ -145,6 +266,7 @@ async def rate_shipment(
     additionalinfo: str = "",
     trans_id: str = "",
     transaction_src: str = "ups-mcp",
+    response_format: ResponseFormat = "raw",
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """
@@ -187,11 +309,70 @@ async def rate_shipment(
         additionalinfo (str): Optional query param. Supports `timeintransit`.
         trans_id (str): Optional request id.
         transaction_src (str): Optional caller source name. Default `ups-mcp`.
+        response_format (str): `raw` for the UPS payload, or `shipagent_v1`
+            for the hosted-safe normalized response.
         ctx: MCP Context (injected by FastMCP, not provided by callers).
 
     Returns:
-        dict[str, Any]: Raw UPS API response payload. On error, raises ToolError.
+        dict[str, Any]: Raw UPS API response payload, or hosted-safe normalized
+        payload when `response_format` is `shipagent_v1`. Raw errors raise
+        ToolError; hosted UPS and normalization errors return safe envelopes.
     """
+    validated_response_format = _validate_response_format(response_format)
+
+    if validated_response_format == RAW_RESPONSE_FORMAT:
+        return await _rate_shipment_execute(
+            requestoption=requestoption,
+            request_body=request_body,
+            version=version,
+            additionalinfo=additionalinfo,
+            trans_id=trans_id or None,
+            transaction_src=transaction_src,
+            ctx=ctx,
+            allow_elicitation=True,
+        )
+
+    correlation_id, correlation_error = _hosted_correlation_id(trans_id)
+    if correlation_error is not None:
+        return correlation_error
+
+    transaction_src_error = _hosted_transaction_src_error(
+        transaction_src,
+        correlation_id,
+    )
+    if transaction_src_error is not None:
+        return transaction_src_error
+
+    try:
+        raw_result = await _rate_shipment_execute(
+            requestoption=requestoption,
+            request_body=request_body,
+            version=version,
+            additionalinfo=additionalinfo,
+            trans_id=correlation_id,
+            transaction_src=transaction_src,
+            ctx=None,
+            allow_elicitation=False,
+        )
+        return normalize_rate_result(raw_result, requestoption, correlation_id)
+    except ShipAgentNormalizationError:
+        return to_normalization_error(correlation_id)
+    except ToolError as exc:
+        return to_safe_error(exc, correlation_id)
+    except Exception as exc:
+        return to_safe_error(exc, correlation_id)
+
+
+async def _rate_shipment_execute(
+    requestoption: str,
+    request_body: dict[str, Any],
+    version: str = "v2409",
+    additionalinfo: str = "",
+    trans_id: str | None = None,
+    transaction_src: str = "ups-mcp",
+    ctx: Context | None = None,
+    allow_elicitation: bool = True,
+) -> dict[str, Any]:
     from .rating_validator import (
         apply_rate_defaults,
         find_missing_rate_fields,
@@ -210,7 +391,7 @@ async def rate_shipment(
             request_body=api_body,
             version=version,
             additionalinfo=additionalinfo or None,
-            trans_id=trans_id or None,
+            trans_id=trans_id,
             transaction_src=transaction_src,
         )
 
@@ -242,6 +423,14 @@ async def rate_shipment(
     # 3. Happy path — all fields present
     if not missing:
         return _send_to_ups(merged_body)
+
+    if not allow_elicitation:
+        raise ToolError(json.dumps({
+            "code": "VALIDATION_ERROR",
+            "message": "Missing required field(s) for rate request.",
+            "reason": "missing_rate_required_fields",
+            "missing": [field.flat_key for field in missing],
+        }))
 
     # 4. Elicitation flow
     merged_body = await elicit_and_rehydrate(
