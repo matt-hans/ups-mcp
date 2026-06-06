@@ -25,6 +25,9 @@ SHIPAGENT_CAPABILITIES = [
 RESPONSE_FORMATS = [RAW_RESPONSE_FORMAT, HOSTED_RESPONSE_FORMAT]
 SUPPORTED_CREATE_LABEL_FORMATS = {"GIF", "ZPL", "EPL", "SPL"}
 
+_RATE_QUOTE_OPTIONS = {"rate", "ratetimeintransit"}
+_RATE_SHOP_OPTIONS = {"shop", "shoptimeintransit"}
+
 _CATEGORY_TO_PUBLIC_ERROR = {
     "auth": {
         "code": "UPS_AUTH_ERROR",
@@ -126,6 +129,45 @@ def to_safe_error(exc: BaseException, correlation_id: str) -> dict[str, Any]:
             "correlation_id": correlation_id,
             "retryable": public_error["retryable"],
         },
+    }
+
+
+def normalize_rate_result(raw: Mapping[str, Any], requestoption: str, correlation_id: str) -> dict[str, Any]:
+    option = _required_hosted_string(requestoption, "requestoption").lower()
+    if option not in _RATE_QUOTE_OPTIONS and option not in _RATE_SHOP_OPTIONS:
+        raise ShipAgentNormalizationError("Unsupported rate request option.")
+    normalized_correlation_id = _required_hosted_string(correlation_id, "correlationId")
+
+    rated_shipments = _rated_shipments(
+        _required_mapping(
+            _required_mapping(raw, "RateResponse envelope").get("RateResponse"),
+            "RateResponse",
+        ).get("RatedShipment")
+    )
+    if not rated_shipments:
+        raise ShipAgentNormalizationError("RateResponse.RatedShipment is required.")
+
+    normalized_shipments: list[dict[str, Any]] = []
+    for rated in rated_shipments:
+        normalized_shipment = _normalize_rate_shipment(rated)
+        if normalized_shipment is None:
+            raise ShipAgentNormalizationError("RatedShipment is incomplete.")
+        normalized_shipments.append(normalized_shipment)
+
+    if option in _RATE_QUOTE_OPTIONS:
+        if len(normalized_shipments) != 1:
+            raise ShipAgentNormalizationError("Rate quote requires exactly one RatedShipment.")
+        shipment = normalized_shipments[0]
+        return {
+            "success": True,
+            "correlationId": normalized_correlation_id,
+            **shipment,
+        }
+
+    return {
+        "success": True,
+        "correlationId": normalized_correlation_id,
+        "ratedShipments": normalized_shipments,
     }
 
 
@@ -272,6 +314,125 @@ def _looks_like_validation_text(value: str) -> bool:
             r"\bmissing required key\b",
         )
     )
+
+
+def _rated_shipments(value: Any) -> list[Mapping[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, Mapping):
+        return [value]
+    if isinstance(value, list):
+        shipments: list[Mapping[str, Any]] = []
+        for item in value:
+            if not isinstance(item, Mapping):
+                raise ShipAgentNormalizationError("RatedShipment entries must be objects.")
+            shipments.append(item)
+        return shipments
+    raise ShipAgentNormalizationError("RatedShipment must be an object or list.")
+
+
+def _normalize_rate_shipment(
+    rated: Mapping[str, Any], *, require_service_code: bool = True
+) -> dict[str, Any] | None:
+    service = _optional_mapping(rated.get("Service"), "RatedShipment.Service")
+    if service is None:
+        return None
+    service_code = _optional_hosted_string(service.get("Code"), "Service.Code")
+    if require_service_code and service_code is None:
+        return None
+
+    total_charge = _extract_total_charge(rated)
+    if total_charge is None:
+        return None
+
+    normalized: dict[str, Any] = {
+        "totalCharges": total_charge,
+    }
+    if service_code is not None:
+        normalized["serviceCode"] = service_code
+    service_description = _optional_hosted_string(
+        service.get("Description"), "Service.Description"
+    )
+    if service_description is not None:
+        normalized["serviceDescription"] = service_description
+    return normalized
+
+
+def _extract_total_charge(rated: Mapping[str, Any]) -> dict[str, str] | None:
+    if rated.get("NegotiatedRateCharges") is not None:
+        negotiated = _required_mapping(
+            rated.get("NegotiatedRateCharges"),
+            "NegotiatedRateCharges",
+        )
+        return _normalize_charge(
+            negotiated.get("TotalCharge"),
+            "NegotiatedRateCharges.TotalCharge",
+            require_complete=True,
+        )
+    return _normalize_charge(
+        rated.get("TotalCharges"),
+        "TotalCharges",
+        require_complete=False,
+    )
+
+
+def _normalize_charge(
+    value: Any, field_name: str, *, require_complete: bool
+) -> dict[str, str] | None:
+    if value is None:
+        if require_complete:
+            raise ShipAgentNormalizationError(f"{field_name} is required.")
+        return None
+    charge = _required_mapping(value, field_name)
+    monetary_value = _optional_hosted_string(
+        charge.get("MonetaryValue"), f"{field_name}.MonetaryValue"
+    )
+    currency_code = _optional_hosted_string(
+        charge.get("CurrencyCode"), f"{field_name}.CurrencyCode"
+    )
+    if monetary_value is None or currency_code is None:
+        if require_complete:
+            raise ShipAgentNormalizationError(f"{field_name} is incomplete.")
+        return None
+    if not _is_currency_code(currency_code):
+        raise ShipAgentNormalizationError(f"{field_name}.CurrencyCode is invalid.")
+    return {"monetaryValue": monetary_value, "currencyCode": currency_code}
+
+
+def _optional_mapping(value: Any, field_name: str) -> Mapping[str, Any] | None:
+    if value is None:
+        return None
+    return _required_mapping(value, field_name)
+
+
+def _required_mapping(value: Any, field_name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ShipAgentNormalizationError(f"{field_name} must be an object.")
+    return value
+
+
+def _required_hosted_string(value: Any, field_name: str) -> str:
+    normalized = _optional_hosted_string(value, field_name)
+    if normalized is None:
+        raise ShipAgentNormalizationError(f"{field_name} is required.")
+    return normalized
+
+
+def _optional_hosted_string(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ShipAgentNormalizationError(f"{field_name} must be a string.")
+    if _has_ascii_control(value):
+        raise ShipAgentNormalizationError(f"{field_name} contains ASCII control characters.")
+    stripped = value.strip()
+    if not stripped:
+        return None
+    return stripped
+
+
+def _is_currency_code(value: str) -> bool:
+    return re.fullmatch(r"[A-Z]{3}", value) is not None
 
 
 def _as_mapping(value: Any) -> dict[str, Any]:
