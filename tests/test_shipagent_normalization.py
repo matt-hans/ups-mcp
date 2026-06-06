@@ -225,6 +225,36 @@ class ShipAgentCapabilitiesAndErrorTests(unittest.TestCase):
                     },
                 )
 
+    def test_to_safe_error_does_not_treat_network_ports_as_status_codes(self) -> None:
+        error = to_safe_error(
+            ToolError(
+                json.dumps(
+                    {
+                        "code": "REQUEST_ERROR",
+                        "message": (
+                            "HTTPSConnectionPool(host='example.test', port=443): "
+                            "Max retries exceeded with url: /rating"
+                        ),
+                    },
+                ),
+            ),
+            "corr_pool",
+        )
+
+        self.assertEqual(
+            error,
+            {
+                "success": False,
+                "error": {
+                    "category": "transport",
+                    "code": "UPS_TRANSPORT_ERROR",
+                    "message": "UPS transport request failed.",
+                    "correlation_id": "corr_pool",
+                    "retryable": True,
+                },
+            },
+        )
+
     def test_to_safe_error_prioritizes_status_text_with_ascii_controls(self) -> None:
         cases = [
             (

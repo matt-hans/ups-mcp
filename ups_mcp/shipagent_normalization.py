@@ -72,6 +72,18 @@ _VALIDATION_ERROR_CODES = {
     "VALIDATION_ERROR",
 }
 
+_HTTP_REASON_PHRASES = (
+    "Bad Request",
+    "Unauthorized",
+    "Forbidden",
+    "Request Timeout",
+    "Too Many Requests",
+    "Internal Server Error",
+    "Bad Gateway",
+    "Service Unavailable",
+    "Gateway Timeout",
+)
+
 
 class ShipAgentNormalizationError(ValueError):
     """Raised when a UPS payload cannot satisfy the hosted-v1 contract."""
@@ -216,7 +228,16 @@ def _coerce_http_status(value: Any) -> int | None:
 def _coerce_status_from_text(value: str | None) -> int | None:
     if value is None:
         return None
-    match = re.search(r"\b([1-5][0-9]{2})\b", value)
+    match = re.search(
+        r"\b(?:HTTPError|HTTP status|status(?: code)?)\D{0,20}([1-5][0-9]{2})\b",
+        value,
+        re.IGNORECASE,
+    )
+    if match:
+        return int(match.group(1))
+
+    reason_pattern = "|".join(re.escape(phrase) for phrase in _HTTP_REASON_PHRASES)
+    match = re.search(rf"\b([1-5][0-9]{{2}})\s+(?:{reason_pattern})\b", value, re.IGNORECASE)
     return int(match.group(1)) if match else None
 
 
