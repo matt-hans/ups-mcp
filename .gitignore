@@ -197,5 +197,10 @@ cython_debug/
 # Worktrees
 .worktrees/
 
+# Local agent skill installs
+.agents/
+.claude/skills/
+skills-lock.json
+
 # Repomix
 repomix-output.xml
