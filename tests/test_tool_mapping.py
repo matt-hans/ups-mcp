@@ -1,3 +1,4 @@
+import copy
 import unittest
 
 from mcp.server.fastmcp.exceptions import ToolError
@@ -82,6 +83,103 @@ class ToolMappingTests(unittest.TestCase):
 
         self.assertIn("Invalid requestoption", str(ctx.exception))
         self.assertEqual(len(self.fake_http_client.calls), 0)
+
+    def test_create_shipment_sets_missing_customer_context_to_idempotency_key(self) -> None:
+        body = {"ShipmentRequest": {"Request": {}, "Shipment": {}}}
+
+        self.manager.create_shipment(
+            request_body=body,
+            idempotency_key=" idem-123 ",
+        )
+
+        sent_body = self.fake_http_client.calls[0]["kwargs"]["json_body"]
+        context = sent_body["ShipmentRequest"]["Request"]["TransactionReference"]["CustomerContext"]
+        self.assertEqual(context, "idem-123")
+        self.assertNotIn("TransactionReference", body["ShipmentRequest"]["Request"])
+
+    def test_create_shipment_sets_empty_customer_context_to_idempotency_key(self) -> None:
+        body = {
+            "ShipmentRequest": {
+                "Request": {"TransactionReference": {"CustomerContext": "  "}},
+                "Shipment": {},
+            }
+        }
+
+        self.manager.create_shipment(request_body=body, idempotency_key="idem-empty")
+
+        sent_body = self.fake_http_client.calls[0]["kwargs"]["json_body"]
+        context = sent_body["ShipmentRequest"]["Request"]["TransactionReference"]["CustomerContext"]
+        self.assertEqual(context, "idem-empty")
+
+    def test_create_shipment_appends_idempotency_key_when_context_has_room(self) -> None:
+        body = {
+            "ShipmentRequest": {
+                "Request": {
+                    "TransactionReference": {"CustomerContext": "caller-context"}
+                },
+                "Shipment": {},
+            }
+        }
+
+        self.manager.create_shipment(request_body=body, idempotency_key="idem-append")
+
+        sent_body = self.fake_http_client.calls[0]["kwargs"]["json_body"]
+        context = sent_body["ShipmentRequest"]["Request"]["TransactionReference"]["CustomerContext"]
+        self.assertEqual(context, "caller-context; idempotency_key=idem-append")
+
+    def test_create_shipment_preserves_existing_context_when_append_exceeds_512_chars(self) -> None:
+        existing = "x" * 500
+        body = {
+            "ShipmentRequest": {
+                "Request": {"TransactionReference": {"CustomerContext": existing}},
+                "Shipment": {},
+            }
+        }
+
+        self.manager.create_shipment(request_body=body, idempotency_key="idem-too-long")
+
+        sent_body = self.fake_http_client.calls[0]["kwargs"]["json_body"]
+        context = sent_body["ShipmentRequest"]["Request"]["TransactionReference"]["CustomerContext"]
+        self.assertEqual(context, existing)
+        self.assertEqual(len(context), 500)
+
+    def test_create_shipment_without_idempotency_key_leaves_request_body_unchanged(self) -> None:
+        body = {
+            "ShipmentRequest": {
+                "Request": {
+                    "TransactionReference": {"CustomerContext": "caller-context"}
+                },
+                "Shipment": {},
+            }
+        }
+        original = copy.deepcopy(body)
+
+        self.manager.create_shipment(request_body=body)
+
+        sent_body = self.fake_http_client.calls[0]["kwargs"]["json_body"]
+        self.assertEqual(sent_body, original)
+        self.assertEqual(body, original)
+
+    def test_create_shipment_same_idempotency_key_is_not_deduped_locally(self) -> None:
+        body = {"ShipmentRequest": {"Request": {}, "Shipment": {}}}
+
+        first = self.manager.create_shipment(
+            request_body=body,
+            idempotency_key="idem-repeat",
+        )
+        second = self.manager.create_shipment(
+            request_body=body,
+            idempotency_key="idem-repeat",
+        )
+
+        self.assertEqual(first, {"mock": True})
+        self.assertEqual(second, {"mock": True})
+        self.assertEqual(len(self.fake_http_client.calls), 2)
+        contexts = [
+            call["kwargs"]["json_body"]["ShipmentRequest"]["Request"]["TransactionReference"]["CustomerContext"]
+            for call in self.fake_http_client.calls
+        ]
+        self.assertEqual(contexts, ["idem-repeat", "idem-repeat"])
 
 
 
