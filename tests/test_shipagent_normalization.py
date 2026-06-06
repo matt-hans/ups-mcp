@@ -209,6 +209,51 @@ class ShipAgentCapabilitiesAndErrorTests(unittest.TestCase):
                     "retryable": True,
                 },
             ),
+            (
+                {
+                    "code": "REQUEST_ERROR",
+                    "message": (
+                        "401 Client Error: Unauthorized for url: "
+                        "https://example.test/security/v1/oauth/token"
+                    ),
+                },
+                {
+                    "category": "auth",
+                    "code": "UPS_AUTH_ERROR",
+                    "message": "UPS authentication failed.",
+                    "retryable": False,
+                },
+            ),
+            (
+                {
+                    "code": "REQUEST_ERROR",
+                    "message": (
+                        "429 Client Error: Too Many Requests for url: "
+                        "https://example.test/rating/v2409/Rate"
+                    ),
+                },
+                {
+                    "category": "rate_limit",
+                    "code": "UPS_RATE_LIMIT_ERROR",
+                    "message": "UPS rate limit exceeded.",
+                    "retryable": True,
+                },
+            ),
+            (
+                {
+                    "code": "REQUEST_ERROR",
+                    "message": (
+                        "500 Server Error: Internal Server Error for url: "
+                        "https://example.test/rating/v2409/Rate"
+                    ),
+                },
+                {
+                    "category": "service_unavailable",
+                    "code": "UPS_SERVICE_UNAVAILABLE",
+                    "message": "UPS service is temporarily unavailable.",
+                    "retryable": True,
+                },
+            ),
         ]
 
         for payload, expected in cases:

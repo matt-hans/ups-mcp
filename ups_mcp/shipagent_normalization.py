@@ -236,6 +236,14 @@ def _coerce_status_from_text(value: str | None) -> int | None:
     if match:
         return int(match.group(1))
 
+    match = re.search(
+        r"\b([1-5][0-9]{2})\s+(?:Client|Server) Error\b",
+        value,
+        re.IGNORECASE,
+    )
+    if match:
+        return int(match.group(1))
+
     reason_pattern = "|".join(re.escape(phrase) for phrase in _HTTP_REASON_PHRASES)
     match = re.search(rf"\b([1-5][0-9]{{2}})\s+(?:{reason_pattern})\b", value, re.IGNORECASE)
     return int(match.group(1)) if match else None
