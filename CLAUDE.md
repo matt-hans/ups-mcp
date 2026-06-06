@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository. `AGENTS.md` is the companion cross-agent operating guide; keep both files synchronized when repository architecture, workflows, tests, or hosted ShipAgent contract behavior changes.
 
 ## Project
 
