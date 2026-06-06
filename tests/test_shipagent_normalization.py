@@ -970,6 +970,23 @@ class ShipAgentAddressNormalizationTests(unittest.TestCase):
                 with self.assertRaises(ShipAgentNormalizationError):
                     normalize_address_result(raw, "corr_address_reject_candidate")
 
+    def test_invalid_and_unknown_reject_candidate_key_even_when_empty(self) -> None:
+        cases = [
+            {"NoCandidatesIndicator": "", "Candidate": {}},
+            {"NoCandidatesIndicator": "", "Candidate": []},
+            {"NoCandidatesIndicator": "", "Candidate": None},
+            {"Candidate": {}},
+            {"Candidate": []},
+            {"Candidate": None},
+        ]
+
+        for xav_response in cases:
+            with self.subTest(xav_response=xav_response):
+                raw = self._raw_xav_response(xav_response)
+
+                with self.assertRaises(ShipAgentNormalizationError):
+                    normalize_address_result(raw, "corr_address_reject_candidate_key")
+
     def test_conflicting_status_indicators_raise(self) -> None:
         raw = self._raw_xav_response(
             {

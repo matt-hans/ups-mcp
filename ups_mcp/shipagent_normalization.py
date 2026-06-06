@@ -200,7 +200,7 @@ def normalize_address_result(raw: Mapping[str, Any], correlation_id: str) -> dic
     candidate_value = xav_response.get("Candidate")
 
     if status in {"invalid", "unknown"}:
-        if "Candidate" in xav_response and _address_candidate_value_has_data(candidate_value):
+        if "Candidate" in xav_response:
             raise ShipAgentNormalizationError(
                 "Invalid and unknown address responses must not include candidates."
             )
@@ -304,18 +304,6 @@ def _normalize_address_lines(value: Any) -> list[str]:
         if line is not None:
             lines.append(line)
     return lines
-
-
-def _address_candidate_value_has_data(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, Mapping):
-        return bool(value)
-    if isinstance(value, list):
-        return any(_address_candidate_value_has_data(item) for item in value)
-    if isinstance(value, str):
-        return bool(value.strip())
-    return True
 
 
 def _classify_exception(exc: BaseException) -> str:
