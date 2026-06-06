@@ -199,6 +199,36 @@ class ShipAgentCapabilitiesAndErrorTests(unittest.TestCase):
             },
         )
 
+    def test_to_safe_error_maps_internal_validation_tool_errors(self) -> None:
+        payloads = [
+            {"code": "MALFORMED_REQUEST", "reason": "malformed_structure"},
+            {"code": "STRUCTURAL_FIELDS_REQUIRED"},
+            {"code": "ELICITATION_UNSUPPORTED"},
+            {"code": "ELICITATION_INVALID_RESPONSE"},
+            {"code": "ELICITATION_DECLINED"},
+            {"code": "ELICITATION_CANCELLED"},
+            {"code": "ELICITATION_FAILED"},
+            {"code": "ELICITATION_MAX_RETRIES"},
+        ]
+
+        for payload in payloads:
+            with self.subTest(payload["code"]):
+                error = to_safe_error(ToolError(json.dumps(payload)), "corr_internal")
+
+                self.assertEqual(
+                    error,
+                    {
+                        "success": False,
+                        "error": {
+                            "category": "validation",
+                            "code": "UPS_VALIDATION_ERROR",
+                            "message": "UPS request validation failed.",
+                            "correlation_id": "corr_internal",
+                            "retryable": False,
+                        },
+                    },
+                )
+
     def test_to_safe_error_does_not_leak_raw_ups_details(self) -> None:
         exc = ToolError(
             json.dumps(

@@ -58,6 +58,20 @@ _CATEGORY_TO_PUBLIC_ERROR = {
     },
 }
 
+_VALIDATION_ERROR_CODES = {
+    "BAD_REQUEST",
+    "ELICITATION_CANCELLED",
+    "ELICITATION_DECLINED",
+    "ELICITATION_FAILED",
+    "ELICITATION_INVALID_RESPONSE",
+    "ELICITATION_MAX_RETRIES",
+    "ELICITATION_UNSUPPORTED",
+    "INVALID_REQUEST",
+    "MALFORMED_REQUEST",
+    "STRUCTURAL_FIELDS_REQUIRED",
+    "VALIDATION_ERROR",
+}
+
 
 class ShipAgentNormalizationError(ValueError):
     """Raised when a UPS payload cannot satisfy the hosted-v1 contract."""
@@ -151,7 +165,7 @@ def _classify_exception(exc: BaseException) -> str:
         return "transport"
     if status_code is not None and 400 <= status_code < 500:
         return "validation"
-    if code_upper in {"VALIDATION_ERROR", "INVALID_REQUEST", "BAD_REQUEST"}:
+    if code_upper in _VALIDATION_ERROR_CODES:
         return "validation"
     if "connection" in text or "timeout" in text or "network" in text:
         return "transport"
