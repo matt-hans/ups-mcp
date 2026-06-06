@@ -1,8 +1,9 @@
 from importlib import metadata
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.fastmcp.exceptions import ToolError
 from dotenv import load_dotenv
+from pydantic import Field
 import json
 import os
 import sys
@@ -24,6 +25,10 @@ from .shipagent_normalization import (
 
 MAX_IDEMPOTENCY_KEY_LENGTH = 512
 MAX_CUSTOMER_CONTEXT_LENGTH = 512
+ResponseFormat = Annotated[
+    str,
+    Field(json_schema_extra={"enum": [RAW_RESPONSE_FORMAT, HOSTED_RESPONSE_FORMAT]}),
+]
 
 # Initialize FastMCP server
 mcp = FastMCP("ups-mcp")
@@ -232,7 +237,7 @@ async def validate_address(
     zipExtended: str = "",
     trans_id: str = "",
     transaction_src: str = "ups-mcp",
-    response_format: str = "raw",
+    response_format: ResponseFormat = "raw",
 ) -> dict[str, Any]:
     """
     Checks addresses against the United States Postal Service database of valid addresses in the U.S. and Puerto Rico.
@@ -373,7 +378,7 @@ async def rate_shipment(
     additionalinfo: str = "",
     trans_id: str = "",
     transaction_src: str = "ups-mcp",
-    response_format: str = "raw",
+    response_format: ResponseFormat = "raw",
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """
@@ -564,7 +569,7 @@ async def create_shipment(
     additionaladdressvalidation: str = "",
     trans_id: str = "",
     transaction_src: str = "ups-mcp",
-    response_format: str = "raw",
+    response_format: ResponseFormat = "raw",
     idempotency_key: str = "",
     ctx: Context | None = None,
 ) -> dict[str, Any]:

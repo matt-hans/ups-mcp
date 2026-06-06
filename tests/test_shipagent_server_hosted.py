@@ -202,6 +202,22 @@ class ShipAgentHostedServerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("shipagent_capabilities", {tool.name for tool in tools})
 
+    async def test_response_format_schema_exposes_hosted_choices(self) -> None:
+        tools = {tool.name: tool for tool in await server.mcp.list_tools()}
+
+        for tool_name in ("rate_shipment", "validate_address", "create_shipment"):
+            with self.subTest(tool_name=tool_name):
+                response_format_schema = (
+                    tools[tool_name]
+                    .inputSchema["properties"]["response_format"]
+                )
+
+                self.assertEqual(response_format_schema["default"], "raw")
+                self.assertEqual(
+                    response_format_schema["enum"],
+                    ["raw", "shipagent_v1"],
+                )
+
     async def test_rate_shipment_raw_default_preserves_raw_response_and_omitted_trans_id(self) -> None:
         raw_response = {"RateResponse": {"RatedShipment": []}}
         fake = self._install_fake_tool_manager(
@@ -238,23 +254,48 @@ class ShipAgentHostedServerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(fake.calls, [])
 
     async def test_invalid_response_format_mcp_call_tool_uses_custom_validator(self) -> None:
-        fake = self._install_fake_tool_manager(_FakeToolManager())
-
-        with self.assertRaises(ToolError) as ctx:
-            await server.mcp.call_tool(
+        cases = [
+            (
                 "rate_shipment",
                 {
                     "requestoption": "Rate",
                     "request_body": make_complete_rate_body(),
                     "response_format": "xml",
                 },
-            )
+            ),
+            (
+                "validate_address",
+                {
+                    "addressLine1": "123 Main St",
+                    "politicalDivision1": "GA",
+                    "politicalDivision2": "Atlanta",
+                    "zipPrimary": "30301",
+                    "countryCode": "US",
+                    "response_format": "xml",
+                },
+            ),
+            (
+                "create_shipment",
+                {
+                    "request_body": make_complete_body(),
+                    "response_format": "xml",
+                    "idempotency_key": "idem-invalid-format",
+                },
+            ),
+        ]
 
-        message = str(ctx.exception)
-        self.assertIn("INVALID_RESPONSE_FORMAT", message)
-        self.assertIn("shipagent_v1", message)
-        self.assertNotIn("literal_error", message)
-        self.assertEqual(fake.calls, [])
+        for tool_name, arguments in cases:
+            with self.subTest(tool_name=tool_name):
+                fake = self._install_fake_tool_manager(_FakeToolManager())
+
+                with self.assertRaises(ToolError) as ctx:
+                    await server.mcp.call_tool(tool_name, arguments)
+
+                message = str(ctx.exception)
+                self.assertIn("INVALID_RESPONSE_FORMAT", message)
+                self.assertIn("shipagent_v1", message)
+                self.assertNotIn("literal_error", message)
+                self.assertEqual(fake.calls, [])
 
     async def test_hosted_rate_rejects_trans_id_control_chars_before_ups(self) -> None:
         result = await server.rate_shipment(
