@@ -643,6 +643,16 @@ class ShipAgentRateNormalizationTests(unittest.TestCase):
         with self.assertRaises(ShipAgentNormalizationError):
             normalize_rate_result(raw, "Rate", "corr_rate_quote")
 
+    def test_present_null_or_missing_negotiated_rate_charge_rejects_without_standard_fallback(self) -> None:
+        for negotiated_rate_charges in (None, {}, {"TotalCharge": None}):
+            with self.subTest(negotiated_rate_charges=negotiated_rate_charges):
+                rated_shipment = self._rated_shipment(monetary_value="99.99")
+                rated_shipment["NegotiatedRateCharges"] = negotiated_rate_charges
+                raw = self._raw_rate_response([rated_shipment])
+
+                with self.assertRaises(ShipAgentNormalizationError):
+                    normalize_rate_result(raw, "Rate", "corr_rate_quote")
+
     def test_quote_requires_service_code(self) -> None:
         raw = self._raw_rate_response(
             [self._rated_shipment(service_code=_MISSING)]

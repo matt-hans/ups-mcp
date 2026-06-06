@@ -359,7 +359,7 @@ def _normalize_rate_shipment(
 
 
 def _extract_total_charge(rated: Mapping[str, Any]) -> dict[str, str] | None:
-    if rated.get("NegotiatedRateCharges") is not None:
+    if "NegotiatedRateCharges" in rated:
         negotiated = _required_mapping(
             rated.get("NegotiatedRateCharges"),
             "NegotiatedRateCharges",
