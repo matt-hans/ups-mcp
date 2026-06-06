@@ -909,6 +909,23 @@ class ShipAgentHostedServerTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(self.fake_tool_manager.calls, [])
 
+    async def test_create_shipment_hosted_rejects_malformed_transaction_reference_before_ups(self) -> None:
+        body = make_complete_body()
+        body["ShipmentRequest"]["Request"]["TransactionReference"] = "bad"
+
+        result = await server.create_shipment(
+            request_body=body,
+            response_format="shipagent_v1",
+            idempotency_key="idem-valid",
+            trans_id="corr_bad_transaction_reference",
+        )
+
+        self._assert_safe_validation(
+            result,
+            correlation_id="corr_bad_transaction_reference",
+        )
+        self.assertEqual(self.fake_tool_manager.calls, [])
+
     async def test_create_shipment_hosted_rejects_existing_customer_context_control_chars_before_ups(self) -> None:
         bad_contexts = {
             "newline": "caller\ncontext",

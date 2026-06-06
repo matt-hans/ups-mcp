@@ -138,9 +138,14 @@ def _validate_hosted_customer_context(request_body: dict[str, Any]) -> None:
     )
     if not isinstance(request, dict):
         return
-    transaction_reference = request.get("TransactionReference", {})
-    if not isinstance(transaction_reference, dict):
+    if "TransactionReference" not in request:
         return
+    transaction_reference = request["TransactionReference"]
+    if not isinstance(transaction_reference, dict):
+        raise ToolError(json.dumps({
+            "code": "VALIDATION_ERROR",
+            "reason": "transaction_reference_must_be_object",
+        }))
     if "CustomerContext" not in transaction_reference:
         return
     customer_context = transaction_reference["CustomerContext"]

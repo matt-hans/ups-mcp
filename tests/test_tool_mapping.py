@@ -121,6 +121,20 @@ class ToolMappingTests(unittest.TestCase):
         context = sent_body["ShipmentRequest"]["Request"]["TransactionReference"]["CustomerContext"]
         self.assertEqual(context, "idem-empty")
 
+    def test_create_shipment_rejects_malformed_transaction_reference_with_idempotency_key(self) -> None:
+        body = {
+            "ShipmentRequest": {
+                "Request": {"TransactionReference": "bad"},
+                "Shipment": {},
+            }
+        }
+
+        with self.assertRaises(ToolError) as ctx:
+            self.manager.create_shipment(request_body=body, idempotency_key="idem-bad")
+
+        self.assertIn("TransactionReference must be a JSON object", str(ctx.exception))
+        self.assertEqual(self.fake_http_client.calls, [])
+
     def test_create_shipment_appends_idempotency_key_when_context_has_room(self) -> None:
         body = {
             "ShipmentRequest": {

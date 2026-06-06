@@ -75,6 +75,8 @@ def _with_idempotency_customer_context(
     shipment_request = result.setdefault("ShipmentRequest", {})
     request = shipment_request.setdefault("Request", {})
     transaction_reference = request.setdefault("TransactionReference", {})
+    if not isinstance(transaction_reference, dict):
+        raise ToolError("ShipmentRequest.Request.TransactionReference must be a JSON object")
     existing_value = transaction_reference.get("CustomerContext")
     existing_context = str(existing_value) if existing_value is not None else ""
 
