@@ -135,20 +135,30 @@ def to_normalization_error(correlation_id: str) -> dict[str, Any]:
     }
 
 
-def to_safe_error(exc: BaseException, correlation_id: str) -> dict[str, Any]:
+def to_safe_error(
+    exc: BaseException,
+    correlation_id: str,
+    *,
+    mutating: bool = False,
+) -> dict[str, Any]:
     category = _classify_exception(exc)
     if category == "normalization":
         return to_normalization_error(correlation_id)
 
     public_error = _CATEGORY_TO_PUBLIC_ERROR.get(category, _CATEGORY_TO_PUBLIC_ERROR["unknown"])
+    public_category = category if category in _CATEGORY_TO_PUBLIC_ERROR else "unknown"
+    retryable = public_error["retryable"]
+    if mutating and public_category in {"service_unavailable", "transport"}:
+        retryable = False
+
     return {
         "success": False,
         "error": {
-            "category": category if category in _CATEGORY_TO_PUBLIC_ERROR else "unknown",
+            "category": public_category,
             "code": public_error["code"],
             "message": public_error["message"],
             "correlation_id": correlation_id,
-            "retryable": public_error["retryable"],
+            "retryable": retryable,
         },
     }
 

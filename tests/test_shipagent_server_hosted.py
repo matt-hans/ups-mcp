@@ -237,6 +237,25 @@ class ShipAgentHostedServerTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(fake.calls, [])
 
+    async def test_invalid_response_format_mcp_call_tool_uses_custom_validator(self) -> None:
+        fake = self._install_fake_tool_manager(_FakeToolManager())
+
+        with self.assertRaises(ToolError) as ctx:
+            await server.mcp.call_tool(
+                "rate_shipment",
+                {
+                    "requestoption": "Rate",
+                    "request_body": make_complete_rate_body(),
+                    "response_format": "xml",
+                },
+            )
+
+        message = str(ctx.exception)
+        self.assertIn("INVALID_RESPONSE_FORMAT", message)
+        self.assertIn("shipagent_v1", message)
+        self.assertNotIn("literal_error", message)
+        self.assertEqual(fake.calls, [])
+
     async def test_hosted_rate_rejects_trans_id_control_chars_before_ups(self) -> None:
         result = await server.rate_shipment(
             requestoption="Rate",
@@ -1083,6 +1102,46 @@ class ShipAgentHostedServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(normalized["error"]["code"], "UPS_NORMALIZATION_ERROR")
         self.assertEqual(normalized["error"]["category"], "normalization")
         self.assertNotIn("idempotencyKey", normalized)
+
+    async def test_create_shipment_hosted_ambiguous_mutating_failures_are_not_retryable(self) -> None:
+        cases = [
+            (
+                "service_unavailable",
+                ToolError(json.dumps({"status_code": 503, "code": "503"})),
+                "UPS_SERVICE_UNAVAILABLE",
+                "service_unavailable",
+            ),
+            (
+                "request_error",
+                ToolError(json.dumps({"code": "REQUEST_ERROR", "message": "connection reset"})),
+                "UPS_TRANSPORT_ERROR",
+                "transport",
+            ),
+            (
+                "timeout",
+                ToolError(json.dumps({"status_code": 408, "code": "REQUEST_TIMEOUT"})),
+                "UPS_TRANSPORT_ERROR",
+                "transport",
+            ),
+        ]
+
+        for name, exc, code, category in cases:
+            with self.subTest(name=name):
+                self.fake_tool_manager.create_shipment_exception = exc
+
+                result = await server.create_shipment(
+                    request_body=make_complete_body(),
+                    response_format="shipagent_v1",
+                    idempotency_key=f"idem-{name}",
+                    trans_id=f"corr_create_{name}",
+                )
+
+                error = self._assert_closed_error(result)
+                self.assertEqual(error["code"], code)
+                self.assertEqual(error["category"], category)
+                self.assertEqual(error["correlation_id"], f"corr_create_{name}")
+                self.assertIs(error["retryable"], False)
+                self.assertNotIn("idempotencyKey", result)
 
 
 if __name__ == "__main__":

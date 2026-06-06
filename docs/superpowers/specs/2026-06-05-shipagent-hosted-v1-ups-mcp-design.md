@@ -7,8 +7,7 @@ Status: Superseded by implementation plan and README
 > is retained only as historical context. Do not use the response shapes,
 > capability list, label-format examples, elicitation flow, or error taxonomy in
 > this file as the hosted-v1 contract. The current contract is defined by
-> `docs/superpowers/plans/2026-06-05-shipagent-hosted-v1-ups-mcp.md`, the
-> implementation, tests, and the "ShipAgent Hosted-v1 Boundary" section in
+> the implementation, tests, and the "ShipAgent Hosted-v1 Boundary" section in
 > `README.md`. In particular, the final contract omits
 > `international_charges`, does not use hosted MCP elicitation, supports create
 > label formats `GIF`, `ZPL`, `EPL`, and `SPL`, and excludes domain-specific

@@ -22,7 +22,6 @@ from .shipagent_normalization import (
     to_safe_error,
 )
 
-ResponseFormat = Literal["raw", "shipagent_v1"]
 MAX_IDEMPOTENCY_KEY_LENGTH = 512
 MAX_CUSTOMER_CONTEXT_LENGTH = 512
 
@@ -62,13 +61,13 @@ def _require_tool_manager() -> tools.ToolManager:
     return tool_manager
 
 
-def _validate_response_format(response_format: str) -> ResponseFormat:
+def _validate_response_format(response_format: str) -> str:
     if response_format not in (RAW_RESPONSE_FORMAT, HOSTED_RESPONSE_FORMAT):
         raise ToolError(json.dumps({
             "code": "INVALID_RESPONSE_FORMAT",
             "allowed": [RAW_RESPONSE_FORMAT, HOSTED_RESPONSE_FORMAT],
         }))
-    return response_format  # type: ignore[return-value]
+    return response_format
 
 
 def _has_ascii_control(value: str) -> bool:
@@ -233,7 +232,7 @@ async def validate_address(
     zipExtended: str = "",
     trans_id: str = "",
     transaction_src: str = "ups-mcp",
-    response_format: ResponseFormat = "raw",
+    response_format: str = "raw",
 ) -> dict[str, Any]:
     """
     Checks addresses against the United States Postal Service database of valid addresses in the U.S. and Puerto Rico.
@@ -374,7 +373,7 @@ async def rate_shipment(
     additionalinfo: str = "",
     trans_id: str = "",
     transaction_src: str = "ups-mcp",
-    response_format: ResponseFormat = "raw",
+    response_format: str = "raw",
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """
@@ -565,7 +564,7 @@ async def create_shipment(
     additionaladdressvalidation: str = "",
     trans_id: str = "",
     transaction_src: str = "ups-mcp",
-    response_format: ResponseFormat = "raw",
+    response_format: str = "raw",
     idempotency_key: str = "",
     ctx: Context | None = None,
 ) -> dict[str, Any]:
@@ -706,7 +705,7 @@ async def create_shipment(
     except ShipAgentNormalizationError:
         return to_normalization_error(correlation_id)
     except ToolError as exc:
-        return to_safe_error(exc, correlation_id)
+        return to_safe_error(exc, correlation_id, mutating=True)
     except Exception:
         return _hosted_unknown_error(correlation_id)
 

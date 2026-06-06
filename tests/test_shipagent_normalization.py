@@ -140,6 +140,50 @@ class ShipAgentCapabilitiesAndErrorTests(unittest.TestCase):
                     },
                 )
 
+    def test_to_safe_error_disables_ambiguous_retry_for_mutating_operations(self) -> None:
+        cases = [
+            (
+                ToolError(json.dumps({"status_code": 503, "code": "503"})),
+                {
+                    "category": "service_unavailable",
+                    "code": "UPS_SERVICE_UNAVAILABLE",
+                    "message": "UPS service is temporarily unavailable.",
+                },
+            ),
+            (
+                ToolError(json.dumps({"code": "REQUEST_ERROR", "message": "connection reset"})),
+                {
+                    "category": "transport",
+                    "code": "UPS_TRANSPORT_ERROR",
+                    "message": "UPS transport request failed.",
+                },
+            ),
+            (
+                ToolError(json.dumps({"status_code": 408, "code": "REQUEST_TIMEOUT"})),
+                {
+                    "category": "transport",
+                    "code": "UPS_TRANSPORT_ERROR",
+                    "message": "UPS transport request failed.",
+                },
+            ),
+        ]
+
+        for exc, expected in cases:
+            with self.subTest(expected["code"]):
+                error = to_safe_error(exc, "corr_mutating", mutating=True)
+
+                self.assertEqual(
+                    error,
+                    {
+                        "success": False,
+                        "error": {
+                            **expected,
+                            "correlation_id": "corr_mutating",
+                            "retryable": False,
+                        },
+                    },
+                )
+
     def test_to_safe_error_keeps_long_numeric_ups_codes_as_business_codes(self) -> None:
         for code in ("120100", "250003"):
             with self.subTest(code):
