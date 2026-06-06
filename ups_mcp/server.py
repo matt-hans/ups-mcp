@@ -359,8 +359,17 @@ async def rate_shipment(
         return to_normalization_error(correlation_id)
     except ToolError as exc:
         return to_safe_error(exc, correlation_id)
-    except Exception as exc:
-        return to_safe_error(exc, correlation_id)
+    except Exception:
+        return {
+            "success": False,
+            "error": {
+                "category": "unknown",
+                "code": "UPS_UNKNOWN_ERROR",
+                "message": "UPS request failed unexpectedly.",
+                "correlation_id": correlation_id,
+                "retryable": False,
+            },
+        }
 
 
 async def _rate_shipment_execute(

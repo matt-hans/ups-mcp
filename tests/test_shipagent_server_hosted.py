@@ -304,9 +304,7 @@ class ShipAgentHostedServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_hosted_unexpected_exception_returns_unknown_safe_envelope(self) -> None:
         self._install_fake_tool_manager(
             _FakeToolManager(
-                rate_exception=RuntimeError(
-                    "Traceback in /Users/matthewhans/Desktop/Programming/ups.py"
-                )
+                rate_exception=RuntimeError("connection timeout")
             )
         )
 
@@ -332,6 +330,7 @@ class ShipAgentHostedServerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("/Users/", json.dumps(result))
         self.assertNotIn("Traceback", json.dumps(result))
+        self.assertNotIn("connection timeout", json.dumps(result))
 
     async def test_raw_mode_still_raises_tool_error(self) -> None:
         exc = ToolError(json.dumps({"status_code": 429, "message": "rate limit"}))
