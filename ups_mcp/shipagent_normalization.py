@@ -121,29 +121,34 @@ def _classify_exception(exc: BaseException) -> str:
     if isinstance(exc, ShipAgentNormalizationError):
         return "normalization"
 
+    exception_text = str(exc)
     payload = _parse_exception_payload(exc)
     status_code = _coerce_http_status(
         payload.get("status_code")
         or payload.get("statusCode")
         or payload.get("status")
     )
-    code = _clean_string(
-        payload.get("code")
-        or payload.get("error_code")
-        or payload.get("errorCode")
+    raw_code = _first_string(
+        payload.get("code"),
+        payload.get("error_code"),
+        payload.get("errorCode"),
     )
-    message = _clean_string(
-        payload.get("message")
-        or payload.get("error")
-        or payload.get("detail")
+    raw_message = _first_string(
+        payload.get("message"),
+        payload.get("error"),
+        payload.get("detail"),
     )
+    code = _clean_string(raw_code)
+    message = _clean_string(raw_message)
     code_upper = (code or "").upper()
     code_status = _coerce_http_status(code)
     if status_code is None:
         status_code = code_status
     if status_code is None:
-        status_code = _coerce_status_from_text(message)
-    text = f"{code or ''} {message or ''}".lower()
+        status_code = _coerce_status_from_text(raw_message)
+    if status_code is None and not payload:
+        status_code = _coerce_status_from_text(exception_text)
+    classifier_text = _classifier_text(raw_code, raw_message, exception_text if not payload else None)
 
     if status_code in {401, 403} or code_upper in {
         "AUTH_ERROR",
@@ -167,7 +172,9 @@ def _classify_exception(exc: BaseException) -> str:
         return "validation"
     if code_upper in _VALIDATION_ERROR_CODES:
         return "validation"
-    if "connection" in text or "timeout" in text or "network" in text:
+    if _looks_like_validation_text(classifier_text):
+        return "validation"
+    if "connection" in classifier_text or "timeout" in classifier_text or "network" in classifier_text:
         return "transport"
     if status_code is not None and status_code >= 500:
         return "service_unavailable"
@@ -211,6 +218,24 @@ def _coerce_status_from_text(value: str | None) -> int | None:
         return None
     match = re.search(r"\b([1-5][0-9]{2})\b", value)
     return int(match.group(1)) if match else None
+
+
+def _first_string(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _classifier_text(*values: str | None) -> str:
+    return " ".join(value for value in values if value).lower()
+
+
+def _looks_like_validation_text(value: str) -> bool:
+    return (
+        "request_body must be a json object" in value
+        or "invalid requestoption" in value
+    )
 
 
 def _as_mapping(value: Any) -> dict[str, Any]:

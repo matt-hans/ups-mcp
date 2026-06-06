@@ -198,6 +198,43 @@ class ShipAgentCapabilitiesAndErrorTests(unittest.TestCase):
                     },
                 )
 
+    def test_to_safe_error_prioritizes_status_text_with_ascii_controls(self) -> None:
+        cases = [
+            (
+                {"code": "REQUEST_ERROR", "message": "HTTPError: 401 Unauthorized\nbody omitted"},
+                {
+                    "category": "auth",
+                    "code": "UPS_AUTH_ERROR",
+                    "message": "UPS authentication failed.",
+                    "retryable": False,
+                },
+            ),
+            (
+                {"code": "REQUEST_ERROR", "message": "HTTPError:\t429 Too Many Requests"},
+                {
+                    "category": "rate_limit",
+                    "code": "UPS_RATE_LIMIT_ERROR",
+                    "message": "UPS rate limit exceeded.",
+                    "retryable": True,
+                },
+            ),
+        ]
+
+        for payload, expected in cases:
+            with self.subTest(payload["message"]):
+                error = to_safe_error(ToolError(json.dumps(payload)), "corr_control")
+
+                self.assertEqual(set(error), {"success", "error"})
+                self.assertIs(error["success"], False)
+                self.assertEqual(
+                    error["error"],
+                    {
+                        **expected,
+                        "correlation_id": "corr_control",
+                    },
+                )
+                self.assertNotIn("HTTPError", json.dumps(error))
+
     def test_to_safe_error_maps_direct_request_timeout_as_transport(self) -> None:
         error = to_safe_error(
             ToolError(json.dumps({"status_code": 408, "code": "REQUEST_TIMEOUT"})),
@@ -247,6 +284,31 @@ class ShipAgentCapabilitiesAndErrorTests(unittest.TestCase):
                         },
                     },
                 )
+
+    def test_to_safe_error_maps_plain_validation_tool_errors(self) -> None:
+        messages = [
+            "request_body must be a JSON object",
+            "Invalid requestoption 'bad'. Allowed values: Rate, Shop",
+        ]
+
+        for message in messages:
+            with self.subTest(message):
+                error = to_safe_error(ToolError(message), "corr_plain")
+
+                self.assertEqual(
+                    error,
+                    {
+                        "success": False,
+                        "error": {
+                            "category": "validation",
+                            "code": "UPS_VALIDATION_ERROR",
+                            "message": "UPS request validation failed.",
+                            "correlation_id": "corr_plain",
+                            "retryable": False,
+                        },
+                    },
+                )
+                self.assertNotIn(message, json.dumps(error))
 
     def test_to_safe_error_does_not_leak_raw_ups_details(self) -> None:
         exc = ToolError(
