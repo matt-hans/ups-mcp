@@ -1,6 +1,5 @@
 import json
 import unittest
-from importlib import metadata
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from mcp.server.fastmcp.exceptions import ToolError
@@ -124,10 +123,11 @@ class ShipAgentHostedServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_shipagent_capabilities_returns_metadata_without_tool_manager(self) -> None:
         server.tool_manager = None
 
-        result = await server.shipagent_capabilities()
+        with patch.object(server.metadata, "version", return_value="9.8.7-test"):
+            result = await server.shipagent_capabilities()
 
         self.assertEqual(result["contract_version"], "hosted-v1")
-        self.assertEqual(result["server_version"], metadata.version("ups-mcp"))
+        self.assertEqual(result["server_version"], "9.8.7-test")
         self.assertEqual(result["response_formats"], ["raw", "shipagent_v1"])
         self.assertIn("rate_quote", result["capabilities"])
 
