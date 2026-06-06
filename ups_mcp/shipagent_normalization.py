@@ -27,6 +27,25 @@ SUPPORTED_CREATE_LABEL_FORMATS = {"GIF", "ZPL", "EPL", "SPL"}
 
 _RATE_QUOTE_OPTIONS = {"rate", "ratetimeintransit"}
 _RATE_SHOP_OPTIONS = {"shop", "shoptimeintransit"}
+_ADDRESS_STATUS_INDICATORS = {
+    "ValidAddressIndicator": "valid",
+    "AmbiguousAddressIndicator": "ambiguous",
+    "NoCandidatesIndicator": "invalid",
+}
+_ADDRESS_FIELD_MAP = (
+    ("PoliticalDivision2", "city"),
+    ("PoliticalDivision1", "stateProvince"),
+    ("PostcodePrimaryLow", "postalCode"),
+    ("PostcodeExtendedLow", "postalCodeExtended"),
+    ("CountryCode", "countryCode"),
+)
+_SUBSTANTIVE_ADDRESS_FIELDS = {
+    "addressLines",
+    "city",
+    "stateProvince",
+    "postalCode",
+    "postalCodeExtended",
+}
 
 _CATEGORY_TO_PUBLIC_ERROR = {
     "auth": {
@@ -169,6 +188,134 @@ def normalize_rate_result(raw: Mapping[str, Any], requestoption: str, correlatio
         "correlationId": normalized_correlation_id,
         "ratedShipments": normalized_shipments,
     }
+
+
+def normalize_address_result(raw: Mapping[str, Any], correlation_id: str) -> dict[str, Any]:
+    normalized_correlation_id = _required_hosted_string(correlation_id, "correlationId")
+    xav_response = _required_mapping(
+        _required_mapping(raw, "XAVResponse envelope").get("XAVResponse"),
+        "XAVResponse",
+    )
+    status = _address_status(xav_response)
+    candidate_value = xav_response.get("Candidate")
+
+    if status in {"invalid", "unknown"}:
+        if "Candidate" in xav_response and _address_candidate_value_has_data(candidate_value):
+            raise ShipAgentNormalizationError(
+                "Invalid and unknown address responses must not include candidates."
+            )
+        return {
+            "success": True,
+            "correlationId": normalized_correlation_id,
+            "status": status,
+            "candidates": [],
+        }
+
+    candidates = _normalize_address_candidates(candidate_value)
+    if not candidates:
+        raise ShipAgentNormalizationError(
+            "Valid and ambiguous address responses require at least one candidate."
+        )
+    return {
+        "success": True,
+        "correlationId": normalized_correlation_id,
+        "status": status,
+        "candidates": candidates,
+    }
+
+
+def _address_status(xav_response: Mapping[str, Any]) -> str:
+    statuses = [
+        status
+        for indicator, status in _ADDRESS_STATUS_INDICATORS.items()
+        if indicator in xav_response
+    ]
+    if len(statuses) > 1:
+        raise ShipAgentNormalizationError("XAVResponse contains conflicting status indicators.")
+    return statuses[0] if statuses else "unknown"
+
+
+def _normalize_address_candidates(candidate_value: Any) -> list[dict[str, Any]]:
+    if candidate_value is None:
+        return []
+    if isinstance(candidate_value, Mapping):
+        candidate_items = [candidate_value]
+    elif isinstance(candidate_value, list):
+        candidate_items = candidate_value
+    else:
+        raise ShipAgentNormalizationError("XAVResponse.Candidate must be an object or list.")
+
+    candidates: list[dict[str, Any]] = []
+    for candidate_item in candidate_items:
+        candidate = _required_mapping(candidate_item, "XAVResponse.Candidate entry")
+        normalized = _normalize_address_candidate(candidate)
+        if normalized is not None:
+            candidates.append(normalized)
+    return candidates
+
+
+def _normalize_address_candidate(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
+    if "AddressKeyFormat" in candidate:
+        address = _required_mapping(
+            candidate.get("AddressKeyFormat"),
+            "XAVResponse.Candidate.AddressKeyFormat",
+        )
+    else:
+        address = candidate
+
+    normalized: dict[str, Any] = {}
+    address_lines = _normalize_address_lines(address.get("AddressLine"))
+    if address_lines:
+        normalized["addressLines"] = address_lines
+    for ups_field, hosted_field in _ADDRESS_FIELD_MAP:
+        value = _optional_hosted_string(
+            address.get(ups_field),
+            f"XAVResponse.Candidate.{ups_field}",
+        )
+        if value is not None:
+            normalized[hosted_field] = value
+
+    if not _has_substantive_address_candidate_field(normalized):
+        return None
+    return normalized
+
+
+def _has_substantive_address_candidate_field(candidate: Mapping[str, Any]) -> bool:
+    return any(field in candidate for field in _SUBSTANTIVE_ADDRESS_FIELDS)
+
+
+def _normalize_address_lines(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        line = _optional_hosted_string(value, "XAVResponse.Candidate.AddressLine")
+        return [line] if line is not None else []
+    if not isinstance(value, list):
+        raise ShipAgentNormalizationError(
+            "XAVResponse.Candidate.AddressLine must be a string or list of strings."
+        )
+
+    lines: list[str] = []
+    for index, item in enumerate(value):
+        line = _optional_hosted_string(
+            item,
+            f"XAVResponse.Candidate.AddressLine[{index}]",
+        )
+        if line is not None:
+            lines.append(line)
+    return lines
+
+
+def _address_candidate_value_has_data(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, Mapping):
+        return bool(value)
+    if isinstance(value, list):
+        return any(_address_candidate_value_has_data(item) for item in value)
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
 
 
 def _classify_exception(exc: BaseException) -> str:

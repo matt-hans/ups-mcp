@@ -6,6 +6,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from ups_mcp.shipagent_normalization import (
     ShipAgentNormalizationError,
     build_shipagent_capabilities,
+    normalize_address_result,
     normalize_rate_result,
     to_normalization_error,
     to_safe_error,
@@ -763,6 +764,236 @@ class ShipAgentRateNormalizationTests(unittest.TestCase):
             with self.subTest(raw=raw, requestoption=requestoption, correlation_id=correlation_id):
                 with self.assertRaises(ShipAgentNormalizationError):
                     normalize_rate_result(raw, requestoption, correlation_id)
+
+
+class ShipAgentAddressNormalizationTests(unittest.TestCase):
+    def _raw_xav_response(self, xav_response: object) -> dict[str, object]:
+        return {"XAVResponse": xav_response}
+
+    def _address_candidate(self, **fields: object) -> dict[str, object]:
+        return {"AddressKeyFormat": fields}
+
+    def test_valid_status_returns_object_candidate_safe_fields(self) -> None:
+        raw = self._raw_xav_response(
+            {
+                "ValidAddressIndicator": "",
+                "Candidate": {
+                    "AddressKeyFormat": {
+                        "AddressLine": [" 123 MAIN ST "],
+                        "PoliticalDivision2": " ATLANTA ",
+                        "PoliticalDivision1": " GA ",
+                        "PostcodePrimaryLow": " 30301 ",
+                        "PostcodeExtendedLow": " 1234 ",
+                        "CountryCode": " US ",
+                    },
+                    "AddressClassification": {"Code": "1"},
+                    "ConsigneeName": "Warehouse",
+                    "Metadata": {"score": 1},
+                },
+            }
+        )
+
+        result = normalize_address_result(raw, "corr_address_valid")
+
+        self.assertEqual(
+            result,
+            {
+                "success": True,
+                "correlationId": "corr_address_valid",
+                "status": "valid",
+                "candidates": [
+                    {
+                        "addressLines": ["123 MAIN ST"],
+                        "city": "ATLANTA",
+                        "stateProvince": "GA",
+                        "postalCode": "30301",
+                        "postalCodeExtended": "1234",
+                        "countryCode": "US",
+                    }
+                ],
+            },
+        )
+        serialized = json.dumps(result)
+        self.assertNotIn("AddressClassification", serialized)
+        self.assertNotIn("ConsigneeName", serialized)
+        self.assertNotIn("contractVersion", result)
+        self.assertNotIn("contract_version", result)
+        self.assertNotIn("correlation_id", result)
+
+    def test_ambiguous_status_returns_list_candidates_and_drops_non_substantive_candidates(self) -> None:
+        raw = self._raw_xav_response(
+            {
+                "AmbiguousAddressIndicator": "",
+                "Candidate": [
+                    self._address_candidate(
+                        AddressLine=" 456 OAK AVE ",
+                        PoliticalDivision2=" SAVANNAH ",
+                        PoliticalDivision1=" GA ",
+                        PostcodePrimaryLow=" 31401 ",
+                        CountryCode=" US ",
+                    ),
+                    {
+                        "AddressLine": [" ", " APT 2 "],
+                        "CountryCode": " US ",
+                        "AddressClassification": {"Code": "2"},
+                    },
+                    {"AddressClassification": {"Code": "1"}, "ConsigneeName": "Only Metadata"},
+                    self._address_candidate(CountryCode=" US "),
+                ],
+            }
+        )
+
+        result = normalize_address_result(raw, "corr_address_ambiguous")
+
+        self.assertEqual(
+            result,
+            {
+                "success": True,
+                "correlationId": "corr_address_ambiguous",
+                "status": "ambiguous",
+                "candidates": [
+                    {
+                        "addressLines": ["456 OAK AVE"],
+                        "city": "SAVANNAH",
+                        "stateProvince": "GA",
+                        "postalCode": "31401",
+                        "countryCode": "US",
+                    },
+                    {
+                        "addressLines": ["APT 2"],
+                        "countryCode": "US",
+                    },
+                ],
+            },
+        )
+        for candidate in result["candidates"]:
+            self.assertNotEqual(candidate, {})
+
+    def test_ascii_control_characters_in_candidate_fields_reject(self) -> None:
+        cases = [
+            self._address_candidate(AddressLine="123\nMAIN ST"),
+            self._address_candidate(AddressLine=["123 MAIN ST", "APT\t2"]),
+            self._address_candidate(PoliticalDivision2="ATLANTA\r"),
+            self._address_candidate(PoliticalDivision1="G\x7fA"),
+            self._address_candidate(PostcodePrimaryLow="30301\n"),
+            self._address_candidate(PostcodeExtendedLow="12\t34"),
+            self._address_candidate(CountryCode="U\rS"),
+        ]
+
+        for candidate in cases:
+            with self.subTest(candidate=candidate):
+                raw = self._raw_xav_response(
+                    {"ValidAddressIndicator": "", "Candidate": candidate}
+                )
+
+                with self.assertRaises(ShipAgentNormalizationError):
+                    normalize_address_result(raw, "corr_address_control")
+
+    def test_non_string_candidate_fields_reject(self) -> None:
+        cases = [
+            self._address_candidate(AddressLine=123),
+            self._address_candidate(AddressLine=["123 MAIN ST", 2]),
+            self._address_candidate(PoliticalDivision2=True),
+            self._address_candidate(PoliticalDivision1={"value": "GA"}),
+            self._address_candidate(PostcodePrimaryLow=30301),
+            self._address_candidate(PostcodeExtendedLow=["1234"]),
+            self._address_candidate(CountryCode=False),
+        ]
+
+        for candidate in cases:
+            with self.subTest(candidate=candidate):
+                raw = self._raw_xav_response(
+                    {"ValidAddressIndicator": "", "Candidate": candidate}
+                )
+
+                with self.assertRaises(ShipAgentNormalizationError):
+                    normalize_address_result(raw, "corr_address_type")
+
+    def test_invalid_and_unknown_statuses_return_empty_candidates(self) -> None:
+        cases = [
+            (
+                self._raw_xav_response({"NoCandidatesIndicator": ""}),
+                "corr_address_invalid",
+                "invalid",
+            ),
+            (self._raw_xav_response({}), "corr_address_unknown", "unknown"),
+        ]
+
+        for raw, correlation_id, status in cases:
+            with self.subTest(status=status):
+                result = normalize_address_result(raw, correlation_id)
+
+                self.assertEqual(
+                    result,
+                    {
+                        "success": True,
+                        "correlationId": correlation_id,
+                        "status": status,
+                        "candidates": [],
+                    },
+                )
+
+    def test_valid_and_ambiguous_require_substantive_hosted_candidate(self) -> None:
+        cases = [
+            {"ValidAddressIndicator": ""},
+            {"ValidAddressIndicator": "", "Candidate": {"AddressClassification": {"Code": "1"}}},
+            {"ValidAddressIndicator": "", "Candidate": self._address_candidate(CountryCode="US")},
+            {"AmbiguousAddressIndicator": "", "Candidate": []},
+            {
+                "AmbiguousAddressIndicator": "",
+                "Candidate": [
+                    {"AddressClassification": {"Code": "1"}},
+                    self._address_candidate(CountryCode="US"),
+                ],
+            },
+        ]
+
+        for xav_response in cases:
+            with self.subTest(xav_response=xav_response):
+                raw = self._raw_xav_response(xav_response)
+
+                with self.assertRaises(ShipAgentNormalizationError):
+                    normalize_address_result(raw, "corr_address_empty")
+
+    def test_invalid_and_unknown_reject_candidate_data_even_when_not_substantive(self) -> None:
+        cases = [
+            {"NoCandidatesIndicator": "", "Candidate": {"AddressClassification": {"Code": "1"}}},
+            {"NoCandidatesIndicator": "", "Candidate": self._address_candidate(CountryCode="US")},
+            {"Candidate": {"AddressClassification": {"Code": "1"}}},
+            {"Candidate": self._address_candidate(CountryCode="US")},
+        ]
+
+        for xav_response in cases:
+            with self.subTest(xav_response=xav_response):
+                raw = self._raw_xav_response(xav_response)
+
+                with self.assertRaises(ShipAgentNormalizationError):
+                    normalize_address_result(raw, "corr_address_reject_candidate")
+
+    def test_conflicting_status_indicators_raise(self) -> None:
+        raw = self._raw_xav_response(
+            {
+                "ValidAddressIndicator": "",
+                "AmbiguousAddressIndicator": "",
+                "Candidate": self._address_candidate(AddressLine="123 MAIN ST"),
+            }
+        )
+
+        with self.assertRaises(ShipAgentNormalizationError):
+            normalize_address_result(raw, "corr_address_conflict")
+
+    def test_missing_or_non_object_xav_response_raises(self) -> None:
+        cases = [
+            {},
+            self._raw_xav_response(None),
+            self._raw_xav_response([]),
+            self._raw_xav_response("not-an-object"),
+        ]
+
+        for raw in cases:
+            with self.subTest(raw=raw):
+                with self.assertRaises(ShipAgentNormalizationError):
+                    normalize_address_result(raw, "corr_address_missing")
 
 
 if __name__ == "__main__":
