@@ -159,25 +159,25 @@ def _classify_exception(exc: BaseException) -> str:
         return "auth"
     if status_code == 429 or code_upper in {"RATE_LIMIT", "RATE_LIMITED", "TOO_MANY_REQUESTS"}:
         return "rate_limit"
-    if status_code in {502, 503, 504}:
+    if status_code == 408:
+        return "transport"
+    if status_code is not None and 400 <= status_code < 500:
+        return "validation"
+    if status_code is not None and status_code >= 500:
         return "service_unavailable"
-    if status_code == 408 or code_upper in {
+    if code_upper in _VALIDATION_ERROR_CODES:
+        return "validation"
+    if _looks_like_validation_text(classifier_text):
+        return "validation"
+    if code_upper in {
         "REQUEST_ERROR",
         "REQUEST_TIMEOUT",
         "TRANSPORT_ERROR",
         "NETWORK_ERROR",
     }:
         return "transport"
-    if status_code is not None and 400 <= status_code < 500:
-        return "validation"
-    if code_upper in _VALIDATION_ERROR_CODES:
-        return "validation"
-    if _looks_like_validation_text(classifier_text):
-        return "validation"
     if "connection" in classifier_text or "timeout" in classifier_text or "network" in classifier_text:
         return "transport"
-    if status_code is not None and status_code >= 500:
-        return "service_unavailable"
     return "unknown"
 
 
@@ -235,6 +235,10 @@ def _looks_like_validation_text(value: str) -> bool:
     return (
         "request_body must be a json object" in value
         or "invalid requestoption" in value
+        or "must be a string or a list of strings" in value
+        or "is required via argument" in value
+        or "missing required key" in value
+        or "must be before" in value
     )
 
 

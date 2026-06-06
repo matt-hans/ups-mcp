@@ -182,6 +182,33 @@ class ShipAgentCapabilitiesAndErrorTests(unittest.TestCase):
                     "retryable": True,
                 },
             ),
+            (
+                {"code": "REQUEST_ERROR", "message": "400 Bad Request"},
+                {
+                    "category": "validation",
+                    "code": "UPS_VALIDATION_ERROR",
+                    "message": "UPS request validation failed.",
+                    "retryable": False,
+                },
+            ),
+            (
+                {"code": "REQUEST_ERROR", "message": "408 Request Timeout"},
+                {
+                    "category": "transport",
+                    "code": "UPS_TRANSPORT_ERROR",
+                    "message": "UPS transport request failed.",
+                    "retryable": True,
+                },
+            ),
+            (
+                {"code": "REQUEST_ERROR", "message": "500 Internal Server Error"},
+                {
+                    "category": "service_unavailable",
+                    "code": "UPS_SERVICE_UNAVAILABLE",
+                    "message": "UPS service is temporarily unavailable.",
+                    "retryable": True,
+                },
+            ),
         ]
 
         for payload, expected in cases:
@@ -289,6 +316,10 @@ class ShipAgentCapabilitiesAndErrorTests(unittest.TestCase):
         messages = [
             "request_body must be a JSON object",
             "Invalid requestoption 'bad'. Allowed values: Rate, Shop",
+            "trackingnumber must be a string or a list of strings",
+            "AccountNumber is required via argument or UPS_ACCOUNT_NUMBER env var",
+            "missing required key ShipmentRequest",
+            "pickup date must be before close time",
         ]
 
         for message in messages:
