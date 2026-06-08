@@ -224,3 +224,17 @@ When enhancing elicitation, consider that data from prior tool calls can pre-fil
 - Hosted boundary tests cover pure normalization and FastMCP server behavior in `test_shipagent_normalization.py` and `test_shipagent_server_hosted.py`, including schema enum exposure, custom invalid `response_format` validation, safe error envelopes, unsupported address countries, create-shipment idempotency metadata, and no retryable guidance for ambiguous mutating failures.
 - CIE quirks: address validation only works for certain states (NY works, GA doesn't); test tracking number: `1Z12345E0205271688`
 - `live_test.py` chains all 18 tools with real CIE IDs (document_id → tracking_number → PRN) for full integration coverage
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues (`matt-hans/ups-mcp`). Skills use the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default label vocabulary: needs-triage, needs-info, ready-for-agent, ready-for-human, wontfix. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context repo — one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
