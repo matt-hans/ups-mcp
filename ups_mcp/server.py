@@ -50,7 +50,6 @@ class UPSFastMCP(FastMCP):
 # Initialize FastMCP server
 mcp = UPSFastMCP("ups-mcp")
 
-load_dotenv()
 base_url = constants.CIE_URL
 client_id: str | None = None
 client_secret: str | None = None
@@ -1006,8 +1005,16 @@ def _validate_runtime_configuration() -> None:
         raise RuntimeError("Missing required env vars: CLIENT_ID and CLIENT_SECRET must be set before starting the server.")
 
 
+def _load_dotenv_for_cli() -> None:
+    # Delegated hosts own the whole environment; a stray .env must never inject
+    # CLIENT_SECRET (or anything else) into it. Importing this module never reads .env.
+    if os.getenv("UPS_AUTH_MODE") != constants.AUTH_MODE_DELEGATED:
+        load_dotenv()
+
+
 def main():
     print("Starting UPS MCP Server...")
+    _load_dotenv_for_cli()
     _refresh_runtime_configuration()
     try:
         _validate_runtime_configuration()

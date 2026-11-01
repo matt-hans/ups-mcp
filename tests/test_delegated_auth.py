@@ -1,3 +1,4 @@
+import ast
 import contextlib
 import io
 import json
@@ -9,6 +10,7 @@ import traceback
 import unittest
 from unittest import mock
 
+import dotenv
 import requests
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
@@ -666,6 +668,50 @@ class DelegatedServerConfigTests(unittest.TestCase):
             {"UPS_AUTH_MODE": "authorization_code", "CLIENT_ID": "id", "CLIENT_SECRET": "secret"},
             "Unknown UPS_AUTH_MODE",
         )
+
+    def test_importing_server_does_not_read_dotenv(self) -> None:
+        with open(server.__file__) as handle:
+            tree = ast.parse(handle.read())
+        module_level_calls = [
+            node.value.func.id
+            for node in tree.body
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+        ]
+        self.assertNotIn("load_dotenv", module_level_calls)
+
+    def test_delegated_startup_ignores_dotenv_with_client_secret(self) -> None:
+        tmpdir = tempfile.mkdtemp(prefix="ups-mcp-dotenv-")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        dotenv_path = os.path.join(tmpdir, ".env")
+        with open(dotenv_path, "w") as handle:
+            handle.write("CLIENT_SECRET=leaked-app-secret\nUPS_MCP_DOTENV_SENTINEL=1\n")
+        real_load = mock.Mock(side_effect=lambda *a, **k: dotenv.load_dotenv(dotenv_path))
+        env = {
+            "UPS_AUTH_MODE": "delegated",
+            "UPS_ACCESS_TOKEN_FILE": "/nonexistent/ups-mcp/token.json",
+            "CLIENT_ID": "app-client-id",
+        }
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch("ups_mcp.server.load_dotenv", real_load), \
+                mock.patch("ups_mcp.server.mcp.run") as mock_run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            server.main()
+            self.assertNotIn("CLIENT_SECRET", os.environ)
+            self.assertNotIn("UPS_MCP_DOTENV_SENTINEL", os.environ)
+
+        real_load.assert_not_called()
+        mock_run.assert_called_once()
+
+    def test_client_credentials_startup_still_loads_dotenv(self) -> None:
+        env = {"CLIENT_ID": "id", "CLIENT_SECRET": "secret"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch("ups_mcp.server.load_dotenv") as mock_load, \
+                mock.patch("ups_mcp.server.mcp.run"), \
+                mock.patch("ups_mcp.server.tools.ToolManager"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            server.main()
+        mock_load.assert_called_once_with()
 
     def test_delegated_starts_without_token_file_and_never_builds_oauth(self) -> None:
         env = {

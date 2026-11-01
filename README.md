@@ -29,10 +29,10 @@ Users can integrate with the MCP server to allow AI agents to facilitate trackin
 
 Startup fails with a message on stderr and exit code 1 when:
 - `UPS_ACCESS_TOKEN_FILE` is unset or not an absolute path.
-- `CLIENT_SECRET` is present in the environment, even empty and including a value loaded from a `.env` file in the working directory: `delegated mode must not receive CLIENT_SECRET`.
+- `CLIENT_SECRET` is present in the process environment, even empty: `delegated mode must not receive CLIENT_SECRET`.
 - `UPS_AUTH_MODE` is set to any value other than `client_credentials` or `delegated`, including an empty value. Only an unset variable selects the default.
 
-The token file does not need to exist at startup. `ENVIRONMENT` and `UPS_ACCOUNT_NUMBER` keep their usual meaning. `CLIENT_ID` may be set but is not used.
+In delegated mode the server never reads a `.env` file, so all configuration must come from the process environment and set `UPS_AUTH_MODE=delegated` there. In client_credentials mode a `.env` in the working directory is loaded when the server starts (not on import), as before. The token file does not need to exist at startup. `ENVIRONMENT` and `UPS_ACCOUNT_NUMBER` keep their usual meaning. `CLIENT_ID` may be set but is not used.
 
 **Token file contract.** UTF-8 JSON, written atomically by the host (write a temp file, then rename it over the target):
 
