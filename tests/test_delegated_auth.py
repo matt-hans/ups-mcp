@@ -735,6 +735,22 @@ class DelegatedServerConfigTests(unittest.TestCase):
         real_load.assert_not_called()
         mock_run.assert_called_once()
 
+    def test_dotenv_switching_to_delegated_with_secret_fails_closed(self) -> None:
+        # Mode unset in the initial env: .env is loaded, may select delegated mode,
+        # and its CLIENT_SECRET is then refused rather than silently used.
+        tmpdir = tempfile.mkdtemp(prefix="ups-mcp-dotenv-")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        dotenv_path = os.path.join(tmpdir, ".env")
+        with open(dotenv_path, "w") as handle:
+            handle.write(
+                "UPS_AUTH_MODE=delegated\nUPS_ACCESS_TOKEN_FILE=/run/ups/token.json\n"
+                "CLIENT_SECRET=stale-app-secret\n"
+            )
+        load_from_tmp = mock.Mock(side_effect=lambda *a, **k: dotenv.load_dotenv(dotenv_path))
+        with mock.patch("ups_mcp.server.load_dotenv", load_from_tmp):
+            self.assert_startup_rejected({}, "delegated mode must not receive CLIENT_SECRET")
+        load_from_tmp.assert_called_once_with()
+
     def test_client_credentials_startup_still_loads_dotenv(self) -> None:
         env = {"CLIENT_ID": "id", "CLIENT_SECRET": "secret"}
         with mock.patch.dict(os.environ, env, clear=True), \
