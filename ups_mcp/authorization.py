@@ -1,7 +1,17 @@
+import json
+import math
+import os
 import time
 import threading
+from typing import Protocol
 
 import requests
+from mcp.server.fastmcp.exceptions import ToolError
+
+
+class TokenProvider(Protocol):
+    def get_access_token(self) -> str: ...
+
 
 class OAuthManager:
     def __init__(self, token_url: str, client_id: str | None, client_secret: str | None, timeout: float = 30.0):
@@ -39,3 +49,96 @@ class OAuthManager:
 
     def _token_is_fresh(self) -> bool:
         return bool(self.access_token and time.time() < self.token_expiry - 60)
+
+
+DELEGATED_TOKEN_EXPIRY_SKEW_SECONDS = 30
+
+
+class DelegatedTokenFile:
+    """Reads a caller-managed UPS access token from a JSON file on every call.
+
+    The file holds {"access_token": "<opaque>", "expires_at": <epoch seconds>}
+    and is rotated atomically by its owner. Failures raise ToolError without
+    contacting UPS; messages name only the file's basename, never its contents.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._label = os.path.basename(path)
+
+    def __repr__(self) -> str:
+        return f"DelegatedTokenFile({self._label!r})"
+
+    def get_access_token(self) -> str:
+        try:
+            fd = os.open(self.path, os.O_RDONLY)
+        except FileNotFoundError:
+            raise _delegated_error(
+                "UPS_DELEGATED_TOKEN_UNAVAILABLE",
+                f"Delegated UPS access token file '{self._label}' does not exist.",
+            ) from None
+        except OSError:
+            raise _delegated_error(
+                "UPS_DELEGATED_TOKEN_UNAVAILABLE",
+                f"Delegated UPS access token file '{self._label}' could not be opened.",
+            ) from None
+
+        with os.fdopen(fd, "rb") as handle:
+            # fstat the opened descriptor so the checks apply to the bytes we read.
+            stat_result = os.fstat(handle.fileno())
+            if stat_result.st_mode & 0o077 or stat_result.st_uid != os.getuid():
+                raise _delegated_error(
+                    "UPS_DELEGATED_TOKEN_INSECURE",
+                    f"Delegated UPS access token file '{self._label}' must be owned by the "
+                    "server user and must not be accessible by group or others (use mode 0600).",
+                )
+            try:
+                raw = handle.read()
+            except OSError:
+                raise _delegated_error(
+                    "UPS_DELEGATED_TOKEN_UNAVAILABLE",
+                    f"Delegated UPS access token file '{self._label}' could not be read.",
+                ) from None
+
+        access_token, expires_at = self._parse(raw)
+        if expires_at <= time.time() + DELEGATED_TOKEN_EXPIRY_SKEW_SECONDS:
+            raise _delegated_error(
+                "UPS_DELEGATED_TOKEN_EXPIRED",
+                f"Delegated UPS access token in '{self._label}' is expired or about to expire.",
+            )
+        return access_token
+
+    def _parse(self, raw: bytes) -> tuple[str, float]:
+        invalid = _delegated_error(
+            "UPS_DELEGATED_TOKEN_INVALID",
+            f"Delegated UPS access token file '{self._label}' must be UTF-8 JSON with a "
+            "non-empty string 'access_token' and a numeric 'expires_at'.",
+        )
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise invalid from None
+        if not isinstance(data, dict):
+            raise invalid
+
+        access_token = data.get("access_token")
+        if (
+            not isinstance(access_token, str)
+            or not access_token
+            or any(ch.isspace() or not ch.isprintable() for ch in access_token)
+        ):
+            raise invalid
+
+        expires_at = data.get("expires_at")
+        # bool is an int subclass; JSON true/false is not a timestamp.
+        if (
+            isinstance(expires_at, bool)
+            or not isinstance(expires_at, (int, float))
+            or not math.isfinite(expires_at)
+        ):
+            raise invalid
+        return access_token, float(expires_at)
+
+
+def _delegated_error(code: str, message: str) -> ToolError:
+    return ToolError(json.dumps({"code": code, "message": message}))

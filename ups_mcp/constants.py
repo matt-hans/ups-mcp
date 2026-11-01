@@ -1,6 +1,12 @@
 CIE_URL = "https://wwwcie.ups.com"
 PRODUCTION_URL = "https://onlinetools.ups.com"
 
+# UPS_AUTH_MODE values. client_credentials uses CLIENT_ID/CLIENT_SECRET; delegated
+# reads a caller-managed customer access token from UPS_ACCESS_TOKEN_FILE.
+AUTH_MODE_CLIENT_CREDENTIALS = "client_credentials"
+AUTH_MODE_DELEGATED = "delegated"
+AUTH_MODES = (AUTH_MODE_CLIENT_CREDENTIALS, AUTH_MODE_DELEGATED)
+
 LOCATOR_OPTIONS = {
     "access_point": "64",
     "retail": "32",

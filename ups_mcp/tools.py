@@ -6,7 +6,7 @@ from typing import Any
 from mcp.server.fastmcp.exceptions import ToolError
 
 from . import constants
-from .authorization import OAuthManager
+from .authorization import OAuthManager, TokenProvider
 from .http_client import UPSHTTPClient
 from .openapi_registry import OpenAPIRegistry, OperationSpec, load_default_registry
 
@@ -70,16 +70,21 @@ class ToolManager:
         client_secret: str | None,
         account_number: str | None = None,
         registry: OpenAPIRegistry | None = None,
+        token_provider: TokenProvider | None = None,
     ) -> None:
         self.base_url = base_url
         self.account_number = account_number
-        self.token_manager = OAuthManager(
-            token_url=f"{self.base_url}/security/v1/oauth/token",
-            client_id=client_id,
-            client_secret=client_secret,
-        )
+        # An explicit provider (delegated mode) replaces client_credentials entirely;
+        # OAuthManager is only built when no provider is supplied.
+        if token_provider is None:
+            token_provider = OAuthManager(
+                token_url=f"{self.base_url}/security/v1/oauth/token",
+                client_id=client_id,
+                client_secret=client_secret,
+            )
+        self.token_manager = token_provider
         self.registry = registry or load_default_registry()
-        self.http_client = UPSHTTPClient(base_url=self.base_url, oauth_manager=self.token_manager)
+        self.http_client = UPSHTTPClient(base_url=self.base_url, token_provider=self.token_manager)
 
     def _resolve_account(self, explicit: str | None = None) -> str | None:
         """Resolve account number: explicit arg > self.account_number > None."""

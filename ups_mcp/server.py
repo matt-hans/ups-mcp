@@ -7,6 +7,7 @@ import os
 import sys
 from . import tools
 from . import constants
+from .authorization import DelegatedTokenFile
 from .openapi_registry import OpenAPISpecLoadError
 
 # Initialize FastMCP server
@@ -16,21 +17,40 @@ load_dotenv()
 base_url = constants.CIE_URL
 client_id: str | None = None
 client_secret: str | None = None
+auth_mode: str = constants.AUTH_MODE_CLIENT_CREDENTIALS
+access_token_file: str | None = None
 tool_manager: tools.ToolManager | None = None
 
 
+class RuntimeConfigurationError(RuntimeError):
+    """Startup configuration is invalid; main() reports it on stderr and exits 1."""
+
+
 def _refresh_runtime_configuration() -> None:
-    global base_url, client_id, client_secret
+    global base_url, client_id, client_secret, auth_mode, access_token_file
     if os.getenv("ENVIRONMENT") == "production":
         base_url = constants.PRODUCTION_URL
     else:
         base_url = constants.CIE_URL
     client_id = os.getenv("CLIENT_ID")
     client_secret = os.getenv("CLIENT_SECRET")
+    auth_mode = os.getenv("UPS_AUTH_MODE") or constants.AUTH_MODE_CLIENT_CREDENTIALS
+    access_token_file = os.getenv("UPS_ACCESS_TOKEN_FILE") or None
 
 
 def _initialize_tool_manager() -> None:
     global tool_manager
+    if auth_mode == constants.AUTH_MODE_DELEGATED:
+        # Never pass client credentials here: delegated calls must bill the
+        # customer's identity, so there is no client_credentials fallback.
+        tool_manager = tools.ToolManager(
+            base_url=base_url,
+            client_id=None,
+            client_secret=None,
+            account_number=os.getenv("UPS_ACCOUNT_NUMBER"),
+            token_provider=DelegatedTokenFile(access_token_file),
+        )
+        return
     tool_manager = tools.ToolManager(
         base_url=base_url,
         client_id=client_id,
@@ -929,6 +949,20 @@ async def get_service_center_facilities(
     )
 
 def _validate_runtime_configuration() -> None:
+    if auth_mode == constants.AUTH_MODE_DELEGATED:
+        if not access_token_file or not os.path.isabs(access_token_file):
+            raise RuntimeConfigurationError(
+                "UPS_ACCESS_TOKEN_FILE must be set to an absolute path when UPS_AUTH_MODE=delegated."
+            )
+        if client_secret is not None:
+            raise RuntimeConfigurationError("delegated mode must not receive CLIENT_SECRET")
+        # The token file may not exist yet; it is checked on every UPS call.
+        return
+    if auth_mode != constants.AUTH_MODE_CLIENT_CREDENTIALS:
+        allowed = ", ".join(constants.AUTH_MODES)
+        raise RuntimeConfigurationError(
+            f"Unknown UPS_AUTH_MODE {auth_mode!r}. Allowed values: {allowed}."
+        )
     if not client_id or not client_secret:
         raise RuntimeError("Missing required env vars: CLIENT_ID and CLIENT_SECRET must be set before starting the server.")
 
@@ -936,7 +970,11 @@ def _validate_runtime_configuration() -> None:
 def main():
     print("Starting UPS MCP Server...")
     _refresh_runtime_configuration()
-    _validate_runtime_configuration()
+    try:
+        _validate_runtime_configuration()
+    except RuntimeConfigurationError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1) from exc
     try:
         _initialize_tool_manager()
     except OpenAPISpecLoadError as exc:

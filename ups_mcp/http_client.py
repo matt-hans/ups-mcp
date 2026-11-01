@@ -9,15 +9,16 @@ from urllib.parse import quote
 import requests
 from mcp.server.fastmcp.exceptions import ToolError
 
-from .authorization import OAuthManager
+from .authorization import DelegatedTokenFile, TokenProvider
 from .openapi_registry import OperationSpec
 
 
 class UPSHTTPClient:
-    def __init__(self, base_url: str, oauth_manager: OAuthManager, timeout: float = 30.0) -> None:
+    def __init__(self, base_url: str, token_provider: TokenProvider, timeout: float = 30.0) -> None:
         self.base_url = base_url
-        self.oauth_manager = oauth_manager
+        self.token_provider = token_provider
         self.timeout = timeout
+        self._delegated = isinstance(token_provider, DelegatedTokenFile)
 
     def call_operation(
         self,
@@ -46,8 +47,10 @@ class UPSHTTPClient:
 
         url = f"{self.base_url}/api{rendered_path}"
 
+        token = ""
         try:
-            token = self.oauth_manager.get_access_token()
+            # Delegated-token failures raise ToolError here, before any request.
+            token = self.token_provider.get_access_token()
             headers = {
                 "Authorization": f"Bearer {token}",
                 "transId": request_trans_id,
@@ -67,9 +70,12 @@ class UPSHTTPClient:
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
+            message = str(exc)
+            if self._delegated:
+                message = _redact_secret(message, token)
             raise ToolError(json.dumps({
                 "code": "REQUEST_ERROR",
-                "message": str(exc),
+                "message": message,
             }))
 
         payload = _parse_payload(response)
@@ -78,6 +84,13 @@ class UPSHTTPClient:
 
         error_code = _extract_error_code(payload, response.status_code)
         error_message = _extract_error_message(payload, response.status_code)
+        if self._delegated:
+            # UPS refuses a bad bearer token before processing the request, so the
+            # caller can safely refresh and retry; ups-mcp itself never retries.
+            if response.status_code == 401:
+                error_code = "UPS_DELEGATED_TOKEN_REJECTED"
+            error_message = _redact_secret(error_message, token)
+            payload = _redact_secret(payload, token)
         raise ToolError(json.dumps({
             "status_code": response.status_code,
             "code": error_code,
@@ -135,6 +148,22 @@ def _extract_error_message(payload: Any, status_code: int) -> str:
                 if isinstance(description, str) and description.strip():
                     return description
     return f"UPS API returned HTTP {status_code}"
+
+
+_REDACTED = "[REDACTED]"
+
+
+def _redact_secret(value: Any, secret: str) -> Any:
+    """Recursively replace occurrences of secret in strings, dict keys included."""
+    if not secret:
+        return value
+    if isinstance(value, str):
+        return value.replace(secret, _REDACTED)
+    if isinstance(value, dict):
+        return {_redact_secret(k, secret): _redact_secret(v, secret) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_secret(item, secret) for item in value]
+    return value
 
 
 _PATH_TOKEN_PATTERN = re.compile(r"{([^{}]+)}")
