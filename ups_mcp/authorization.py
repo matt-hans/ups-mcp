@@ -69,21 +69,38 @@ class DelegatedTokenFile:
     def __repr__(self) -> str:
         return f"DelegatedTokenFile({self._label!r})"
 
+    # Every ToolError below is raised outside its except block, so it carries no
+    # __context__ chaining back to OS/JSON exceptions that hold the full path or
+    # the file contents.
     def get_access_token(self) -> str:
+        access_token, expires_at = self._parse(self._read())
+        if expires_at <= time.time() + DELEGATED_TOKEN_EXPIRY_SKEW_SECONDS:
+            raise _delegated_error(
+                "UPS_DELEGATED_TOKEN_EXPIRED",
+                f"Delegated UPS access token in '{self._label}' is expired or about to expire.",
+            )
+        return access_token
+
+    def _read(self) -> bytes:
+        failure: str | None = None
         try:
             fd = os.open(self.path, os.O_RDONLY)
         except FileNotFoundError:
-            raise _delegated_error(
-                "UPS_DELEGATED_TOKEN_UNAVAILABLE",
-                f"Delegated UPS access token file '{self._label}' does not exist.",
-            ) from None
+            failure = "does not exist"
         except OSError:
-            raise _delegated_error(
-                "UPS_DELEGATED_TOKEN_UNAVAILABLE",
-                f"Delegated UPS access token file '{self._label}' could not be opened.",
-            ) from None
+            failure = "could not be opened"
+        if failure is not None:
+            raise self._unavailable(failure)
 
-        with os.fdopen(fd, "rb") as handle:
+        handle = None
+        try:
+            handle = os.fdopen(fd, "rb")
+        except OSError:  # e.g. the path is a directory
+            os.close(fd)
+        if handle is None:
+            raise self._unavailable("could not be read")
+
+        with handle:
             # fstat the opened descriptor so the checks apply to the bytes we read.
             stat_result = os.fstat(handle.fileno())
             if stat_result.st_mode & 0o077 or stat_result.st_uid != os.getuid():
@@ -92,42 +109,40 @@ class DelegatedTokenFile:
                     f"Delegated UPS access token file '{self._label}' must be owned by the "
                     "server user and must not be accessible by group or others (use mode 0600).",
                 )
+            raw: bytes | None = None
             try:
                 raw = handle.read()
             except OSError:
-                raise _delegated_error(
-                    "UPS_DELEGATED_TOKEN_UNAVAILABLE",
-                    f"Delegated UPS access token file '{self._label}' could not be read.",
-                ) from None
+                pass
+        if raw is None:
+            raise self._unavailable("could not be read")
+        return raw
 
-        access_token, expires_at = self._parse(raw)
-        if expires_at <= time.time() + DELEGATED_TOKEN_EXPIRY_SKEW_SECONDS:
-            raise _delegated_error(
-                "UPS_DELEGATED_TOKEN_EXPIRED",
-                f"Delegated UPS access token in '{self._label}' is expired or about to expire.",
-            )
-        return access_token
+    def _unavailable(self, reason: str) -> ToolError:
+        return _delegated_error(
+            "UPS_DELEGATED_TOKEN_UNAVAILABLE",
+            f"Delegated UPS access token file '{self._label}' {reason}.",
+        )
 
     def _parse(self, raw: bytes) -> tuple[str, float]:
-        invalid = _delegated_error(
-            "UPS_DELEGATED_TOKEN_INVALID",
-            f"Delegated UPS access token file '{self._label}' must be UTF-8 JSON with a "
-            "non-empty string 'access_token' and a numeric 'expires_at'.",
-        )
+        data: object = None
         try:
             data = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            raise invalid from None
+        except ValueError:  # includes UnicodeDecodeError and JSONDecodeError
+            pass
         if not isinstance(data, dict):
-            raise invalid
+            raise self._invalid()
 
         access_token = data.get("access_token")
+        # Bearer tokens are visible ASCII (RFC 6750 b64token is a subset). Anything
+        # else cannot be sent in an HTTP header, and the header encoder's error
+        # would quote the token.
         if (
             not isinstance(access_token, str)
             or not access_token
-            or any(ch.isspace() or not ch.isprintable() for ch in access_token)
+            or not all("\x21" <= ch <= "\x7e" for ch in access_token)
         ):
-            raise invalid
+            raise self._invalid()
 
         expires_at = data.get("expires_at")
         # bool is an int subclass; JSON true/false is not a timestamp.
@@ -136,8 +151,15 @@ class DelegatedTokenFile:
             or not isinstance(expires_at, (int, float))
             or not math.isfinite(expires_at)
         ):
-            raise invalid
+            raise self._invalid()
         return access_token, float(expires_at)
+
+    def _invalid(self) -> ToolError:
+        return _delegated_error(
+            "UPS_DELEGATED_TOKEN_INVALID",
+            f"Delegated UPS access token file '{self._label}' must be UTF-8 JSON with a "
+            "non-empty visible-ASCII string 'access_token' and a numeric 'expires_at'.",
+        )
 
 
 def _delegated_error(code: str, message: str) -> ToolError:

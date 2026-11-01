@@ -30,7 +30,7 @@ Users can integrate with the MCP server to allow AI agents to facilitate trackin
 Startup fails with a message on stderr and exit code 1 when:
 - `UPS_ACCESS_TOKEN_FILE` is unset or not an absolute path.
 - `CLIENT_SECRET` is present in the environment, even empty and including a value loaded from a `.env` file in the working directory: `delegated mode must not receive CLIENT_SECRET`.
-- `UPS_AUTH_MODE` is any value other than `client_credentials` or `delegated`.
+- `UPS_AUTH_MODE` is set to any value other than `client_credentials` or `delegated`, including an empty value. Only an unset variable selects the default.
 
 The token file does not need to exist at startup. `ENVIRONMENT` and `UPS_ACCOUNT_NUMBER` keep their usual meaning. `CLIENT_ID` may be set but is not used.
 
@@ -40,7 +40,7 @@ The token file does not need to exist at startup. `ENVIRONMENT` and `UPS_ACCOUNT
 {"access_token": "<opaque UPS access token>", "expires_at": 1767225600}
 ```
 
-- `access_token`: non-empty string with no whitespace or control characters.
+- `access_token`: non-empty string of visible ASCII characters (`0x21`–`0x7E`, a superset of the RFC 6750 bearer token alphabet). Spaces, control characters, and non-ASCII characters are rejected as `UPS_DELEGATED_TOKEN_INVALID` because they cannot be sent in an HTTP header.
 - `expires_at`: expiry as Unix epoch seconds (integer or float).
 - Extra keys are ignored.
 - The file must be owned by the user running the server and must not be readable or writable by group or others (mode `0600`).
@@ -54,6 +54,8 @@ The server re-reads the file on every UPS call, so a rotated token applies to th
 | `UPS_DELEGATED_TOKEN_INVALID` | Not UTF-8 JSON, `access_token` missing/empty/malformed, or `expires_at` missing/non-numeric |
 | `UPS_DELEGATED_TOKEN_EXPIRED` | `expires_at` is at most 30 seconds from now |
 | `UPS_DELEGATED_TOKEN_REJECTED` | UPS answered HTTP 401 (`status_code` is `401`); the UPS message is kept |
+
+For these codes the MCP `tools/call` result has `isError: true`, and its text content is the bare JSON object, e.g. `{"code": "UPS_DELEGATED_TOKEN_EXPIRED", "message": "..."}`, so a client can `json.loads` it directly. Other tool errors keep FastMCP's `Error executing tool <name>: ` prefix.
 
 In delegated mode the token is redacted as `[REDACTED]` from every error message and error `details` payload. Error messages name only the token file's basename. The server does not retry; on `UPS_DELEGATED_TOKEN_EXPIRED` or `UPS_DELEGATED_TOKEN_REJECTED` the host refreshes the token, rewrites the file, and retries the call once. UPS rejects an invalid bearer token before processing the request, so one retry after a 401 is safe for `create_shipment` too. Tokens are never accepted as tool arguments, and no tool sets them.
 

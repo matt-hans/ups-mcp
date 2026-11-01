@@ -55,7 +55,7 @@ class UPSHTTPClientTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = UPSHTTPClient(
             base_url="https://wwwcie.ups.com",
-            token_provider=DummyOAuthManager(),
+            oauth_manager=DummyOAuthManager(),
         )
         self.operation = build_operation_spec()
 

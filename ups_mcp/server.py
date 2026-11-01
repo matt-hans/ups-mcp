@@ -10,8 +10,45 @@ from . import constants
 from .authorization import DelegatedTokenFile
 from .openapi_registry import OpenAPISpecLoadError
 
+DELEGATED_TOKEN_ERROR_PREFIX = "UPS_DELEGATED_TOKEN_"
+
+
+def _delegated_token_error_text(exc: BaseException | None) -> str | None:
+    """Return exc's JSON text if it is a ToolError carrying a delegated-token code."""
+    if not isinstance(exc, ToolError):
+        return None
+    text = str(exc)
+    try:
+        code = json.loads(text).get("code")
+    except (ValueError, AttributeError):
+        return None
+    if isinstance(code, str) and code.startswith(DELEGATED_TOKEN_ERROR_PREFIX):
+        return text
+    return None
+
+
+class UPSFastMCP(FastMCP):
+    """FastMCP that returns delegated-token errors as bare JSON.
+
+    FastMCP prefixes tool errors with "Error executing tool <name>: ", which a
+    client cannot json.loads. Hosts need the UPS_DELEGATED_TOKEN_* code to decide
+    whether to refresh and retry, so those errors are unwrapped; every other
+    error keeps FastMCP's existing text.
+    """
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        delegated_text: str | None = None
+        try:
+            return await super().call_tool(name, arguments)
+        except ToolError as exc:
+            delegated_text = _delegated_token_error_text(exc.__cause__)
+            if delegated_text is None:
+                raise
+        raise ToolError(delegated_text)
+
+
 # Initialize FastMCP server
-mcp = FastMCP("ups-mcp")
+mcp = UPSFastMCP("ups-mcp")
 
 load_dotenv()
 base_url = constants.CIE_URL
@@ -34,7 +71,8 @@ def _refresh_runtime_configuration() -> None:
         base_url = constants.CIE_URL
     client_id = os.getenv("CLIENT_ID")
     client_secret = os.getenv("CLIENT_SECRET")
-    auth_mode = os.getenv("UPS_AUTH_MODE") or constants.AUTH_MODE_CLIENT_CREDENTIALS
+    # Only an absent variable selects the default; an empty value is rejected as unknown.
+    auth_mode = os.getenv("UPS_AUTH_MODE", constants.AUTH_MODE_CLIENT_CREDENTIALS)
     access_token_file = os.getenv("UPS_ACCESS_TOKEN_FILE") or None
 
 

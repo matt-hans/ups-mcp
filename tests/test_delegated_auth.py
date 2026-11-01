@@ -5,10 +5,13 @@ import os
 import shutil
 import tempfile
 import time
+import traceback
 import unittest
 from unittest import mock
 
+import requests
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.shared.memory import create_connected_server_and_client_session
 
 import ups_mcp.server as server
 from ups_mcp import constants
@@ -41,6 +44,14 @@ class TokenFileTestCase(unittest.TestCase):
     def write_valid_token(self, token: str = TOKEN, ttl: float = 3600) -> None:
         self.write_token_file({"access_token": token, "expires_at": time.time() + ttl})
 
+    def assert_unchained(self, exc: BaseException, *secrets: str) -> None:
+        """No chained exception (which could hold paths or file contents) and no secret in the traceback."""
+        self.assertIsNone(exc.__cause__)
+        self.assertIsNone(exc.__context__)
+        rendered = "".join(traceback.format_exception(exc))
+        for secret in secrets:
+            self.assertNotIn(secret, rendered)
+
     def assert_tool_error_code(self, exc: ToolError, code: str) -> dict:
         payload = json.loads(str(exc))
         self.assertEqual(payload["code"], code)
@@ -59,6 +70,7 @@ class DelegatedTokenFileTests(TokenFileTestCase):
         message = str(ctx.exception)
         self.assertNotIn(TOKEN, message)
         self.assertNotIn(self.tmpdir, message)
+        self.assert_unchained(ctx.exception, TOKEN, self.tmpdir)
         return payload
 
     def test_returns_token_from_valid_file(self) -> None:
@@ -100,6 +112,8 @@ class DelegatedTokenFileTests(TokenFileTestCase):
             "empty_token": {"access_token": "", "expires_at": future},
             "non_string_token": {"access_token": 12345, "expires_at": future},
             "whitespace_token": {"access_token": f"{TOKEN}\r\nX-Injected: 1", "expires_at": future},
+            "space_token": {"access_token": f"{TOKEN} {TOKEN}", "expires_at": future},
+            "non_ascii_token": {"access_token": f"{TOKEN}\u03bb", "expires_at": future},
             "missing_expiry": {"access_token": TOKEN},
             "string_expiry": {"access_token": TOKEN, "expires_at": str(future)},
             "bool_expiry": {"access_token": TOKEN, "expires_at": True},
@@ -109,6 +123,11 @@ class DelegatedTokenFileTests(TokenFileTestCase):
             with self.subTest(case=name):
                 self.write_token_file(payload)
                 self.assert_provider_fails("UPS_DELEGATED_TOKEN_INVALID")
+
+    def test_unreadable_token_file_is_unavailable(self) -> None:
+        os.mkdir(self.token_path)  # opening succeeds on macOS/Linux, reading raises IsADirectoryError
+        os.chmod(self.token_path, 0o700)
+        self.assert_provider_fails("UPS_DELEGATED_TOKEN_UNAVAILABLE")
 
     def test_expired_or_nearly_expired_token_is_expired(self) -> None:
         now = 1_800_000_000.0
@@ -230,6 +249,34 @@ class DelegatedHTTPClientTests(TokenFileTestCase):
         self.assertEqual(mock_request.call_count, 1)  # no retry inside ups-mcp
         mock_post.assert_not_called()
 
+    def test_request_exception_is_scrubbed_and_unchained(
+        self, mock_request: mock.Mock, mock_post: mock.Mock
+    ) -> None:
+        self.write_valid_token()
+        failure = requests.ConnectionError(f"connection reset; Authorization: Bearer {TOKEN}")
+        failure.request = mock.Mock(headers={"Authorization": f"Bearer {TOKEN}"})
+        mock_request.side_effect = failure
+
+        with self.assertRaises(ToolError) as ctx:
+            self.call()
+
+        payload = self.assert_tool_error_code(ctx.exception, "REQUEST_ERROR")
+        self.assertIn("[REDACTED]", payload["message"])
+        self.assert_unchained(ctx.exception, TOKEN)
+
+    def test_numeric_token_echoed_as_number_is_scrubbed(
+        self, mock_request: mock.Mock, mock_post: mock.Mock
+    ) -> None:
+        numeric_token = "8675309123456"
+        self.write_valid_token(numeric_token)
+        mock_request.return_value = make_response(401, {"echo": int(numeric_token), "code": int(numeric_token)})
+
+        with self.assertRaises(ToolError) as ctx:
+            self.call()
+
+        self.assertNotIn(numeric_token, str(ctx.exception))
+        self.assertEqual(json.loads(str(ctx.exception))["code"], "UPS_DELEGATED_TOKEN_REJECTED")
+
     def test_non_401_errors_keep_ups_code_but_are_scrubbed(
         self, mock_request: mock.Mock, mock_post: mock.Mock
     ) -> None:
@@ -245,8 +292,27 @@ class DelegatedHTTPClientTests(TokenFileTestCase):
         self.assertEqual(payload["code"], "400")
         self.assertNotIn(TOKEN, str(ctx.exception))
 
+    def test_extracted_error_code_echoing_token_is_scrubbed(
+        self, mock_request: mock.Mock, mock_post: mock.Mock
+    ) -> None:
+        self.write_valid_token()
+        mock_request.return_value = make_response(403, {"code": TOKEN, "message": "Forbidden"})
+
+        with self.assertRaises(ToolError) as ctx:
+            self.call()
+
+        self.assertNotIn(TOKEN, str(ctx.exception))
+        self.assertEqual(json.loads(str(ctx.exception))["code"], "[REDACTED]")
+
 
 class ClientCredentialsHTTPClientTests(unittest.TestCase):
+    def test_oauth_manager_keyword_and_attribute_still_work(self) -> None:
+        manager = DummyOAuthManager()
+        client = UPSHTTPClient("https://wwwcie.ups.com", oauth_manager=manager)
+        self.assertIs(client.oauth_manager, manager)
+        self.assertIs(client.token_provider, manager)
+
+
     @mock.patch("requests.request")
     def test_401_keeps_existing_error_shape(self, mock_request: mock.Mock) -> None:
         details = {"response": {"errors": [{"code": "250002", "message": "Invalid Authentication Information."}]}}
@@ -354,6 +420,12 @@ class DelegatedServerConfigTests(unittest.TestCase):
             "delegated mode must not receive CLIENT_SECRET",
         )
 
+    def test_empty_mode_is_rejected(self) -> None:
+        self.assert_startup_rejected(
+            {"UPS_AUTH_MODE": "", "CLIENT_ID": "id", "CLIENT_SECRET": "secret"},
+            "Unknown UPS_AUTH_MODE",
+        )
+
     def test_delegated_without_token_file_is_rejected(self) -> None:
         self.assert_startup_rejected({"UPS_AUTH_MODE": "delegated"}, "UPS_ACCESS_TOKEN_FILE")
 
@@ -390,6 +462,65 @@ class DelegatedServerConfigTests(unittest.TestCase):
         provider = server.tool_manager.http_client.token_provider
         self.assertIsInstance(provider, DelegatedTokenFile)
         self.assertEqual(provider.path, "/nonexistent/ups-mcp/token.json")
+
+
+
+@mock.patch("requests.post")
+@mock.patch("requests.request")
+class DelegatedMCPBoundaryTests(TokenFileTestCase, unittest.IsolatedAsyncioTestCase):
+    """Errors as an MCP client sees them over tools/call."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        saved = server.tool_manager
+        self.addCleanup(setattr, server, "tool_manager", saved)
+        server.tool_manager = ToolManager(
+            base_url=constants.CIE_URL,
+            client_id=None,
+            client_secret=None,
+            token_provider=DelegatedTokenFile(self.token_path),
+        )
+
+    async def call_tool_text(self, name: str, arguments: dict) -> str:
+        async with create_connected_server_and_client_session(server.mcp._mcp_server) as client:
+            result = await client.call_tool(name, arguments)
+        self.assertTrue(result.isError)
+        return result.content[0].text
+
+    async def test_missing_token_file_returns_parseable_json(
+        self, mock_request: mock.Mock, mock_post: mock.Mock
+    ) -> None:
+        text = await self.call_tool_text("track_package", {"inquiryNumber": "1Z12345E0205271688"})
+
+        self.assertEqual(json.loads(text)["code"], "UPS_DELEGATED_TOKEN_UNAVAILABLE")
+        mock_request.assert_not_called()
+        mock_post.assert_not_called()
+
+    async def test_ups_401_returns_parseable_scrubbed_json(
+        self, mock_request: mock.Mock, mock_post: mock.Mock
+    ) -> None:
+        self.write_valid_token()
+        mock_request.return_value = make_response(401, {
+            "response": {"errors": [{"code": "250002", "message": f"Invalid token {TOKEN}"}]},
+        })
+
+        text = await self.call_tool_text("track_package", {"inquiryNumber": "1Z12345E0205271688"})
+
+        payload = json.loads(text)
+        self.assertEqual(payload["status_code"], 401)
+        self.assertEqual(payload["code"], "UPS_DELEGATED_TOKEN_REJECTED")
+        self.assertNotIn(TOKEN, text)
+        mock_post.assert_not_called()
+
+    async def test_other_errors_keep_fastmcp_prefix(
+        self, mock_request: mock.Mock, mock_post: mock.Mock
+    ) -> None:
+        self.write_valid_token()
+        mock_request.return_value = make_response(404, {"message": "Not found"})
+
+        text = await self.call_tool_text("track_package", {"inquiryNumber": "1Z12345E0205271688"})
+
+        self.assertTrue(text.startswith("Error executing tool track_package: "))
 
 
 if __name__ == "__main__":

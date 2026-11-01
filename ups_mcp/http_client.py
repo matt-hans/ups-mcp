@@ -14,11 +14,27 @@ from .openapi_registry import OperationSpec
 
 
 class UPSHTTPClient:
-    def __init__(self, base_url: str, token_provider: TokenProvider, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        token_provider: TokenProvider | None = None,
+        timeout: float = 30.0,
+        *,
+        oauth_manager: TokenProvider | None = None,
+    ) -> None:
+        # oauth_manager is the pre-seam keyword, kept for existing callers.
+        if token_provider is None:
+            token_provider = oauth_manager
+        if token_provider is None:
+            raise TypeError("UPSHTTPClient requires a token_provider")
         self.base_url = base_url
         self.token_provider = token_provider
         self.timeout = timeout
         self._delegated = isinstance(token_provider, DelegatedTokenFile)
+
+    @property
+    def oauth_manager(self) -> TokenProvider:
+        return self.token_provider
 
     def call_operation(
         self,
@@ -48,6 +64,7 @@ class UPSHTTPClient:
         url = f"{self.base_url}/api{rendered_path}"
 
         token = ""
+        request_error: str | None = None
         try:
             # Delegated-token failures raise ToolError here, before any request.
             token = self.token_provider.get_access_token()
@@ -70,12 +87,15 @@ class UPSHTTPClient:
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
-            message = str(exc)
+            request_error = str(exc)
+        if request_error is not None:
+            # Raised outside the except block so the error does not chain to the
+            # RequestException, whose .request still carries the Authorization header.
             if self._delegated:
-                message = _redact_secret(message, token)
+                request_error = _redact_secret(request_error, token)
             raise ToolError(json.dumps({
                 "code": "REQUEST_ERROR",
-                "message": message,
+                "message": request_error,
             }))
 
         payload = _parse_payload(response)
@@ -89,6 +109,7 @@ class UPSHTTPClient:
             # caller can safely refresh and retry; ups-mcp itself never retries.
             if response.status_code == 401:
                 error_code = "UPS_DELEGATED_TOKEN_REJECTED"
+            error_code = _redact_secret(error_code, token)
             error_message = _redact_secret(error_message, token)
             payload = _redact_secret(payload, token)
         raise ToolError(json.dumps({
@@ -163,6 +184,9 @@ def _redact_secret(value: Any, secret: str) -> Any:
         return {_redact_secret(k, secret): _redact_secret(v, secret) for k, v in value.items()}
     if isinstance(value, list):
         return [_redact_secret(item, secret) for item in value]
+    # An all-digit token echoed back as a JSON number.
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and str(value) == secret:
+        return _REDACTED
     return value
 
 
