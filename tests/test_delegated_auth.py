@@ -686,7 +686,7 @@ class DelegatedServerConfigTests(unittest.TestCase):
         tmpdir = tempfile.mkdtemp(prefix="ups-mcp-dotenv-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         with open(os.path.join(tmpdir, ".env"), "w") as handle:
-            handle.write("FASTMCP_DEPENDENCIES=not-valid-json\nCLIENT_SECRET=leaked-app-secret\n")
+            handle.write("CLIENT_SECRET=leaked-app-secret\nUPS_MCP_DOTENV_SENTINEL=1\n")
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(server.__file__)))
         script = (
             "import os, sys\n"
@@ -696,6 +696,7 @@ class DelegatedServerConfigTests(unittest.TestCase):
             "with mock.patch.object(server.mcp, 'run'):\n"
             "    server.main()\n"
             "assert 'CLIENT_SECRET' not in os.environ\n"
+            "assert 'UPS_MCP_DOTENV_SENTINEL' not in os.environ\n"
             "print('OK')\n"
         )
         env = {
