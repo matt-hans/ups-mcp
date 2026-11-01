@@ -713,6 +713,29 @@ class DelegatedServerConfigTests(unittest.TestCase):
             server.main()
         mock_load.assert_called_once_with()
 
+    def test_client_credentials_startup_uses_credentials_from_real_dotenv(self) -> None:
+        tmpdir = tempfile.mkdtemp(prefix="ups-mcp-dotenv-")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        dotenv_path = os.path.join(tmpdir, ".env")
+        with open(dotenv_path, "w") as handle:
+            handle.write("CLIENT_ID=dotenv-client-id\nCLIENT_SECRET=dotenv-client-secret\n")
+        # Point main()'s load_dotenv() at a real file; parsing and os.environ
+        # population are python-dotenv's real code.
+        load_from_tmp = mock.Mock(side_effect=lambda *a, **k: dotenv.load_dotenv(dotenv_path))
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch("ups_mcp.server.load_dotenv", load_from_tmp), \
+                mock.patch("ups_mcp.server.mcp.run") as mock_run, \
+                mock.patch("ups_mcp.server.tools.ToolManager") as mock_tool_manager, \
+                contextlib.redirect_stdout(io.StringIO()):
+            server.main()
+
+        load_from_tmp.assert_called_once_with()
+        mock_run.assert_called_once()
+        kwargs = mock_tool_manager.call_args.kwargs
+        self.assertEqual(kwargs["client_id"], "dotenv-client-id")
+        self.assertEqual(kwargs["client_secret"], "dotenv-client-secret")
+        self.assertNotIn("token_provider", kwargs)
+
     def test_delegated_starts_without_token_file_and_never_builds_oauth(self) -> None:
         env = {
             "UPS_AUTH_MODE": "delegated",

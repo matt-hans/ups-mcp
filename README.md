@@ -32,7 +32,7 @@ Startup fails with a message on stderr and exit code 1 when:
 - `CLIENT_SECRET` is present in the process environment, even empty: `delegated mode must not receive CLIENT_SECRET`.
 - `UPS_AUTH_MODE` is set to any value other than `client_credentials` or `delegated`, including an empty value. Only an unset variable selects the default.
 
-In delegated mode the server never reads a `.env` file, so all configuration must come from the process environment and set `UPS_AUTH_MODE=delegated` there. In client_credentials mode a `.env` in the working directory is loaded when the server starts (not on import), as before. The token file does not need to exist at startup. `ENVIRONMENT` and `UPS_ACCOUNT_NUMBER` keep their usual meaning. `CLIENT_ID` may be set but is not used.
+In delegated mode the server never reads a `.env` file, so all configuration must come from the process environment and set `UPS_AUTH_MODE=delegated` there. In client_credentials mode the server loads a `.env` at startup (not on import), with the same lookup as before: python-dotenv searches upward from the installed `ups_mcp` package directory, not from the working directory. Variables already in the environment take precedence over the file. With `uvx` or a non-editable install, a project-local `.env` is usually not found, so pass the variables through the process environment instead (as the MCP client configs below do). The token file does not need to exist at startup. `ENVIRONMENT` and `UPS_ACCOUNT_NUMBER` keep their usual meaning. `CLIENT_ID` may be set but is not used.
 
 **Token file contract.** UTF-8 JSON, written atomically by the host (write a temp file, then rename it over the target):
 
