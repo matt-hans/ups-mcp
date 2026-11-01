@@ -39,10 +39,6 @@ class UPSHTTPClient:
     def oauth_manager(self, value: TokenProvider) -> None:
         self.token_provider = value
 
-    @property
-    def _delegated(self) -> bool:
-        return isinstance(self.token_provider, DelegatedTokenFile)
-
     def call_operation(
         self,
         operation: OperationSpec,
@@ -70,11 +66,15 @@ class UPSHTTPClient:
 
         url = f"{self.base_url}/api{rendered_path}"
 
+        # Snapshot the provider so a concurrent reassignment can't change how this
+        # call's errors are handled.
+        token_provider = self.token_provider
+        delegated = isinstance(token_provider, DelegatedTokenFile)
         token = ""
         request_error: str | None = None
         try:
             # Delegated-token failures raise ToolError here, before any request.
-            token = self.token_provider.get_access_token()
+            token = token_provider.get_access_token()
             headers = {
                 "Authorization": f"Bearer {token}",
                 "transId": request_trans_id,
@@ -98,7 +98,7 @@ class UPSHTTPClient:
         if request_error is not None:
             # Raised outside the except block so the error does not chain to the
             # RequestException, whose .request still carries the Authorization header.
-            if self._delegated:
+            if delegated:
                 request_error = _redact_secret(request_error, token)
             raise ToolError(json.dumps({
                 "code": "REQUEST_ERROR",
@@ -109,17 +109,20 @@ class UPSHTTPClient:
         if 200 <= response.status_code < 300:
             return payload if isinstance(payload, dict) else {"raw": payload}
 
-        if self._delegated:
-            # Scrub the whole response before extracting fields from it, so no
-            # stringified value can carry the token out.
-            payload = _redact_secret(payload, token)
         error_code = _extract_error_code(payload, response.status_code)
         error_message = _extract_error_message(payload, response.status_code)
-        if self._delegated and response.status_code == 401:
-            # UPS refuses a bad bearer token before processing the request, so the
-            # caller can safely refresh and retry; ups-mcp itself never retries.
-            # Set after redaction so a token that overlaps this code can't alter it.
-            error_code = "UPS_DELEGATED_TOKEN_REJECTED"
+        if delegated:
+            # Extract from the original structure, then scrub what is emitted. The
+            # token alphabet (see DelegatedTokenFile) survives str()/JSON escaping
+            # unchanged, so literal replacement catches every echo.
+            error_code = _redact_secret(error_code, token)
+            error_message = _redact_secret(error_message, token)
+            payload = _redact_secret(payload, token)
+            if response.status_code == 401:
+                # UPS refuses a bad bearer token before processing the request, so
+                # the caller can safely refresh and retry; ups-mcp never retries.
+                # Set after redaction so a token that overlaps this code can't alter it.
+                error_code = "UPS_DELEGATED_TOKEN_REJECTED"
         raise ToolError(json.dumps({
             "status_code": response.status_code,
             "code": error_code,
@@ -180,6 +183,8 @@ def _extract_error_message(payload: Any, status_code: int) -> str:
 
 
 _REDACTED = "[REDACTED]"
+# Used when the secret is a substring of _REDACTED; "*" is outside the token alphabet.
+_REDACTED_FALLBACK = "********"
 
 
 def _redact_secret(value: Any, secret: str) -> Any:
@@ -187,14 +192,15 @@ def _redact_secret(value: Any, secret: str) -> Any:
     if not secret:
         return value
     if isinstance(value, str):
-        return value.replace(secret, _REDACTED)
+        return value.replace(secret, _REDACTED if secret not in _REDACTED else _REDACTED_FALLBACK)
     if isinstance(value, dict):
         return {_redact_secret(k, secret): _redact_secret(v, secret) for k, v in value.items()}
     if isinstance(value, list):
         return [_redact_secret(item, secret) for item in value]
-    # A digit-only token echoed back inside a JSON number.
-    if isinstance(value, (int, float)) and not isinstance(value, bool) and secret in str(value):
-        return _REDACTED
+    # A token echoed back as a JSON number, true/false, or null.
+    if isinstance(value, (bool, int, float)) or value is None:
+        if secret in json.dumps(value):
+            return _REDACTED if secret not in _REDACTED else _REDACTED_FALLBACK
     return value
 
 

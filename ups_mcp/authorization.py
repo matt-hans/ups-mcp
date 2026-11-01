@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import re
 import time
 import threading
 from typing import Protocol
@@ -53,6 +54,10 @@ class OAuthManager:
 
 DELEGATED_TOKEN_EXPIRY_SKEW_SECONDS = 30
 
+# RFC 6750 b64token. It has no quote, backslash, whitespace, or bracket, so JSON or
+# repr escaping can never disguise an echoed token from literal redaction.
+_BEARER_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
+
 
 class DelegatedTokenFile:
     """Reads a caller-managed UPS access token from a JSON file on every call.
@@ -90,6 +95,10 @@ class DelegatedTokenFile:
         except OSError:
             failure = "could not be opened"
         if failure is not None:
+            # A file we cannot open may still be another user's: report that as
+            # INSECURE, per the contract, rather than UNAVAILABLE.
+            if failure != "does not exist" and self._path_is_insecure():
+                raise self._insecure()
             raise self._unavailable(failure)
 
         handle = None
@@ -102,13 +111,8 @@ class DelegatedTokenFile:
 
         with handle:
             # fstat the opened descriptor so the checks apply to the bytes we read.
-            stat_result = os.fstat(handle.fileno())
-            if stat_result.st_mode & 0o077 or stat_result.st_uid != os.getuid():
-                raise _delegated_error(
-                    "UPS_DELEGATED_TOKEN_INSECURE",
-                    f"Delegated UPS access token file '{self._label}' must be owned by the "
-                    "server user and must not be accessible by group or others (use mode 0600).",
-                )
+            if _stat_is_insecure(os.fstat(handle.fileno())):
+                raise self._insecure()
             raw: bytes | None = None
             try:
                 raw = handle.read()
@@ -117,6 +121,21 @@ class DelegatedTokenFile:
         if raw is None:
             raise self._unavailable("could not be read")
         return raw
+
+    def _path_is_insecure(self) -> bool:
+        stat_result = None
+        try:
+            stat_result = os.stat(self.path)
+        except OSError:
+            pass
+        return stat_result is not None and _stat_is_insecure(stat_result)
+
+    def _insecure(self) -> ToolError:
+        return _delegated_error(
+            "UPS_DELEGATED_TOKEN_INSECURE",
+            f"Delegated UPS access token file '{self._label}' must be owned by the "
+            "server user and must not be accessible by group or others (use mode 0600).",
+        )
 
     def _unavailable(self, reason: str) -> ToolError:
         return _delegated_error(
@@ -134,14 +153,7 @@ class DelegatedTokenFile:
             raise self._invalid()
 
         access_token = data.get("access_token")
-        # Bearer tokens are visible ASCII (RFC 6750 b64token is a subset). Anything
-        # else cannot be sent in an HTTP header, and the header encoder's error
-        # would quote the token.
-        if (
-            not isinstance(access_token, str)
-            or not access_token
-            or not all("\x21" <= ch <= "\x7e" for ch in access_token)
-        ):
+        if not isinstance(access_token, str) or not _BEARER_TOKEN_PATTERN.fullmatch(access_token):
             raise self._invalid()
 
         expires_at = data.get("expires_at")
@@ -158,8 +170,12 @@ class DelegatedTokenFile:
         return _delegated_error(
             "UPS_DELEGATED_TOKEN_INVALID",
             f"Delegated UPS access token file '{self._label}' must be UTF-8 JSON with a "
-            "non-empty visible-ASCII string 'access_token' and a numeric 'expires_at'.",
+            "non-empty RFC 6750 bearer token 'access_token' and a numeric 'expires_at'.",
         )
+
+
+def _stat_is_insecure(stat_result: os.stat_result) -> bool:
+    return bool(stat_result.st_mode & 0o077) or stat_result.st_uid != os.getuid()
 
 
 def _delegated_error(code: str, message: str) -> ToolError:

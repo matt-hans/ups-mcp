@@ -102,6 +102,25 @@ class DelegatedTokenFileTests(TokenFileTestCase):
         with mock.patch("ups_mcp.authorization.os.getuid", return_value=other_uid):
             self.assert_provider_fails("UPS_DELEGATED_TOKEN_INSECURE")
 
+    def test_unopenable_file_owned_by_another_user_is_insecure(self) -> None:
+        # A 0600 file owned by someone else fails os.open with EACCES; it must still
+        # be classified as INSECURE, not UNAVAILABLE.
+        self.write_valid_token()
+        other_uid = os.stat(self.token_path).st_uid + 1
+        with mock.patch("ups_mcp.authorization.os.open", side_effect=PermissionError(13, "denied", self.token_path)), \
+                mock.patch("ups_mcp.authorization.os.getuid", return_value=other_uid):
+            self.assert_provider_fails("UPS_DELEGATED_TOKEN_INSECURE")
+
+    def test_unopenable_own_file_is_unavailable(self) -> None:
+        self.write_valid_token()
+        with mock.patch("ups_mcp.authorization.os.open", side_effect=PermissionError(13, "denied", self.token_path)):
+            self.assert_provider_fails("UPS_DELEGATED_TOKEN_UNAVAILABLE")
+
+    def test_rfc6750_token_alphabet_is_accepted(self) -> None:
+        token = "eyJhbGciOi.JIUzI1-NiJ9_~+/abc=="
+        self.write_valid_token(token)
+        self.assertEqual(self.provider.get_access_token(), token)
+
     def test_invalid_contents_are_invalid(self) -> None:
         future = time.time() + 3600
         cases = {
@@ -114,6 +133,9 @@ class DelegatedTokenFileTests(TokenFileTestCase):
             "whitespace_token": {"access_token": f"{TOKEN}\r\nX-Injected: 1", "expires_at": future},
             "space_token": {"access_token": f"{TOKEN} {TOKEN}", "expires_at": future},
             "non_ascii_token": {"access_token": f"{TOKEN}\u03bb", "expires_at": future},
+            "quote_token": {"access_token": f'{TOKEN}"x', "expires_at": future},
+            "backslash_token": {"access_token": f"{TOKEN}\\x", "expires_at": future},
+            "padding_not_at_end": {"access_token": f"{TOKEN}=x", "expires_at": future},
             "missing_expiry": {"access_token": TOKEN},
             "string_expiry": {"access_token": TOKEN, "expires_at": str(future)},
             "bool_expiry": {"access_token": TOKEN, "expires_at": True},
@@ -289,20 +311,75 @@ class DelegatedHTTPClientTests(TokenFileTestCase):
 
         self.assertNotIn(numeric_token, str(ctx.exception))
 
-    def test_non_string_error_code_with_escaped_token_is_scrubbed(
+    def test_non_string_error_code_echoing_token_is_scrubbed(
         self, mock_request: mock.Mock, mock_post: mock.Mock
     ) -> None:
-        escaped_token = 'tok\\en"with-escapes'
-        self.write_valid_token(escaped_token)
-        mock_request.return_value = make_response(400, {"code": {"echo": escaped_token}})
+        self.write_valid_token()
+        mock_request.return_value = make_response(400, {"code": {"echo": f"Bearer {TOKEN}"}})
 
         with self.assertRaises(ToolError) as ctx:
             self.call()
 
         payload = json.loads(str(ctx.exception))
-        self.assertNotIn(escaped_token, json.dumps(payload))
-        self.assertNotIn(escaped_token, payload["code"])
+        self.assertNotIn(TOKEN, str(ctx.exception))
         self.assertIn("[REDACTED]", payload["code"])
+
+    def test_token_matching_a_response_key_keeps_ups_message(
+        self, mock_request: mock.Mock, mock_post: mock.Mock
+    ) -> None:
+        self.write_valid_token("message")
+        mock_request.return_value = make_response(401, {"message": "Invalid Authentication Information."})
+
+        with self.assertRaises(ToolError) as ctx:
+            self.call()
+
+        payload = json.loads(str(ctx.exception))
+        self.assertEqual(payload["message"], "Invalid Authentication Information.")
+        self.assertEqual(payload["code"], "UPS_DELEGATED_TOKEN_REJECTED")
+
+    def test_token_inside_redaction_marker_uses_fallback(
+        self, mock_request: mock.Mock, mock_post: mock.Mock
+    ) -> None:
+        self.write_valid_token("REDACTED")
+        mock_request.return_value = make_response(401, {"message": "Bad token REDACTED"})
+
+        with self.assertRaises(ToolError) as ctx:
+            self.call()
+
+        payload = json.loads(str(ctx.exception))
+        self.assertNotIn("REDACTED", payload["message"])
+        self.assertNotIn("REDACTED", json.dumps(payload["details"]))
+
+    def test_token_echoed_as_json_literal_is_scrubbed(
+        self, mock_request: mock.Mock, mock_post: mock.Mock
+    ) -> None:
+        for literal_token, echoed in (("true", True), ("null", None)):
+            with self.subTest(token=literal_token):
+                self.write_valid_token(literal_token)
+                mock_request.return_value = make_response(401, {"echo": echoed})
+
+                with self.assertRaises(ToolError) as ctx:
+                    self.call()
+
+                self.assertEqual(json.loads(str(ctx.exception))["details"]["echo"], "[REDACTED]")
+
+    def test_provider_reassigned_mid_request_keeps_delegated_handling(
+        self, mock_request: mock.Mock, mock_post: mock.Mock
+    ) -> None:
+        self.write_valid_token()
+
+        def swap_provider_then_reject(**kwargs):  # noqa: ANN003
+            self.client.oauth_manager = DummyOAuthManager()
+            return make_response(401, {"message": f"Invalid token {TOKEN}"})
+
+        mock_request.side_effect = swap_provider_then_reject
+
+        with self.assertRaises(ToolError) as ctx:
+            self.call()
+
+        payload = json.loads(str(ctx.exception))
+        self.assertEqual(payload["code"], "UPS_DELEGATED_TOKEN_REJECTED")
+        self.assertNotIn(TOKEN, str(ctx.exception))
 
     def test_token_overlapping_rejected_code_leaves_code_intact(
         self, mock_request: mock.Mock, mock_post: mock.Mock

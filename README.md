@@ -40,10 +40,10 @@ The token file does not need to exist at startup. `ENVIRONMENT` and `UPS_ACCOUNT
 {"access_token": "<opaque UPS access token>", "expires_at": 1767225600}
 ```
 
-- `access_token`: non-empty string of visible ASCII characters (`0x21`–`0x7E`, a superset of the RFC 6750 bearer token alphabet). Spaces, control characters, and non-ASCII characters are rejected as `UPS_DELEGATED_TOKEN_INVALID` because they cannot be sent in an HTTP header.
+- `access_token`: a non-empty RFC 6750 bearer token: one or more of `A–Z a–z 0–9 - . _ ~ + /`, optionally followed by `=` padding. UPS OAuth access tokens fit this. Any other character (spaces, quotes, backslashes, non-ASCII) is rejected as `UPS_DELEGATED_TOKEN_INVALID`.
 - `expires_at`: expiry as Unix epoch seconds (integer or float).
 - Extra keys are ignored.
-- The file must be owned by the user running the server and must not be readable or writable by group or others (mode `0600`).
+- The file must be owned by the user running the server and must not be readable or writable by group or others (mode `0600`). A file the server cannot open because another user owns it is reported as `UPS_DELEGATED_TOKEN_INSECURE`.
 
 The server re-reads the file on every UPS call, so a rotated token applies to the next call without a restart. Each call checks the file before any network I/O and fails closed without contacting UPS. Failures are raised as tool errors whose JSON `code` is:
 
@@ -57,7 +57,7 @@ The server re-reads the file on every UPS call, so a rotated token applies to th
 
 For these codes the MCP `tools/call` result has `isError: true`, and its text content is the bare JSON object, e.g. `{"code": "UPS_DELEGATED_TOKEN_EXPIRED", "message": "..."}`, so a client can `json.loads` it directly. Other tool errors keep FastMCP's `Error executing tool <name>: ` prefix.
 
-In delegated mode the token is redacted as `[REDACTED]` from every error message and error `details` payload. Error messages name only the token file's basename. The server does not retry; on `UPS_DELEGATED_TOKEN_EXPIRED` or `UPS_DELEGATED_TOKEN_REJECTED` the host refreshes the token, rewrites the file, and retries the call once. UPS rejects an invalid bearer token before processing the request, so one retry after a 401 is safe for `create_shipment` too. Tokens are never accepted as tool arguments, and no tool sets them.
+In delegated mode the token is redacted as `[REDACTED]` (`********` if the token is itself part of that marker) from every error code, message, and error `details` payload. Error messages name only the token file's basename. The server does not retry; on `UPS_DELEGATED_TOKEN_EXPIRED` or `UPS_DELEGATED_TOKEN_REJECTED` the host refreshes the token, rewrites the file, and retries the call once. UPS rejects an invalid bearer token before processing the request, so one retry after a 401 is safe for `create_shipment` too. Tokens are never accepted as tool arguments, and no tool sets them.
 
 **Execution**
 
