@@ -422,7 +422,52 @@ class DelegatedHTTPClientTests(TokenFileTestCase):
         self.assertEqual(json.loads(str(ctx.exception))["code"], "[REDACTED]")
 
 
+class DelegatedNetrcTests(TokenFileTestCase):
+    """Exercises real request preparation, which mocking requests.request would skip."""
+
+    def test_netrc_credentials_do_not_replace_bearer_token(self) -> None:
+        self.write_valid_token()
+        netrc_path = os.path.join(self.tmpdir, "netrc")
+        with open(netrc_path, "w") as handle:
+            handle.write("machine wwwcie.ups.com login netrc-user password netrc-pass\n")
+        os.chmod(netrc_path, 0o600)
+        sent: list[requests.PreparedRequest] = []
+
+        def fake_send(adapter, request, **kwargs):  # noqa: ANN001, ANN003
+            sent.append(request)
+            response = requests.Response()
+            response.status_code = 200
+            response._content = b'{"ok": true}'
+            response.request = request
+            response.url = request.url
+            return response
+
+        client = UPSHTTPClient("https://wwwcie.ups.com", token_provider=DelegatedTokenFile(self.token_path))
+        with mock.patch.dict(os.environ, {"NETRC": netrc_path}), \
+                mock.patch("requests.adapters.HTTPAdapter.send", fake_send), \
+                mock.patch("requests.post") as mock_post:
+            client.call_operation(build_operation_spec(), operation_name="create_shipment",
+                                  path_params={"version": "v2409"}, json_body={})
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0].headers["Authorization"], f"Bearer {TOKEN}")
+        mock_post.assert_not_called()
+
+
 class ClientCredentialsHTTPClientTests(unittest.TestCase):
+    @mock.patch("requests.request")
+    def test_request_error_still_chains_original_exception(self, mock_request: mock.Mock) -> None:
+        failure = requests.ConnectionError("connection refused")
+        mock_request.side_effect = failure
+        client = UPSHTTPClient("https://wwwcie.ups.com", token_provider=DummyOAuthManager())
+
+        with self.assertRaises(ToolError) as ctx:
+            client.call_operation(build_operation_spec(), operation_name="create_shipment",
+                                  path_params={"version": "v2409"})
+
+        self.assertEqual(json.loads(str(ctx.exception)), {"code": "REQUEST_ERROR", "message": "connection refused"})
+        self.assertIs(ctx.exception.__context__, failure)
+
     def test_oauth_manager_keyword_and_attribute_still_work(self) -> None:
         manager = DummyOAuthManager()
         client = UPSHTTPClient("https://wwwcie.ups.com", oauth_manager=manager)

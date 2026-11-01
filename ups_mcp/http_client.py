@@ -85,6 +85,11 @@ class UPSHTTPClient:
                 for k, v in additional_headers.items():
                     if v is not None and k.lower() not in reserved:
                         headers[k] = v
+            request_kwargs: dict[str, Any] = {}
+            if delegated:
+                # An explicit auth object stops requests from replacing the Bearer
+                # header with ~/.netrc Basic credentials for the UPS host.
+                request_kwargs["auth"] = _BearerAuth(token)
             response = requests.request(
                 method=operation.method,
                 url=url,
@@ -92,14 +97,18 @@ class UPSHTTPClient:
                 params=safe_query,
                 json=json_body,
                 timeout=self.timeout,
+                **request_kwargs,
             )
         except requests.RequestException as exc:
-            request_error = str(exc)
+            if not delegated:
+                raise ToolError(json.dumps({
+                    "code": "REQUEST_ERROR",
+                    "message": str(exc),
+                }))
+            request_error = _redact_secret(str(exc), token)
         if request_error is not None:
-            # Raised outside the except block so the error does not chain to the
-            # RequestException, whose .request still carries the Authorization header.
-            if delegated:
-                request_error = _redact_secret(request_error, token)
+            # Delegated errors are raised outside the except block so they don't
+            # chain to the RequestException, whose .request carries the token.
             raise ToolError(json.dumps({
                 "code": "REQUEST_ERROR",
                 "message": request_error,
@@ -180,6 +189,18 @@ def _extract_error_message(payload: Any, status_code: int) -> str:
                 if isinstance(description, str) and description.strip():
                     return description
     return f"UPS API returned HTTP {status_code}"
+
+
+class _BearerAuth(requests.auth.AuthBase):
+    def __init__(self, token: str) -> None:
+        self._token = token
+
+    def __call__(self, request: requests.PreparedRequest) -> requests.PreparedRequest:
+        request.headers["Authorization"] = f"Bearer {self._token}"
+        return request
+
+    def __repr__(self) -> str:
+        return "_BearerAuth(<redacted>)"
 
 
 _REDACTED = "[REDACTED]"
