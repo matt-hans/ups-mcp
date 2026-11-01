@@ -4,6 +4,8 @@ import io
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import traceback
@@ -679,6 +681,35 @@ class DelegatedServerConfigTests(unittest.TestCase):
             and isinstance(node.value.func, ast.Name)
         ]
         self.assertNotIn("load_dotenv", module_level_calls)
+
+    def test_fresh_process_import_and_delegated_start_ignore_cwd_dotenv(self) -> None:
+        tmpdir = tempfile.mkdtemp(prefix="ups-mcp-dotenv-")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        with open(os.path.join(tmpdir, ".env"), "w") as handle:
+            handle.write("FASTMCP_DEPENDENCIES=not-valid-json\nCLIENT_SECRET=leaked-app-secret\n")
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(server.__file__)))
+        script = (
+            "import os, sys\n"
+            "from unittest import mock\n"
+            "import ups_mcp.server as server\n"
+            "assert 'CLIENT_SECRET' not in os.environ\n"
+            "with mock.patch.object(server.mcp, 'run'):\n"
+            "    server.main()\n"
+            "assert 'CLIENT_SECRET' not in os.environ\n"
+            "print('OK')\n"
+        )
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": repo_root,
+            "UPS_AUTH_MODE": "delegated",
+            "UPS_ACCESS_TOKEN_FILE": os.path.join(tmpdir, "token.json"),
+        }
+        result = subprocess.run(
+            [sys.executable, "-c", script], cwd=tmpdir, env=env,
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertIn("OK", result.stdout)
 
     def test_delegated_startup_ignores_dotenv_with_client_secret(self) -> None:
         tmpdir = tempfile.mkdtemp(prefix="ups-mcp-dotenv-")

@@ -1,5 +1,6 @@
 from typing import Any, Literal
 from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import server as fastmcp_server
 from mcp.server.fastmcp.exceptions import ToolError
 from dotenv import load_dotenv
 import json
@@ -47,8 +48,22 @@ class UPSFastMCP(FastMCP):
         raise ToolError(delegated_text)
 
 
+def _build_mcp_server() -> UPSFastMCP:
+    # FastMCP's Settings reads a working-directory .env on construction. Every
+    # setting is passed explicitly, so the file can't change any value, but a
+    # malformed FASTMCP_* entry still fails the import. Skip the file for this
+    # instance only; FASTMCP_* environment variables are still honored.
+    config = fastmcp_server.Settings.model_config
+    saved_env_file = config.get("env_file")
+    config["env_file"] = None
+    try:
+        return UPSFastMCP("ups-mcp")
+    finally:
+        config["env_file"] = saved_env_file
+
+
 # Initialize FastMCP server
-mcp = UPSFastMCP("ups-mcp")
+mcp = _build_mcp_server()
 
 base_url = constants.CIE_URL
 client_id: str | None = None
