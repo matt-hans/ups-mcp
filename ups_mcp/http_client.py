@@ -124,10 +124,11 @@ class UPSHTTPClient:
         error_code = _extract_error_code(payload, response.status_code)
         error_message = _extract_error_message(payload, response.status_code)
         if delegated:
-            # Some UPS APIs (e.g. Time in Transit) return a top-level "errors" list.
-            # Delegated errors keep UPS's message, so read that shape too.
+            # Delegated errors keep UPS's message, including body shapes the shared
+            # extractor doesn't read: a top-level "errors" list (e.g. Time in
+            # Transit) or a plain-text body.
             if error_message == _fallback_error_message(response.status_code):
-                error_message = _extract_top_level_error_message(payload) or error_message
+                error_message = _extract_delegated_fallback_message(payload) or error_message
             # Extract from the original structure, then scrub what is emitted. The
             # token alphabet (see DelegatedTokenFile) survives str()/JSON escaping
             # unchanged, so literal replacement catches every echo.
@@ -214,13 +215,18 @@ class _BearerAuth(requests.auth.AuthBase):
         return "_BearerAuth(<redacted>)"
 
 
-def _extract_top_level_error_message(payload: Any) -> str | None:
-    if isinstance(payload, dict):
-        errors = payload.get("errors")
-        if isinstance(errors, list) and errors and isinstance(errors[0], dict):
-            message = errors[0].get("message")
-            if isinstance(message, str) and message.strip():
-                return message
+def _extract_delegated_fallback_message(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    errors = payload.get("errors")
+    if isinstance(errors, list) and errors:
+        first = errors[0]
+        message = first.get("message") if isinstance(first, dict) else first
+        if isinstance(message, str) and message.strip():
+            return message
+    raw = payload.get("raw")  # non-JSON body, see _parse_payload
+    if isinstance(raw, str) and raw.strip():
+        return raw
     return None
 
 

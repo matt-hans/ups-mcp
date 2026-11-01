@@ -488,6 +488,17 @@ class ClientCredentialsHTTPClientTests(unittest.TestCase):
         self.assertEqual(json.loads(str(ctx.exception))["message"], "UPS API returned HTTP 401")
 
     @mock.patch("requests.request")
+    def test_plain_text_401_message_unchanged(self, mock_request: mock.Mock) -> None:
+        mock_request.return_value = make_response(401, "Token expired")
+        client = UPSHTTPClient("https://wwwcie.ups.com", token_provider=DummyOAuthManager())
+
+        with self.assertRaises(ToolError) as ctx:
+            client.call_operation(build_operation_spec(), operation_name="create_shipment",
+                                  path_params={"version": "v2409"})
+
+        self.assertEqual(json.loads(str(ctx.exception))["message"], "UPS API returned HTTP 401")
+
+    @mock.patch("requests.request")
     def test_request_error_still_chains_original_exception(self, mock_request: mock.Mock) -> None:
         failure = requests.ConnectionError("connection refused")
         mock_request.side_effect = failure
@@ -730,6 +741,19 @@ class DelegatedMCPBoundaryTests(TokenFileTestCase, unittest.IsolatedAsyncioTestC
         payload = json.loads(text)
         self.assertEqual(payload["code"], "UPS_DELEGATED_TOKEN_REJECTED")
         self.assertEqual(payload["message"], "Invalid customer token [REDACTED]")
+        self.assertNotIn(TOKEN, text)
+
+    async def test_ups_401_with_plain_text_body_keeps_ups_message(
+        self, mock_request: mock.Mock, mock_post: mock.Mock
+    ) -> None:
+        self.write_valid_token()
+        mock_request.return_value = make_response(401, f"Token expired or invalid: {TOKEN}")
+
+        text = await self.call_tool_text("track_package", {"inquiryNumber": "1Z12345E0205271688"})
+
+        payload = json.loads(text)
+        self.assertEqual(payload["code"], "UPS_DELEGATED_TOKEN_REJECTED")
+        self.assertEqual(payload["message"], "Token expired or invalid: [REDACTED]")
         self.assertNotIn(TOKEN, text)
 
     async def test_other_errors_keep_fastmcp_prefix(
