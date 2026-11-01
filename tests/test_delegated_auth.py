@@ -425,33 +425,54 @@ class DelegatedHTTPClientTests(TokenFileTestCase):
 class DelegatedNetrcTests(TokenFileTestCase):
     """Exercises real request preparation, which mocking requests.request would skip."""
 
-    def test_netrc_credentials_do_not_replace_bearer_token(self) -> None:
+    def setUp(self) -> None:
+        super().setUp()
         self.write_valid_token()
         netrc_path = os.path.join(self.tmpdir, "netrc")
         with open(netrc_path, "w") as handle:
             handle.write("machine wwwcie.ups.com login netrc-user password netrc-pass\n")
         os.chmod(netrc_path, 0o600)
+        self.netrc_path = netrc_path
+        self.client = UPSHTTPClient("https://wwwcie.ups.com", token_provider=DelegatedTokenFile(self.token_path))
+
+    def send_with_netrc(self, status_code: int, headers: dict[str, str] | None = None):  # noqa: ANN201
         sent: list[requests.PreparedRequest] = []
 
         def fake_send(adapter, request, **kwargs):  # noqa: ANN001, ANN003
             sent.append(request)
             response = requests.Response()
-            response.status_code = 200
+            response.status_code = status_code
+            response.headers.update(headers or {})
             response._content = b'{"ok": true}'
             response.request = request
             response.url = request.url
             return response
 
-        client = UPSHTTPClient("https://wwwcie.ups.com", token_provider=DelegatedTokenFile(self.token_path))
-        with mock.patch.dict(os.environ, {"NETRC": netrc_path}), \
+        with mock.patch.dict(os.environ, {"NETRC": self.netrc_path}), \
                 mock.patch("requests.adapters.HTTPAdapter.send", fake_send), \
                 mock.patch("requests.post") as mock_post:
-            client.call_operation(build_operation_spec(), operation_name="create_shipment",
-                                  path_params={"version": "v2409"}, json_body={})
+            try:
+                result = self.client.call_operation(build_operation_spec(), operation_name="create_shipment",
+                                                    path_params={"version": "v2409"}, json_body={})
+            except ToolError as exc:
+                result = exc
+        mock_post.assert_not_called()
+        return sent, result
+
+    def test_netrc_credentials_do_not_replace_bearer_token(self) -> None:
+        sent, result = self.send_with_netrc(200)
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0].headers["Authorization"], f"Bearer {TOKEN}")
+
+    def test_same_host_redirect_is_not_followed(self) -> None:
+        sent, result = self.send_with_netrc(307, {"Location": "https://wwwcie.ups.com/api/shipments/v2409/ship2"})
 
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0].headers["Authorization"], f"Bearer {TOKEN}")
-        mock_post.assert_not_called()
+        self.assertIsInstance(result, ToolError)
+        self.assertEqual(json.loads(str(result))["status_code"], 307)
 
 
 class ClientCredentialsHTTPClientTests(unittest.TestCase):

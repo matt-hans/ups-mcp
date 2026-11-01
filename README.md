@@ -45,7 +45,7 @@ The token file does not need to exist at startup. `ENVIRONMENT` and `UPS_ACCOUNT
 - Extra keys are ignored.
 - The file must be owned by the user running the server and must not be readable or writable by group or others (mode `0600`). A file the server cannot open because another user owns it is reported as `UPS_DELEGATED_TOKEN_INSECURE`.
 
-The server re-reads the file on every UPS call, so a rotated token applies to the next call without a restart. Each call checks the file before any network I/O and fails closed without contacting UPS. Failures are raised as tool errors whose JSON `code` is:
+Delegated requests always send the file's token as `Authorization: Bearer`. Credentials in `~/.netrc` are never substituted, and HTTP redirects are not followed: a 3xx response is returned as a tool error. The server re-reads the file on every UPS call, so a rotated token applies to the next call without a restart. Each call checks the file before any network I/O and fails closed without contacting UPS. Failures are raised as tool errors whose JSON `code` is:
 
 | Code | Cause |
 |------|-------|

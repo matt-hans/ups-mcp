@@ -88,8 +88,11 @@ class UPSHTTPClient:
             request_kwargs: dict[str, Any] = {}
             if delegated:
                 # An explicit auth object stops requests from replacing the Bearer
-                # header with ~/.netrc Basic credentials for the UPS host.
+                # header with ~/.netrc Basic credentials for the UPS host. Redirects
+                # are not followed: requests re-applies netrc credentials on each
+                # redirect, and UPS APIs don't redirect, so a 3xx fails closed.
                 request_kwargs["auth"] = _BearerAuth(token)
+                request_kwargs["allow_redirects"] = False
             response = requests.request(
                 method=operation.method,
                 url=url,
