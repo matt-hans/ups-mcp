@@ -290,5 +290,39 @@ class CreateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("connection lost", payload["message"])
 
 
+class CreateShipmentConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    """Shipments run off the event loop, so concurrent creates overlap."""
+
+    def setUp(self) -> None:
+        self.original_tool_manager = server.tool_manager
+
+    def tearDown(self) -> None:
+        server.tool_manager = self.original_tool_manager
+
+    async def test_concurrent_create_calls_overlap(self) -> None:
+        import asyncio
+        import threading
+
+        # All four creates must be inside the UPS call at the same time; a
+        # serial server never fills the barrier and it times out.
+        inside = threading.Barrier(4, timeout=5)
+
+        class OverlappingToolManager(_FakeToolManager):
+            def create_shipment(self, **kwargs):
+                inside.wait()  # a blocking HTTP call, as requests does
+                self.calls.append(("create_shipment", threading.get_ident()))
+                return {"ShipmentResponse": {"Response": {}}}
+
+        overlapping = OverlappingToolManager()
+        server.tool_manager = overlapping
+        await asyncio.gather(
+            *(server.create_shipment(request_body=make_complete_body()) for _ in range(4))
+        )
+        self.assertEqual(len(overlapping.calls), 4)
+        self.assertNotIn(
+            threading.get_ident(), {ident for _, ident in overlapping.calls}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

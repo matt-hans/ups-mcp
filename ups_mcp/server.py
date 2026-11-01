@@ -832,9 +832,10 @@ async def _create_shipment_execute(
             "missing": [],
         }))
 
-    # 3. Happy path — all fields present
+    # 3. Happy path — all fields present. The UPS call is synchronous (requests):
+    # off the event loop, so concurrent shipments overlap instead of queueing.
     if not missing:
-        return _send_to_ups(merged_body)
+        return await asyncio.to_thread(_send_to_ups, merged_body)
 
     if not allow_elicitation:
         raise ToolError(json.dumps({
@@ -852,7 +853,7 @@ async def _create_shipment_execute(
         canonicalize_fn=canonicalize_body,
         array_rules=[PRODUCT_ARRAY_RULE],
     )
-    return _send_to_ups(merged_body)
+    return await asyncio.to_thread(_send_to_ups, merged_body)
 
 @mcp.tool()
 async def void_shipment(
