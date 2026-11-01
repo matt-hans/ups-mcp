@@ -282,3 +282,36 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RateShipmentConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    """Rate quotes run off the event loop, so concurrent calls overlap."""
+
+    def setUp(self) -> None:
+        self.original_tool_manager = server.tool_manager
+
+    def tearDown(self) -> None:
+        server.tool_manager = self.original_tool_manager
+
+    async def test_concurrent_rate_calls_overlap(self) -> None:
+        import asyncio
+        import threading
+        import time
+
+        class SlowToolManager(_FakeToolManager):
+            def rate_shipment(self, **kwargs):
+                time.sleep(0.1)  # a blocking HTTP call, as requests does
+                self.calls.append(("rate_shipment", threading.get_ident()))
+                return {"RateResponse": {"RatedShipment": []}}
+
+        slow = SlowToolManager()
+        server.tool_manager = slow
+        body = make_complete_rate_body()
+        started = time.monotonic()
+        await asyncio.gather(
+            *(server.rate_shipment(requestoption="Rate", request_body=body) for _ in range(4))
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(slow.calls), 4)
+        self.assertLess(elapsed, 0.3, f"quotes ran one after another: {elapsed:.2f}s")
+        self.assertNotIn(threading.get_ident(), {ident for _, ident in slow.calls})
