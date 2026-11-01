@@ -16,7 +16,48 @@ Users can integrate with the MCP server to allow AI agents to facilitate trackin
 - ```UPS_ACCOUNT_NUMBER``` - UPS Account/Shipper Number (used for Paperless, Landed Cost, and Pickup tools). Optional — can also be provided per-call.
 - ```UPS_MCP_SPECS_DIR``` - Optional absolute path to a directory containing OpenAPI spec overrides. Required files: `Rating.yaml`, `Shipping.yaml`, `TimeInTransit.yaml`. Optional files: `LandedCost.yaml`, `Paperless.yaml`, `Locator.yaml`, `Pickup.yaml` — if absent, the corresponding tools are unavailable. If set, this override is used instead of bundled package specs.
 
+- ```UPS_AUTH_MODE``` - Optional. How UPS calls are authenticated: `client_credentials` (default) or `delegated`. See [Authentication Modes](#authentication-modes).
+- ```UPS_ACCESS_TOKEN_FILE``` - Absolute path to the delegated access token file. Required when `UPS_AUTH_MODE=delegated`; ignored otherwise.
+
 **Note**: Your API credentials are sensitive. Do not commit them to version control. We recommend managing secrets securely using GitHub Secrets, a vault, or a password manager.
+
+### Authentication Modes
+
+**`client_credentials` (default).** The server exchanges `CLIENT_ID` and `CLIENT_SECRET` for an app token at `{base_url}/security/v1/oauth/token`, caches it, and refreshes it before expiry. Behavior is identical whether `UPS_AUTH_MODE` is unset or set to `client_credentials`.
+
+**`delegated`.** For hosts that run the UPS OAuth authorization-code flow themselves so that each customer's calls carry that customer's UPS identity. The host owns the whole grant lifecycle (authorize URL, code exchange, refresh, storage, revocation) and gives the server the current access token through a file. In this mode the server never requests a client_credentials token and has no fallback to one.
+
+Startup fails with a message on stderr and exit code 1 when:
+- `UPS_ACCESS_TOKEN_FILE` is unset or not an absolute path.
+- `CLIENT_SECRET` is present in the process environment, even empty: `delegated mode must not receive CLIENT_SECRET`.
+- `UPS_AUTH_MODE` is set to any value other than `client_credentials` or `delegated`, including an empty value. Only an unset variable selects the default.
+
+When the server's initial process environment sets `UPS_AUTH_MODE=delegated`, ups-mcp never loads a `.env` into the environment, so the rest of the configuration must come from the process environment too. Set `UPS_AUTH_MODE=delegated` there, not in a `.env`. If `UPS_AUTH_MODE` is unset at startup, the `.env` is loaded first, as in client_credentials mode. A `.env` that then switches to `delegated` while also holding `CLIENT_SECRET` fails startup with `delegated mode must not receive CLIENT_SECRET`. Separately, the underlying FastMCP framework reads its own `FASTMCP_*`-prefixed settings from a `.env` in the working directory, as for any FastMCP server. That read never writes to the environment and never affects UPS credentials, but a malformed `FASTMCP_*` entry there makes startup fail, so start the server in a directory you control. In client_credentials mode the server loads a `.env` at startup (not on import), with the same lookup as before: python-dotenv searches upward from the installed `ups_mcp` package directory, not from the working directory. Variables already in the environment take precedence over the file. With `uvx` or a non-editable install, a project-local `.env` is usually not found, so pass the variables through the process environment instead (as the MCP client configs below do). The token file does not need to exist at startup. `ENVIRONMENT` and `UPS_ACCOUNT_NUMBER` keep their usual meaning. `CLIENT_ID` may be set but is not used.
+
+**Token file contract.** UTF-8 JSON, written atomically by the host (write a temp file, then rename it over the target):
+
+```json
+{"access_token": "<opaque UPS access token>", "expires_at": 1767225600}
+```
+
+- `access_token`: a non-empty RFC 6750 bearer token: one or more of `A–Z a–z 0–9 - . _ ~ + /`, optionally followed by `=` padding. UPS OAuth access tokens fit this. Any other character (spaces, quotes, backslashes, non-ASCII) is rejected as `UPS_DELEGATED_TOKEN_INVALID`.
+- `expires_at`: expiry as Unix epoch seconds (integer or float).
+- Extra keys are ignored.
+- The file must be owned by the user running the server and must not be readable or writable by group or others (mode `0600`). A file the server cannot open because another user owns it is reported as `UPS_DELEGATED_TOKEN_INSECURE`.
+
+Delegated requests always send the file's token as `Authorization: Bearer`. Credentials in `~/.netrc` are never substituted, and HTTP redirects are not followed: a 3xx response is returned as a tool error. The server re-reads the file on every UPS call, so a rotated token applies to the next call without a restart. Each call checks the file before any network I/O and fails closed without contacting UPS. Failures are raised as tool errors whose JSON `code` is:
+
+| Code | Cause |
+|------|-------|
+| `UPS_DELEGATED_TOKEN_UNAVAILABLE` | File missing or cannot be opened/read |
+| `UPS_DELEGATED_TOKEN_INSECURE` | Mode allows group/other access, or owner is not the server's user |
+| `UPS_DELEGATED_TOKEN_INVALID` | Not UTF-8 JSON, `access_token` missing/empty/malformed, or `expires_at` missing/non-numeric |
+| `UPS_DELEGATED_TOKEN_EXPIRED` | `expires_at` is at most 30 seconds from now |
+| `UPS_DELEGATED_TOKEN_REJECTED` | UPS answered HTTP 401 (`status_code` is `401`); the UPS message is kept |
+
+For these codes the MCP `tools/call` result has `isError: true`, and its text content is the bare JSON object, e.g. `{"code": "UPS_DELEGATED_TOKEN_EXPIRED", "message": "..."}`, so a client can `json.loads` it directly. Other tool errors keep FastMCP's `Error executing tool <name>: ` prefix.
+
+In delegated mode the token is redacted as `[REDACTED]` (`********` if the token is itself part of that marker) from every error code, message, and error `details` payload. Error messages name only the token file's basename. The server does not retry; on `UPS_DELEGATED_TOKEN_EXPIRED` or `UPS_DELEGATED_TOKEN_REJECTED` the host refreshes the token, rewrites the file, and retries the call once. UPS rejects an invalid bearer token before processing the request, so one retry after a 401 is safe for `create_shipment` too. Tokens are never accepted as tool arguments, and no tool sets them.
 
 **Execution**
 

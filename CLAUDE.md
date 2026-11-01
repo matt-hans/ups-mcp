@@ -54,7 +54,8 @@ constants.py          (CIE/production URLs, locator/pickup/paperless/intl consta
     ↓
 http_client.py (UPSHTTPClient — path rendering, HTTP execution, error parsing)
     ↓
-authorization.py (OAuthManager — thread-safe OAuth2 client_credentials with token caching)
+authorization.py (TokenProvider seam: OAuthManager — thread-safe client_credentials with caching;
+                  DelegatedTokenFile — per-call read of a host-managed customer token file)
     ↓
 openapi_registry.py (OpenAPIRegistry — loads specs, extracts OperationSpec metadata)
 ```
@@ -203,6 +204,7 @@ When enhancing elicitation, consider that data from prior tool calls can pre-fil
 ## Environment
 
 - `.env`: `CLIENT_ID`, `CLIENT_SECRET`, `UPS_ACCOUNT_NUMBER`, `ENVIRONMENT` (test|production), optional `UPS_MCP_SPECS_DIR`
+- `UPS_AUTH_MODE`: `client_credentials` (default) or `delegated`. Delegated mode requires an absolute `UPS_ACCESS_TOKEN_FILE`, refuses to start if `CLIENT_SECRET` is present, never constructs `OAuthManager`, and raises `UPS_DELEGATED_TOKEN_*` ToolErrors (UNAVAILABLE/INSECURE/INVALID/EXPIRED before any HTTP; REJECTED on UPS 401) with the token redacted. Contract lives in README "Authentication Modes"; tests in `tests/test_delegated_auth.py`
 - `ENVIRONMENT=test` (default) → CIE base URL `https://wwwcie.ups.com`
 - `ENVIRONMENT=production` → `https://onlinetools.ups.com`
 - All API calls go through `/api` prefix: `{base_url}/api{rendered_path}`
