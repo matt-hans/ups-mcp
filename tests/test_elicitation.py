@@ -969,3 +969,32 @@ class ArrayFieldRuleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SdkElicitationSchemaTests(unittest.TestCase):
+    """The MCP SDK accepts only primitive fields; enum choices live in the schema."""
+
+    def test_enum_fields_pass_the_sdk_check_and_keep_their_choices(self) -> None:
+        from mcp.server.elicitation import _validate_elicitation_schema
+
+        from ups_mcp.elicitation import MissingField, build_elicitation_schema
+
+        missing = [
+            MissingField(
+                dot_path="A.Code", flat_key="titled", prompt="Titled",
+                enum_values=("02", "01"), enum_titles=("Box", "Letter"),
+                default="02",
+            ),
+            MissingField(
+                dot_path="B.Code", flat_key="plain", prompt="Plain",
+                enum_values=("LBS", "KGS"),
+            ),
+        ]
+        schema = build_elicitation_schema(missing)
+        _validate_elicitation_schema(schema)  # raises TypeError on Literal fields
+        props = schema.model_json_schema()["properties"]
+        self.assertEqual(
+            props["titled"]["oneOf"],
+            [{"const": "02", "title": "Box"}, {"const": "01", "title": "Letter"}],
+        )
+        self.assertEqual(props["plain"]["enum"], ["LBS", "KGS"])

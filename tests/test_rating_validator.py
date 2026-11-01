@@ -66,15 +66,13 @@ class FindMissingRateFieldsTests(unittest.TestCase):
     def test_empty_body_returns_many_fields(self) -> None:
         missing = find_missing_rate_fields({})
         flat_keys = {mf.flat_key for mf in missing}
-        self.assertIn("shipper_name", flat_keys)
         self.assertIn("shipper_number", flat_keys)
-        self.assertIn("shipper_address_line_1", flat_keys)
-        self.assertIn("shipper_city", flat_keys)
         self.assertIn("shipper_country_code", flat_keys)
-        self.assertIn("ship_to_name", flat_keys)
-        self.assertIn("ship_to_address_line_1", flat_keys)
-        self.assertIn("ship_to_city", flat_keys)
         self.assertIn("ship_to_country_code", flat_keys)
+        # A quote needs no names, street or city (see ZipOnlyRateQuoteTests).
+        for key in ("shipper_name", "shipper_address_line_1", "shipper_city",
+                    "ship_to_name", "ship_to_address_line_1", "ship_to_city"):
+            self.assertNotIn(key, flat_keys)
         self.assertIn("service_code", flat_keys)
         self.assertIn("payment_charge_type", flat_keys)
         self.assertIn("payment_account_number", flat_keys)
@@ -82,27 +80,20 @@ class FindMissingRateFieldsTests(unittest.TestCase):
         self.assertIn("package_1_weight_unit", flat_keys)
         self.assertIn("package_1_weight", flat_keys)
 
-    def test_missing_shipper_name_detected(self) -> None:
+    def test_missing_ship_to_country_detected(self) -> None:
         body = make_complete_rate_body()
-        del body["RateRequest"]["Shipment"]["Shipper"]["Name"]
+        del body["RateRequest"]["Shipment"]["ShipTo"]["Address"]["CountryCode"]
         missing = find_missing_rate_fields(body)
         flat_keys = {mf.flat_key for mf in missing}
-        self.assertIn("shipper_name", flat_keys)
-
-    def test_missing_ship_to_address_detected(self) -> None:
-        body = make_complete_rate_body()
-        del body["RateRequest"]["Shipment"]["ShipTo"]["Address"]["AddressLine"]
-        missing = find_missing_rate_fields(body)
-        flat_keys = {mf.flat_key for mf in missing}
-        self.assertIn("ship_to_address_line_1", flat_keys)
+        self.assertIn("ship_to_country_code", flat_keys)
 
     def test_dot_paths_use_rate_request_prefix(self) -> None:
         body = make_complete_rate_body()
-        del body["RateRequest"]["Shipment"]["Shipper"]["Name"]
+        del body["RateRequest"]["Shipment"]["ShipTo"]["Address"]["CountryCode"]
         missing = find_missing_rate_fields(body)
-        shipper_name = [mf for mf in missing if mf.flat_key == "shipper_name"]
-        self.assertEqual(len(shipper_name), 1)
-        self.assertTrue(shipper_name[0].dot_path.startswith("RateRequest."))
+        country = [mf for mf in missing if mf.flat_key == "ship_to_country_code"]
+        self.assertEqual(len(country), 1)
+        self.assertTrue(country[0].dot_path.startswith("RateRequest."))
 
 
 # ---------------------------------------------------------------------------
@@ -624,3 +615,62 @@ class InternationalRateValidationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# ZIP-only quotes (UPS CIE rates without names, street or city, 2026-11-01)
+# ---------------------------------------------------------------------------
+
+def _zip_only_rate_body(package: dict) -> dict:
+    return {
+        "RateRequest": {
+            "Shipment": {
+                "Shipper": {
+                    "ShipperNumber": "A1B2C3",
+                    "Address": {
+                        "StateProvinceCode": "GA",
+                        "PostalCode": "30303",
+                        "CountryCode": "US",
+                    },
+                },
+                "ShipTo": {
+                    "Address": {
+                        "StateProvinceCode": "TX",
+                        "PostalCode": "78701",
+                        "CountryCode": "US",
+                    }
+                },
+                "PaymentInformation": {
+                    "ShipmentCharge": {
+                        "Type": "01",
+                        "BillShipper": {"AccountNumber": "A1B2C3"},
+                    }
+                },
+                "Service": {"Code": "03"},
+                "Package": package,
+            }
+        }
+    }
+
+
+_WEIGHT = {"PackageWeight": {"UnitOfMeasurement": {"Code": "LBS"}, "Weight": "5"}}
+
+
+class ZipOnlyRateQuoteTests(unittest.TestCase):
+    def test_a_quote_needs_no_names_street_or_city(self) -> None:
+        body = _zip_only_rate_body({"Packaging": {"Code": "02"}, **_WEIGHT})
+        self.assertEqual(find_missing_rate_fields(body), [])
+
+    def test_rating_packaging_type_is_accepted_as_written(self) -> None:
+        body = _zip_only_rate_body({"PackagingType": {"Code": "02"}, **_WEIGHT})
+        self.assertEqual(find_missing_rate_fields(body), [])
+        sent = remap_packaging_for_rating(canonicalize_rate_body(body))
+        package = sent["RateRequest"]["Shipment"]["Package"][0]
+        self.assertEqual(package["PackagingType"], {"Code": "02"})
+        self.assertNotIn("Packaging", package)
+
+    def test_us_postal_code_is_still_required(self) -> None:
+        body = _zip_only_rate_body({"Packaging": {"Code": "02"}, **_WEIGHT})
+        del body["RateRequest"]["Shipment"]["ShipTo"]["Address"]["PostalCode"]
+        flat_keys = {mf.flat_key for mf in find_missing_rate_fields(body)}
+        self.assertEqual(flat_keys, {"ship_to_postal_code"})
