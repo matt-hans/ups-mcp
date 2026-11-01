@@ -216,14 +216,18 @@ class _BearerAuth(requests.auth.AuthBase):
 
 
 def _extract_delegated_fallback_message(payload: Any) -> str | None:
+    if isinstance(payload, str):  # a JSON string body
+        return payload if payload.strip() else None
     if not isinstance(payload, dict):
         return None
-    errors = payload.get("errors")
-    if isinstance(errors, list) and errors:
-        first = errors[0]
-        message = first.get("message") if isinstance(first, dict) else first
-        if isinstance(message, str) and message.strip():
-            return message
+    nested = payload.get("response")
+    for errors in (nested.get("errors") if isinstance(nested, dict) else None, payload.get("errors")):
+        if not isinstance(errors, list):
+            continue
+        for entry in errors:  # first entry that actually carries a message
+            message = entry.get("message") if isinstance(entry, dict) else entry
+            if isinstance(message, str) and message.strip():
+                return message
     raw = payload.get("raw")  # non-JSON body, see _parse_payload
     if isinstance(raw, str) and raw.strip():
         return raw

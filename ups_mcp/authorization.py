@@ -146,7 +146,7 @@ class DelegatedTokenFile:
     def _parse(self, raw: bytes) -> tuple[str, float]:
         data: object = None
         try:
-            data = json.loads(raw.decode("utf-8"))
+            data = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
         except ValueError:  # includes UnicodeDecodeError and JSONDecodeError
             pass
         if not isinstance(data, dict):
@@ -172,6 +172,11 @@ class DelegatedTokenFile:
             f"Delegated UPS access token file '{self._label}' must be UTF-8 JSON with a "
             "non-empty RFC 6750 bearer token 'access_token' and a numeric 'expires_at'.",
         )
+
+
+def _reject_json_constant(name: str) -> None:
+    # Python's decoder accepts NaN/Infinity, which are not valid JSON.
+    raise ValueError(f"invalid JSON constant {name}")
 
 
 def _stat_is_insecure(stat_result: os.stat_result) -> bool:

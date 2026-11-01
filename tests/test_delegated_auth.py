@@ -140,6 +140,8 @@ class DelegatedTokenFileTests(TokenFileTestCase):
             "string_expiry": {"access_token": TOKEN, "expires_at": str(future)},
             "bool_expiry": {"access_token": TOKEN, "expires_at": True},
             "nan_expiry": '{"access_token": "%s", "expires_at": NaN}' % TOKEN,
+            "nan_in_extra_key": '{"access_token": "%s", "expires_at": 4000000000, "extra": NaN}' % TOKEN,
+            "infinity_in_extra_key": '{"access_token": "%s", "expires_at": 4000000000, "extra": -Infinity}' % TOKEN,
         }
         for name, payload in cases.items():
             with self.subTest(case=name):
@@ -754,6 +756,37 @@ class DelegatedMCPBoundaryTests(TokenFileTestCase, unittest.IsolatedAsyncioTestC
         payload = json.loads(text)
         self.assertEqual(payload["code"], "UPS_DELEGATED_TOKEN_REJECTED")
         self.assertEqual(payload["message"], "Token expired or invalid: [REDACTED]")
+        self.assertNotIn(TOKEN, text)
+
+    async def test_ups_401_message_found_past_entries_without_one(
+        self, mock_request: mock.Mock, mock_post: mock.Mock
+    ) -> None:
+        self.write_valid_token()
+        for body in (
+            {"response": {"errors": [{"code": "250002"}, {"message": "Token expired"}]}},
+            {"errors": [{"code": "250002"}, {"message": "Token expired"}]},
+        ):
+            with self.subTest(body=body):
+                mock_request.return_value = make_response(401, body)
+
+                text = await self.call_tool_text("track_package", {"inquiryNumber": "1Z12345E0205271688"})
+
+                self.assertEqual(json.loads(text)["message"], "Token expired")
+
+    async def test_ups_401_with_json_string_body_keeps_ups_message(
+        self, mock_request: mock.Mock, mock_post: mock.Mock
+    ) -> None:
+        self.write_valid_token()
+        response = requests.Response()  # real Response, so .json() really parses the string
+        response.status_code = 401
+        response._content = json.dumps(f"Invalid Authentication Information. {TOKEN}").encode()
+        mock_request.return_value = response
+
+        text = await self.call_tool_text("track_package", {"inquiryNumber": "1Z12345E0205271688"})
+
+        payload = json.loads(text)
+        self.assertEqual(payload["code"], "UPS_DELEGATED_TOKEN_REJECTED")
+        self.assertEqual(payload["message"], "Invalid Authentication Information. [REDACTED]")
         self.assertNotIn(TOKEN, text)
 
     async def test_other_errors_keep_fastmcp_prefix(
