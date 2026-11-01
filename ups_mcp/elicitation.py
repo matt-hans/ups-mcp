@@ -16,7 +16,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 
 from mcp.server.elicitation import (
     AcceptedElicitation,
@@ -305,8 +305,8 @@ def build_elicitation_schema(
     """Create a dynamic flat Pydantic model from missing field metadata.
 
     Uses MissingField type information to produce richer schema types:
-    - ``enum_values`` with ``enum_titles`` -> ``Literal`` (renders as oneOf)
-    - ``enum_values`` without titles -> ``Literal`` (renders as enum)
+    - ``enum_values`` with ``enum_titles`` -> ``str`` with a ``oneOf`` schema
+    - ``enum_values`` without titles -> ``str`` with an ``enum`` schema
     - ``type_hint == float`` -> ``float``
     - ``type_hint == int`` -> ``int``
     - ``type_hint == bool`` -> ``bool``
@@ -336,18 +336,20 @@ def build_elicitation_schema(
                 field_kwargs["json_schema_extra"] = json_extras
 
         if mf.enum_values:
-            field_type = Literal[mf.enum_values]  # type: ignore[valid-type]
-            # When titles are paired with enum values, inject oneOf with
-            # const+title into json_schema_extra so MCP clients can show
-            # human-readable labels for opaque codes.
+            # The MCP SDK admits only primitive field types (no Literal), so
+            # the choices live in the JSON schema; validate_elicited_values
+            # enforces them on the answer.
+            field_type = str
+            extras = field_kwargs.get("json_schema_extra", {})
             if mf.enum_titles and len(mf.enum_titles) == len(mf.enum_values):
-                one_of = [
+                # const+title lets MCP clients show labels for opaque codes.
+                extras["oneOf"] = [
                     {"const": val, "title": title}
                     for val, title in zip(mf.enum_values, mf.enum_titles)
                 ]
-                extras = field_kwargs.get("json_schema_extra", {})
-                extras["oneOf"] = one_of
-                field_kwargs["json_schema_extra"] = extras
+            else:
+                extras["enum"] = list(mf.enum_values)
+            field_kwargs["json_schema_extra"] = extras
         else:
             field_type = mf.type_hint
 

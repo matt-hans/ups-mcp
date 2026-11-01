@@ -35,19 +35,16 @@ from .shipment_validator import (
 # Rating-specific unconditional rules
 # ---------------------------------------------------------------------------
 
+# A quote needs no names, street or city: UPS CIE rates a US shipment from
+# country, state and postal code alone (live check 2026-11-01). The
+# country-conditional rules still require postal/state codes where needed.
 RATE_UNCONDITIONAL_RULES: list[FieldRule] = [
-    FieldRule("RateRequest.Shipment.Shipper.Name", "shipper_name", "Shipper name"),
     FieldRule("RateRequest.Shipment.Shipper.ShipperNumber", "shipper_number", "UPS account number"),
-    FieldRule("RateRequest.Shipment.Shipper.Address.AddressLine[0]", "shipper_address_line_1", "Shipper street address"),
-    FieldRule("RateRequest.Shipment.Shipper.Address.City", "shipper_city", "Shipper city"),
     FieldRule(
         "RateRequest.Shipment.Shipper.Address.CountryCode",
         "shipper_country_code", "Shipper country code",
         constraints=(("maxLength", 2), ("pattern", "^[A-Z]{2}$")),
     ),
-    FieldRule("RateRequest.Shipment.ShipTo.Name", "ship_to_name", "Recipient name"),
-    FieldRule("RateRequest.Shipment.ShipTo.Address.AddressLine[0]", "ship_to_address_line_1", "Recipient street address"),
-    FieldRule("RateRequest.Shipment.ShipTo.Address.City", "ship_to_city", "Recipient city"),
     FieldRule(
         "RateRequest.Shipment.ShipTo.Address.CountryCode",
         "ship_to_country_code", "Recipient country code",
@@ -206,6 +203,15 @@ def canonicalize_rate_body(request_body: dict) -> dict:
         )
 
     _normalize_list_field(shipment, "Package")
+    # Callers may write the Rating API's own key; validate on Packaging and let
+    # remap_packaging_for_rating restore PackagingType before the call.
+    for package in shipment.get("Package") or []:
+        if (
+            isinstance(package, dict)
+            and "PackagingType" in package
+            and "Packaging" not in package
+        ):
+            package["Packaging"] = package.pop("PackagingType")
 
     payment = shipment.get("PaymentInformation")
     if payment is None:

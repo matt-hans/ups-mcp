@@ -122,10 +122,10 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_accepted_elicitation_calls_ups(self) -> None:
         body = make_complete_rate_body()
-        del body["RateRequest"]["Shipment"]["Shipper"]["Name"]
+        del body["RateRequest"]["Shipment"]["ShipTo"]["Address"]["CountryCode"]
 
-        Model = create_model("ElicitedData", shipper_name=(str, ...))
-        accepted = AcceptedElicitation(data=Model(shipper_name="Elicited Corp"))
+        Model = create_model("ElicitedData", ship_to_country_code=(str, ...))
+        accepted = AcceptedElicitation(data=Model(ship_to_country_code="US"))
 
         ctx = self._make_ctx(form_supported=True, elicit_result=accepted)
         result = await server.rate_shipment(
@@ -136,7 +136,7 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_declined_raises_elicitation_declined(self) -> None:
         body = make_complete_rate_body()
-        del body["RateRequest"]["Shipment"]["Shipper"]["Name"]
+        del body["RateRequest"]["Shipment"]["ShipTo"]["Address"]["CountryCode"]
         declined = DeclinedElicitation()
         ctx = self._make_ctx(form_supported=True, elicit_result=declined)
         with self.assertRaises(ToolError) as cm:
@@ -148,7 +148,7 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_raises_elicitation_cancelled(self) -> None:
         body = make_complete_rate_body()
-        del body["RateRequest"]["Shipment"]["Shipper"]["Name"]
+        del body["RateRequest"]["Shipment"]["ShipTo"]["Address"]["CountryCode"]
         cancelled = CancelledElicitation()
         ctx = self._make_ctx(form_supported=True, elicit_result=cancelled)
         with self.assertRaises(ToolError) as cm:
@@ -161,11 +161,11 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
     async def test_still_missing_after_accept_exhausts_retries(self) -> None:
         """Persistently missing fields after accept exhaust retries."""
         body = make_complete_rate_body()
-        del body["RateRequest"]["Shipment"]["Shipper"]["Name"]
-        del body["RateRequest"]["Shipment"]["ShipTo"]["Name"]
+        del body["RateRequest"]["Shipment"]["ShipTo"]["Address"]["CountryCode"]
+        del body["RateRequest"]["Shipment"]["Shipper"]["Address"]["CountryCode"]
 
-        Model = create_model("ElicitedData", shipper_name=(str, ...))
-        accepted = AcceptedElicitation(data=Model(shipper_name="Filled"))
+        Model = create_model("ElicitedData", ship_to_country_code=(str, ...))
+        accepted = AcceptedElicitation(data=Model(ship_to_country_code="US"))
 
         ctx = self._make_ctx(form_supported=True, elicit_result=accepted)
         with self.assertRaises(ToolError) as cm:
@@ -220,7 +220,7 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_elicitation_transport_failure_raises_structured_error(self) -> None:
         body = make_complete_rate_body()
-        del body["RateRequest"]["Shipment"]["Shipper"]["Name"]
+        del body["RateRequest"]["Shipment"]["ShipTo"]["Address"]["CountryCode"]
 
         ctx = self._make_ctx(form_supported=True)
         ctx.elicit = AsyncMock(side_effect=RuntimeError("connection lost"))
