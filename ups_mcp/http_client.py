@@ -30,11 +30,18 @@ class UPSHTTPClient:
         self.base_url = base_url
         self.token_provider = token_provider
         self.timeout = timeout
-        self._delegated = isinstance(token_provider, DelegatedTokenFile)
 
     @property
     def oauth_manager(self) -> TokenProvider:
         return self.token_provider
+
+    @oauth_manager.setter
+    def oauth_manager(self, value: TokenProvider) -> None:
+        self.token_provider = value
+
+    @property
+    def _delegated(self) -> bool:
+        return isinstance(self.token_provider, DelegatedTokenFile)
 
     def call_operation(
         self,
@@ -102,16 +109,17 @@ class UPSHTTPClient:
         if 200 <= response.status_code < 300:
             return payload if isinstance(payload, dict) else {"raw": payload}
 
+        if self._delegated:
+            # Scrub the whole response before extracting fields from it, so no
+            # stringified value can carry the token out.
+            payload = _redact_secret(payload, token)
         error_code = _extract_error_code(payload, response.status_code)
         error_message = _extract_error_message(payload, response.status_code)
-        if self._delegated:
+        if self._delegated and response.status_code == 401:
             # UPS refuses a bad bearer token before processing the request, so the
             # caller can safely refresh and retry; ups-mcp itself never retries.
-            if response.status_code == 401:
-                error_code = "UPS_DELEGATED_TOKEN_REJECTED"
-            error_code = _redact_secret(error_code, token)
-            error_message = _redact_secret(error_message, token)
-            payload = _redact_secret(payload, token)
+            # Set after redaction so a token that overlaps this code can't alter it.
+            error_code = "UPS_DELEGATED_TOKEN_REJECTED"
         raise ToolError(json.dumps({
             "status_code": response.status_code,
             "code": error_code,
@@ -184,8 +192,8 @@ def _redact_secret(value: Any, secret: str) -> Any:
         return {_redact_secret(k, secret): _redact_secret(v, secret) for k, v in value.items()}
     if isinstance(value, list):
         return [_redact_secret(item, secret) for item in value]
-    # An all-digit token echoed back as a JSON number.
-    if isinstance(value, (int, float)) and not isinstance(value, bool) and str(value) == secret:
+    # A digit-only token echoed back inside a JSON number.
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and secret in str(value):
         return _REDACTED
     return value
 

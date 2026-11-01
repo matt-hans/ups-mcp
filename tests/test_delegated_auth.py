@@ -277,6 +277,46 @@ class DelegatedHTTPClientTests(TokenFileTestCase):
         self.assertNotIn(numeric_token, str(ctx.exception))
         self.assertEqual(json.loads(str(ctx.exception))["code"], "UPS_DELEGATED_TOKEN_REJECTED")
 
+    def test_token_inside_longer_number_is_scrubbed(
+        self, mock_request: mock.Mock, mock_post: mock.Mock
+    ) -> None:
+        numeric_token = "1234567890123456"
+        self.write_valid_token(numeric_token)
+        mock_request.return_value = make_response(401, {"echo": int("9" + numeric_token + "8")})
+
+        with self.assertRaises(ToolError) as ctx:
+            self.call()
+
+        self.assertNotIn(numeric_token, str(ctx.exception))
+
+    def test_non_string_error_code_with_escaped_token_is_scrubbed(
+        self, mock_request: mock.Mock, mock_post: mock.Mock
+    ) -> None:
+        escaped_token = 'tok\\en"with-escapes'
+        self.write_valid_token(escaped_token)
+        mock_request.return_value = make_response(400, {"code": {"echo": escaped_token}})
+
+        with self.assertRaises(ToolError) as ctx:
+            self.call()
+
+        payload = json.loads(str(ctx.exception))
+        self.assertNotIn(escaped_token, json.dumps(payload))
+        self.assertNotIn(escaped_token, payload["code"])
+        self.assertIn("[REDACTED]", payload["code"])
+
+    def test_token_overlapping_rejected_code_leaves_code_intact(
+        self, mock_request: mock.Mock, mock_post: mock.Mock
+    ) -> None:
+        self.write_valid_token("TOKEN")
+        mock_request.return_value = make_response(401, {"message": "Invalid token TOKEN"})
+
+        with self.assertRaises(ToolError) as ctx:
+            self.call()
+
+        payload = json.loads(str(ctx.exception))
+        self.assertEqual(payload["code"], "UPS_DELEGATED_TOKEN_REJECTED")
+        self.assertEqual(payload["message"], "Invalid token [REDACTED]")
+
     def test_non_401_errors_keep_ups_code_but_are_scrubbed(
         self, mock_request: mock.Mock, mock_post: mock.Mock
     ) -> None:
@@ -311,6 +351,17 @@ class ClientCredentialsHTTPClientTests(unittest.TestCase):
         client = UPSHTTPClient("https://wwwcie.ups.com", oauth_manager=manager)
         self.assertIs(client.oauth_manager, manager)
         self.assertIs(client.token_provider, manager)
+
+    @mock.patch("requests.request")
+    def test_assigning_oauth_manager_replaces_provider(self, mock_request: mock.Mock) -> None:
+        mock_request.return_value = make_response(200, {"ok": True})
+        client = UPSHTTPClient("https://wwwcie.ups.com", oauth_manager=DummyOAuthManager("old-token"))
+
+        client.oauth_manager = DummyOAuthManager("new-token")
+        client.call_operation(build_operation_spec(), operation_name="create_shipment",
+                              path_params={"version": "v2409"})
+
+        self.assertEqual(mock_request.call_args.kwargs["headers"]["Authorization"], "Bearer new-token")
 
 
     @mock.patch("requests.request")
