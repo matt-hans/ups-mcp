@@ -644,6 +644,14 @@ class DelegatedServerConfigTests(unittest.TestCase):
             "Unknown UPS_AUTH_MODE",
         )
 
+    def test_client_secret_reported_before_bad_token_path(self) -> None:
+        for path_env in ({}, {"UPS_ACCESS_TOKEN_FILE": "relative/token.json"}):
+            with self.subTest(path_env=path_env):
+                self.assert_startup_rejected(
+                    {"UPS_AUTH_MODE": "delegated", "CLIENT_SECRET": "app-secret", **path_env},
+                    "delegated mode must not receive CLIENT_SECRET",
+                )
+
     def test_delegated_without_token_file_is_rejected(self) -> None:
         self.assert_startup_rejected({"UPS_AUTH_MODE": "delegated"}, "UPS_ACCESS_TOKEN_FILE")
 
@@ -765,6 +773,10 @@ class DelegatedMCPBoundaryTests(TokenFileTestCase, unittest.IsolatedAsyncioTestC
         for body in (
             {"response": {"errors": [{"code": "250002"}, {"message": "Token expired"}]}},
             {"errors": [{"code": "250002"}, {"message": "Token expired"}]},
+            {"response": {
+                "errors": [{"code": "250002"}, {"message": "Token expired"}],
+                "status": {"description": "Failure"},
+            }},
         ):
             with self.subTest(body=body):
                 mock_request.return_value = make_response(401, body)

@@ -124,11 +124,11 @@ class UPSHTTPClient:
         error_code = _extract_error_code(payload, response.status_code)
         error_message = _extract_error_message(payload, response.status_code)
         if delegated:
-            # Delegated errors keep UPS's message, including body shapes the shared
-            # extractor doesn't read: a top-level "errors" list (e.g. Time in
-            # Transit) or a plain-text body.
-            if error_message == _fallback_error_message(response.status_code):
-                error_message = _extract_delegated_fallback_message(payload) or error_message
+            # Delegated errors keep UPS's most specific message, including shapes
+            # the shared extractor misses: any entry of either "errors" list (e.g.
+            # Time in Transit's top-level one) and plain-text or JSON-string bodies.
+            # The generic status description is the last resort.
+            error_message = _extract_delegated_message(payload) or error_message
             # Extract from the original structure, then scrub what is emitted. The
             # token alphabet (see DelegatedTokenFile) survives str()/JSON escaping
             # unchanged, so literal replacement catches every echo.
@@ -215,11 +215,15 @@ class _BearerAuth(requests.auth.AuthBase):
         return "_BearerAuth(<redacted>)"
 
 
-def _extract_delegated_fallback_message(payload: Any) -> str | None:
+def _extract_delegated_message(payload: Any) -> str | None:
     if isinstance(payload, str):  # a JSON string body
         return payload if payload.strip() else None
     if not isinstance(payload, dict):
         return None
+    for key in ("message", "error", "detail"):  # same precedence as _extract_error_message
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
     nested = payload.get("response")
     for errors in (nested.get("errors") if isinstance(nested, dict) else None, payload.get("errors")):
         if not isinstance(errors, list):

@@ -988,12 +988,13 @@ async def get_service_center_facilities(
 
 def _validate_runtime_configuration() -> None:
     if auth_mode == constants.AUTH_MODE_DELEGATED:
+        # Checked first so a leaked app secret is always the reported error.
+        if client_secret is not None:
+            raise RuntimeConfigurationError("delegated mode must not receive CLIENT_SECRET")
         if not access_token_file or not os.path.isabs(access_token_file):
             raise RuntimeConfigurationError(
                 "UPS_ACCESS_TOKEN_FILE must be set to an absolute path when UPS_AUTH_MODE=delegated."
             )
-        if client_secret is not None:
-            raise RuntimeConfigurationError("delegated mode must not receive CLIENT_SECRET")
         # The token file may not exist yet; it is checked on every UPS call.
         return
     if auth_mode != constants.AUTH_MODE_CLIENT_CREDENTIALS:
