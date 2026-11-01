@@ -280,8 +280,6 @@ class RateShipmentElicitationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("prompt", first)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class RateShipmentConcurrencyTests(unittest.IsolatedAsyncioTestCase):
@@ -296,22 +294,26 @@ class RateShipmentConcurrencyTests(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_rate_calls_overlap(self) -> None:
         import asyncio
         import threading
-        import time
 
-        class SlowToolManager(_FakeToolManager):
+        # All four quotes must be inside the UPS call at the same time; a
+        # serial server never fills the barrier and it times out.
+        inside = threading.Barrier(4, timeout=5)
+
+        class OverlappingToolManager(_FakeToolManager):
             def rate_shipment(self, **kwargs):
-                time.sleep(0.1)  # a blocking HTTP call, as requests does
+                inside.wait()  # a blocking HTTP call, as requests does
                 self.calls.append(("rate_shipment", threading.get_ident()))
                 return {"RateResponse": {"RatedShipment": []}}
 
-        slow = SlowToolManager()
-        server.tool_manager = slow
+        overlapping = OverlappingToolManager()
+        server.tool_manager = overlapping
         body = make_complete_rate_body()
-        started = time.monotonic()
         await asyncio.gather(
             *(server.rate_shipment(requestoption="Rate", request_body=body) for _ in range(4))
         )
-        elapsed = time.monotonic() - started
-        self.assertEqual(len(slow.calls), 4)
-        self.assertLess(elapsed, 0.3, f"quotes ran one after another: {elapsed:.2f}s")
-        self.assertNotIn(threading.get_ident(), {ident for _, ident in slow.calls})
+        self.assertEqual(len(overlapping.calls), 4)
+        self.assertNotIn(threading.get_ident(), {ident for _, ident in overlapping.calls})
+
+
+if __name__ == "__main__":
+    unittest.main()
