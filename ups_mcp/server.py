@@ -4,6 +4,7 @@ from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.fastmcp.exceptions import ToolError
 from dotenv import load_dotenv
 from pydantic import Field
+import asyncio
 import json
 import os
 import sys
@@ -598,9 +599,10 @@ async def _rate_shipment_execute(
             "missing": [],
         }))
 
-    # 3. Happy path — all fields present
+    # 3. Happy path — all fields present. The UPS call is synchronous (requests):
+    # off the event loop, so concurrent quotes overlap instead of queueing.
     if not missing:
-        return _send_to_ups(merged_body)
+        return await asyncio.to_thread(_send_to_ups, merged_body)
 
     if not allow_elicitation:
         raise ToolError(json.dumps({
@@ -617,7 +619,7 @@ async def _rate_shipment_execute(
         tool_label="rate request",
         canonicalize_fn=canonicalize_rate_body,
     )
-    return _send_to_ups(merged_body)
+    return await asyncio.to_thread(_send_to_ups, merged_body)
 
 @mcp.tool()
 async def create_shipment(
