@@ -124,6 +124,10 @@ class UPSHTTPClient:
         error_code = _extract_error_code(payload, response.status_code)
         error_message = _extract_error_message(payload, response.status_code)
         if delegated:
+            # Some UPS APIs (e.g. Time in Transit) return a top-level "errors" list.
+            # Delegated errors keep UPS's message, so read that shape too.
+            if error_message == _fallback_error_message(response.status_code):
+                error_message = _extract_top_level_error_message(payload) or error_message
             # Extract from the original structure, then scrub what is emitted. The
             # token alphabet (see DelegatedTokenFile) survives str()/JSON escaping
             # unchanged, so literal replacement catches every echo.
@@ -191,6 +195,10 @@ def _extract_error_message(payload: Any, status_code: int) -> str:
                 description = status.get("description")
                 if isinstance(description, str) and description.strip():
                     return description
+    return _fallback_error_message(status_code)
+
+
+def _fallback_error_message(status_code: int) -> str:
     return f"UPS API returned HTTP {status_code}"
 
 
@@ -204,6 +212,16 @@ class _BearerAuth(requests.auth.AuthBase):
 
     def __repr__(self) -> str:
         return "_BearerAuth(<redacted>)"
+
+
+def _extract_top_level_error_message(payload: Any) -> str | None:
+    if isinstance(payload, dict):
+        errors = payload.get("errors")
+        if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+            message = errors[0].get("message")
+            if isinstance(message, str) and message.strip():
+                return message
+    return None
 
 
 _REDACTED = "[REDACTED]"
